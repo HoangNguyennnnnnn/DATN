@@ -1402,6 +1402,90 @@ Bao_cao_FaceDiff_ChiTiet.md    +120     (section 9.7 này)
 
 ---
 
+## 9.8. Rà soát toàn pipeline trước khi Resume Train (Revision 7 — 11/05/2026)
+
+### 9.8.1. Mục tiêu rà soát
+
+Chuẩn bị resume training trên máy chủ mới qua `git clone`. Data + checkpoint từ Google Drive. Rà soát toàn bộ code trước khi deploy.
+
+### 9.8.2. Tổng kết rà soát theo file
+
+| Module | File | Kết quả | Ghi chú |
+|---|---|---|---|
+| SC-VAE model | `src/models/sc_vae.py` | ✅ OK | Kiến trúc 4-level encoder/decoder, early-pruning, residual AE shortcuts, TRELLIS.2 activations — đúng spec |
+| SC-VAE loss | `src/models/sc_vae_loss.py` | ✅ OK | Multi-mode loss (shape_mat, shape_native, geom6...), KL per-element normalization, rho Focal Loss — đúng |
+| SC-VAE train | `src/train_sc_vae.py` | 🔧 Sửa 1 bug | Bug `batch_data_time` luôn = 0 (xem §9.8.3) |
+| iMF diffusion | `src/models/imf_diffusion.py` | ✅ OK | JVP, CFG, adaptive weighting, v-head — đã fix ở rev6 |
+| Voxel Mamba | `src/models/voxel_mamba.py` | ✅ OK | BiSSM, Hilbert SFC, interval tokens — đúng spec |
+| iMF train | `src/train_imf.py` | ✅ OK | SlatDataset cache, offline mode, grad clip all_params — đúng |
+| Config | `src/config.py` | ✅ OK | Tất cả tham số có CLI override |
+| Data pipeline | `src/scvae_train/data.py` | ✅ OK | LMDB + disk cache, stratified subsampling, collate |
+| Data runtime | `src/scvae_train/runtime.py` | ✅ OK | align_recon_target, LR scheduler, resume scheduler |
+| Scripts | `scripts/resume_from_397.sh` | ⚠️ Lưu ý | Conda path hardcode `${HOME}/miniconda3` (xem §9.8.4) |
+| Precompute | `scripts/precompute_slat_cache.py` | ✅ OK | Slat cache generation đúng contract |
+
+### 9.8.3. Bug đã sửa: `batch_data_time` không được tích lũy
+
+**File:** `src/train_sc_vae.py` (line 880)
+
+**Vấn đề:** Biến `batch_data_time` được khởi tạo `= 0.0` ở đầu mỗi gradient accumulation cycle (line 864) nhưng giá trị `data_time` (thời gian fetch batch từ DataLoader, line 844) không bao giờ được cộng vào. Kết quả: `epoch_data_time` luôn = 0 → perf metrics cho data loading time trong console và WandB luôn hiển thị 0ms.
+
+**Fix:** Thêm `batch_data_time += data_time` ngay trước vòng micro-batch loop (line 880).
+
+**Tác động:** Chỉ ảnh hưởng perf logging, KHÔNG ảnh hưởng training correctness. Sau fix, WandB `perf/data_ms` sẽ phản ánh đúng thời gian DataLoader.
+
+### 9.8.4. Checklist resume train trên máy chủ mới
+
+Khi `git clone` sang server mới với data/checkpoint từ Google Drive:
+
+#### 1. Cài đặt environment
+```bash
+conda create -n facediff python=3.10
+conda activate facediff
+pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121
+pip install spconv-cu121 mamba-ssm lmdb trimesh wandb
+```
+
+#### 2. Override data paths (BẮT BUỘC)
+Các đường dẫn mặc định trong `config.py` trỏ tới `/mnt/16TData/...` — trên server mới cần override qua CLI:
+```bash
+python src/train_sc_vae.py \
+    --faceverse-root /path/to/FaceVerse \
+    --facescape-root /path/to/FaceScape \
+    --lmdb-dir /path/to/lmdb \
+    --resume /path/to/checkpoint.pt \
+    --allow-unsafe-resume
+```
+
+#### 3. Checkpoint compatibility
+- SC-VAE checkpoints (epoch_390, epoch_397, interrupt.pt) **tương thích hoàn toàn** — không có thay đổi parameter shapes/names.
+- `pre_latent_norm` (non-affine LayerNorm trước to_mu/to_logvar) không tạo learnable params → state_dict không đổi.
+- `--allow-unsafe-resume` cần thiết nếu data path thay đổi (data_signature sẽ khác).
+
+#### 4. Scripts cần chỉnh
+- `scripts/resume_from_397.sh`: Đổi `${HOME}/miniconda3/...` thành đường dẫn conda của server mới
+- Hoặc chạy trực tiếp `python src/train_sc_vae.py ...` với args tương ứng
+
+#### 5. Cấu trúc thư mục cần thiết
+```
+facediff/
+├── checkpoints/
+│   └── sc_vae_shape/     ← checkpoint từ Google Drive
+├── data/
+│   ├── ovoxel_cache_lmdb/ ← LMDB cache (nếu có)
+│   └── slat_cache/        ← iMF slat cache (tự tạo bởi train_imf.py)
+├── train_faceverse_ids.txt
+├── test_faceverse_ids.txt
+├── train_facescape_ids.txt
+└── test_facescape_ids.txt
+```
+
+### 9.8.5. Kết luận
+
+Pipeline SC-VAE + iMF đã ổn định sau 8 bug fixes ở Revision 6. Rà soát lần này chỉ phát hiện 1 bug logging nhỏ (`batch_data_time`). Toàn bộ code sẵn sàng để resume training trên server mới — chỉ cần override data paths qua CLI args.
+
+---
+
 ## Tài liệu Tham khảo
 
 1. Geng, Z., Lu, Y., Wu, Z., Shechtman, E., Kolter, J. Z., & He, K. (2025). *Improved Mean Flows: On the Challenges of Fastforward Generative Models*. arXiv:2512.02012v1.
@@ -1422,4 +1506,4 @@ Bao_cao_FaceDiff_ChiTiet.md    +120     (section 9.7 này)
 
 ---
 
-*(Hết báo cáo — Cập nhật: 11/05/2026 — Revision 6 + dọn legacy: đọc lại kỹ iMF (2512.02012v1) + DiM-3D (2406.05038v1); sửa 8 bug (§9.7); gỡ `src/models/imf_vloss.py`; lazy-import `IMFUNet1D` khi `use_voxel_mamba=False`.)*
+*(Hết báo cáo — Cập nhật: 11/05/2026 — Revision 7: rà soát toàn pipeline trước resume train; sửa bug batch_data_time (§9.8.3); checklist deploy server mới (§9.8.4).)*

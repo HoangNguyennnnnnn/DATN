@@ -877,6 +877,8 @@ def train_sc_vae(
                     stage2_perceptual_last = torch.zeros((), device=device, dtype=torch.float32)
                     stage2_total_last = torch.zeros((), device=device, dtype=torch.float32)
 
+                batch_data_time += data_time
+
                 micro_failed = False
                 micro_fail_stage = ""
                 micro_fail_exc = None
