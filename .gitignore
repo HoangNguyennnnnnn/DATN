@@ -1,0 +1,56 @@
+# Datasets & Cache (CRITICAL: Do not upload to GitHub)
+data/
+outputs/
+val_samples/
+*.pt
+*.lmdb
+*.shape_mat
+*.mx100000
+miniconda3/
+snap/
+third_party/
+
+# Model Checkpoints
+checkpoints/
+*.bin
+*.pth
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# IDEs & System
+.vscode/
+.idea/
+.DS_Store
+.ipynb_checkpoints
+.gemini/
+.env
+
+# Logs
+logs/
+*.log
+wandb/
+
+# User Home Directory specific (since the workspace is used as $HOME)
+.*
+!.gitignore

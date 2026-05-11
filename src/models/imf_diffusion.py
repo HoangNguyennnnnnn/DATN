@@ -1,0 +1,720 @@
+"""
+Improved Mean Flow (iMF) — Bản triển khai bám sát paper.
+=========================================================
+Bài báo: "Improved Mean Flows: On the Challenges of Fastforward Generative Models"
+       (Geng et al., arXiv:2512.02012v1 — Z. Geng, Y. Lu, Z. Wu, E. Shechtman, J. Z. Kolter, K. He)
+
+Khác biệt cốt lõi vs Rectified Flow:
+- Mạng nơ-ron dự đoán **vận tốc trung bình** (average velocity) u(z, r, t), KHÔNG phải vận tốc tức thời (instantaneous velocity) v(z, t)
+- Đầu vào có 3 tham số thời gian: z_t, r (thời gian bắt đầu), t (thời gian kết thúc)  
+- Dùng JVP (Jacobian-Vector Product) để tính du/dt
+- Dừng lan truyền ngược (Stop-gradient) trên du/dt để ổn định huấn luyện
+- Lấy mẫu các cặp (r, t) với tỉ lệ 50% r≠t
+- Suy luận: z_0 = z_1 - u_theta(z_1, r=0, t=1)  (1-step)
+
+VRAM: JVP tạo thêm ~30% overhead so với MSE đơn thuần, nhưng chất lượng cao hơn đáng kể.
+"""
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from typing import Optional, Tuple
+
+
+class ImprovedMeanFlow:
+    """
+    Khung làm việc Improved Mean Flow (iMF).
+    
+    Tư tưởng cốt lõi: thay vì dự đoán vận tốc tức thời v(z,t) = dz/dt,
+    hãy dự đoán **vận tốc trung bình** u(z,r,t) = (1/(t-r)) * ∫[r→t] v(z_s, s) ds
+    
+    Đồng nhất thức MeanFlow: v = u + (t-r) * du/dt
+    
+    Hàm hợp V_θ: V = u_θ + (t-r) * stop_grad(du/dt)
+    Hàm mất mát: ||V_θ(z_t) - (e - x)||²
+    
+    Lấy mẫu 1 bước (1-step sampling): z_0 = z_1 - u_θ(z_1, r=0, t=1)
+    """
+    
+    def __init__(
+        self,
+        sigma_min: float = 1e-4,
+        ratio_r_neq_t: float = 0.5,
+        t_sampler: str = "logit_normal",
+        t_loc: float = -0.4,
+        t_scale: float = 1.0,
+        curriculum_switch_ratio: float = 0.6,
+        curriculum_uniform_prob: float = 0.8,
+        cfg_omega_min: float = 1.0,
+        cfg_omega_max: float = 8.0,
+        cfg_omega_power_beta: float = 1.0,
+        enable_cfg_interval_conditioning: bool = True,
+        adaptive_loss_weighting: bool = True,
+    ):
+        """
+        Tham số:
+            sigma_min: Mức nhiễu tối thiểu
+            ratio_r_neq_t: Tỷ lệ các mẫu có r≠t (bài báo dùng 0.5)
+            t_sampler: 'uniform', 'logit_normal', hoặc 'curriculum'
+            t_loc: Giá trị trung bình (mean) cho bộ lấy mẫu logit-normal
+            t_scale: Tỉ lệ (scale) cho bộ lấy mẫu logit-normal
+            curriculum_switch_ratio: Điểm chuyển chương trình giảng dạy (0-1 theo epoch tiến trình)
+            curriculum_uniform_prob: Xác suất chọn đồng đều ở giai đoạn 2 của tiến trình
+            cfg_omega_min: Thang đo điều hướng tối thiểu cho điều kiện hóa CFG linh hoạt
+            cfg_omega_max: Thang đo điều hướng tối đa cho điều kiện hóa CFG linh hoạt
+            cfg_omega_power_beta: Giá trị beta của hàm lũy thừa trong p(w) ~ w^-beta
+            enable_cfg_interval_conditioning: Nếu True, lấy mẫu khoảng CFG [tmin, tmax]
+        """
+        self.sigma_min = sigma_min
+        self.ratio_r_neq_t = ratio_r_neq_t
+        self.t_sampler = t_sampler
+        self.t_loc = t_loc
+        self.t_scale = t_scale
+        self.curriculum_switch_ratio = max(0.0, min(1.0, curriculum_switch_ratio))
+        self.curriculum_uniform_prob = max(0.0, min(1.0, curriculum_uniform_prob))
+        self.cfg_omega_min = float(max(1.0, cfg_omega_min))
+        self.cfg_omega_max = float(max(self.cfg_omega_min, cfg_omega_max))
+        self.cfg_omega_power_beta = float(max(0.0, cfg_omega_power_beta))
+        self.enable_cfg_interval_conditioning = bool(enable_cfg_interval_conditioning)
+        self.training_progress = 0.0
+
+        # --- Adaptive loss weighting (MeanFlow paper, iMF Appendix A) ---
+        # Maintains running EMA of per-timestep-bin loss to normalize
+        # contributions, preventing high-variance bins from dominating.
+        self.adaptive_loss_weighting = adaptive_loss_weighting
+        self._num_bins = 100  # discretize t into 100 bins
+        self._loss_ema_decay = 0.99
+        # Running EMA of loss per bin, initialized to 1.0 (neutral weight)
+        self._loss_ema = torch.ones(self._num_bins)
+        self._loss_counts = torch.zeros(self._num_bins, dtype=torch.long)
+
+    def set_progress(self, progress: float) -> None:
+        """Thiết lập tiến trình huấn luyện trong khoảng [0, 1] cho việc lấy mẫu dấu thời gian theo chương trình."""
+        self.training_progress = max(0.0, min(1.0, float(progress)))
+
+    def _sample_cfg_omega(
+        self,
+        batch_size: int,
+        device: torch.device,
+        omega_min: float,
+        omega_max: float,
+        beta: float,
+    ) -> torch.Tensor:
+        """Lấy mẫu thang đo điều hướng omega với p(w) ~ w^-beta trên đoạn [omega_min, omega_max]."""
+        if omega_max <= omega_min + 1e-8:
+            return torch.full((batch_size,), float(omega_min), device=device)
+
+        u = torch.rand(batch_size, device=device).clamp_(1e-6, 1.0 - 1e-6)
+        if abs(beta - 1.0) < 1e-6:
+            ratio = omega_max / omega_min
+            return omega_min * (ratio ** u)
+
+        one_minus_beta = 1.0 - beta
+        lo = omega_min ** one_minus_beta
+        hi = omega_max ** one_minus_beta
+        return (lo + (hi - lo) * u).clamp_min(1e-12) ** (1.0 / one_minus_beta)
+
+    def _sample_cfg_interval(self, batch_size: int, device: torch.device) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Lấy mẫu khoảng CFG [tmin, tmax] theo thực tiễn trong phụ lục của iMF."""
+        tmin = torch.rand(batch_size, device=device) * 0.5
+        tmax = 0.5 + torch.rand(batch_size, device=device) * 0.5
+        return tmin, tmax
+
+    def _sample_t(self, batch_size: int, device: torch.device) -> torch.Tensor:
+        """Lấy mẫu dấu thời gian t sử dụng chính sách lấy mẫu đã cấu hình."""
+        if self.t_sampler == "uniform":
+            t = torch.rand(batch_size, device=device)
+        elif self.t_sampler == "curriculum":
+            # Giai đoạn 1: chủ yếu dùng logit-normal để học nhanh cấu trúc thô.
+            # Giai đoạn 2: trộn lẫn với uniform để bao phủ tốt hơn các dấu thời gian ở biên.
+            if self.training_progress < self.curriculum_switch_ratio:
+                u = torch.randn(batch_size, device=device) * self.t_scale + self.t_loc
+                t = torch.sigmoid(u)
+            else:
+                use_uniform = torch.rand(batch_size, device=device) < self.curriculum_uniform_prob
+                u = torch.randn(batch_size, device=device) * self.t_scale + self.t_loc
+                t_logit = torch.sigmoid(u)
+                t_uniform = torch.rand(batch_size, device=device)
+                t = torch.where(use_uniform, t_uniform, t_logit)
+        else:
+            # Mặc định: logit-normal
+            u = torch.randn(batch_size, device=device) * self.t_scale + self.t_loc
+            t = torch.sigmoid(u)
+        return t
+    
+    def _sample_t_r(self, batch_size: int, device: torch.device) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Sample (t, r) pairs theo paper convention r ≤ t.
+
+        Paper Geng et al. 2512.02012v1 — Tab. 4 ratio of r≠t = 50%; trong các
+        triển khai chính thống của MeanFlow / iMF (ví dụ Gsunshine/meanflow) hai
+        biến được sắp xếp sao cho ``r ≤ t`` để (t-r) ≥ 0 và mean velocity được
+        định hướng từ data → noise giống flow matching tuyến tính.
+        """
+        # Lấy mẫu t (logit-normal hoặc uniform), kẹp (clamp) tránh biên 0/1.
+        t = self._sample_t(batch_size, device).clamp(self.sigma_min, 1.0 - self.sigma_min)
+
+        # Sample r ~ U[0, t] để bảo đảm r ≤ t (interval (t-r) ≥ 0 — paper convention).
+        u = torch.rand(batch_size, device=device)
+        r_candidate = (u * t).clamp(0.0, 1.0 - self.sigma_min)
+
+        # 50% mẫu nhận r = t (boundary case, JVP coefficient triệt tiêu); còn lại r < t.
+        mask_neq = torch.rand(batch_size, device=device) < self.ratio_r_neq_t
+        r = torch.where(mask_neq, r_candidate, t)
+
+        return t, r
+    
+    def _interpolate(self, x: torch.Tensor, e: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
+        """
+        Nội suy (Interpolation) khớp luồng (Flow matching): z_t = (1-t)*x + t*e
+        
+        Quy ước của bài báo: x = dữ liệu (data), e = nhiễu (noise) (ngược với một số bản triển khai khác)
+        z_t đi từ dữ liệu (t=0) → nhiễu (t=1)
+        """
+        t_exp = t.view(-1, *([1] * (x.ndim - 1)))
+        return (1.0 - t_exp) * x + t_exp * e
+
+    def _weighted_mse(
+        self,
+        pred: torch.Tensor,
+        target: torch.Tensor,
+        channel_weights: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        """MSE được đánh trọng số theo kênh trên chiều cuối cùng khi các trọng số được cung cấp."""
+        if channel_weights is None:
+            return F.mse_loss(pred, target)
+
+        w = channel_weights.view(*([1] * (pred.ndim - 1)), -1)
+        return ((pred - target) ** 2 * w).mean()
+
+    def _per_sample_weighted_mse(
+        self,
+        pred: torch.Tensor,
+        target: torch.Tensor,
+        channel_weights: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        """Per-sample MSE with optional channel weighting.
+
+        Returns a tensor shaped [B] so adaptive weighting can be applied
+        per sample/timestep instead of collapsing into a single scalar.
+        """
+        diff2 = (pred - target) ** 2
+        if channel_weights is not None:
+            w = channel_weights.view(*([1] * (pred.ndim - 1)), -1)
+            diff2 = diff2 * w
+        reduce_dims = tuple(range(1, pred.ndim))
+        return diff2.mean(dim=reduce_dims)
+
+    @torch.no_grad()
+    def _get_adaptive_weights(self, t: torch.Tensor) -> torch.Tensor:
+        """Compute per-sample adaptive weight based on running loss EMA.
+
+        Bins timestep *t* into ``_num_bins`` buckets and returns
+        ``1 / max(loss_ema[bin], eps)`` so that timestep ranges with
+        historically large loss get down-weighted, stabilising training.
+
+        Reference: Original MeanFlow paper; iMF Appendix A:
+        "As adaptive weighting [mf] is used in the MF loss, we also
+        apply it to this auxiliary loss."
+        """
+        if not self.adaptive_loss_weighting:
+            return torch.ones(t.shape[0], device=t.device)
+
+        # Move EMA buffer to correct device lazily
+        if self._loss_ema.device != t.device:
+            self._loss_ema = self._loss_ema.to(t.device)
+            self._loss_counts = self._loss_counts.to(t.device)
+
+        bins = (t.clamp(0.0, 1.0 - 1e-6) * self._num_bins).long()
+        ema_vals = self._loss_ema[bins].clamp(min=1e-4)
+        # Weight = 1/ema → higher weight for low-loss bins (easy), lower for high-loss (hard)
+        # This is the "normalizing" variant: each bin contributes roughly equally to total loss
+        weights = 1.0 / ema_vals
+        # Normalize so mean weight = 1 (keeps effective LR unchanged)
+        weights = weights / weights.mean().clamp(min=1e-6)
+        return weights
+
+    @torch.no_grad()
+    def _update_adaptive_ema(self, t: torch.Tensor, per_sample_loss: torch.Tensor) -> None:
+        """Vectorised EMA update of per-timestep-bin loss using scatter ops.
+
+        Trước đây dùng vòng for trên ``bins.unique()`` rất chậm khi batch lớn (mỗi
+        bin gây 1 kernel launch). Giờ tính tổng/số đếm theo bin bằng
+        ``scatter_add_`` rồi blend EMA một lần — O(B) thay vì O(unique_bins).
+        """
+        if not self.adaptive_loss_weighting:
+            return
+
+        if self._loss_ema.device != t.device:
+            self._loss_ema = self._loss_ema.to(t.device)
+            self._loss_counts = self._loss_counts.to(t.device)
+
+        bins = (t.clamp(0.0, 1.0 - 1e-6) * self._num_bins).long()
+
+        bin_sum = torch.zeros(self._num_bins, device=t.device, dtype=per_sample_loss.dtype)
+        bin_cnt = torch.zeros(self._num_bins, device=t.device, dtype=per_sample_loss.dtype)
+        bin_sum.scatter_add_(0, bins, per_sample_loss)
+        bin_cnt.scatter_add_(0, bins, torch.ones_like(per_sample_loss))
+
+        present = bin_cnt > 0
+        if not bool(present.any().item()):
+            return
+
+        bin_avg = torch.where(present, bin_sum / bin_cnt.clamp_min(1.0), self._loss_ema)
+        d = self._loss_ema_decay
+        # Chỉ cập nhật những bin có sample trong batch này (giữ giá trị cũ cho phần còn lại).
+        self._loss_ema = torch.where(
+            present,
+            d * self._loss_ema + (1.0 - d) * bin_avg.to(self._loss_ema.dtype),
+            self._loss_ema,
+        )
+        self._loss_counts = self._loss_counts + bin_cnt.to(self._loss_counts.dtype)
+
+    def _compute_dudt_jvp(
+        self,
+        model: nn.Module,
+        z_t: torch.Tensor,
+        t: torch.Tensor,
+        r: torch.Tensor,
+        context: torch.Tensor,
+        v_tangent: torch.Tensor,
+        omega: Optional[torch.Tensor] = None,
+        cfg_tmin: Optional[torch.Tensor] = None,
+        cfg_tmax: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Tính toán du/dt thông qua JVP với tiếp tuyến (dz/dt=v, dr/dt=0, dt/dt=1)."""
+
+        def fn(z_in: torch.Tensor, t_in: torch.Tensor) -> torch.Tensor:
+            return model(
+                z_in,
+                t_in,
+                context,
+                r=r,
+                omega=omega,
+                cfg_tmin=cfg_tmin,
+                cfg_tmax=cfg_tmax,
+            )
+
+        _, dudt = torch.autograd.functional.jvp(
+            fn,
+            (z_t, t),
+            (v_tangent, torch.ones_like(t)),
+            create_graph=False,
+            strict=False,
+        )
+        return dudt
+    
+    def compute_loss(
+        self,
+        model: nn.Module,
+        x_data: torch.Tensor,
+        context: torch.Tensor,
+        v_head: Optional[nn.Module] = None,
+        material_loss_weight: float = 1.0,
+        dual_branch: bool = False,
+        shape_dim: Optional[int] = None,
+        material_condition_source: str = "gt",
+        material_condition_dropout: float = 0.0,
+        cfg_conditioning: bool = False,
+        cfg_omega_min: Optional[float] = None,
+        cfg_omega_max: Optional[float] = None,
+        cfg_omega_power_beta: Optional[float] = None,
+        cfg_interval_conditioning: Optional[bool] = None,
+        cfg_context_dropout: float = 0.1,
+        return_components: bool = False,
+    ):
+        """
+        Tính toán hàm mất mát huấn luyện iMF (biến thể thực tế bám sát bài báo).
+
+        Giao diện mô hình hiện tại dự đoán u(z_t, t, context, r).
+        r được lấy mẫu và truyền vào các lời gọi mô hình, trong khi JVP được tính trên (z_t, t)
+        với r được giữ cố định (dr/dt=0).
+        
+        Tham số:
+            model: U-Net/Transformer dự đoán u(z,t,ctx,r).
+            x_data: Các token Slat mục tiêu [B, L, D]
+            context: Vector điều kiện hóa [B, C] (ArcFace + FLAME)
+            v_head: Khối phụ trợ (tùy chọn) để dự đoán vận tốc cận biên (marginal velocity).
+            material_loss_weight: Hệ số nhân nhánh vật liệu trong chế độ nhánh kép.
+            dual_branch: Xác định các kênh tiềm ẩn là [shape | material].
+            shape_dim: Số lượng kênh hình dáng (shape) trên chiều cuối cùng khi dual_branch=True.
+            material_condition_source: "gt" hoặc "pred_detached".
+            material_condition_dropout: Tỷ lệ giám sát vật liệu được thay thế bằng tự dự đoán độc lập (detached self-prediction) khi nguồn là "pred_detached".
+            cfg_conditioning: Nếu True, bật điều kiện hóa CFG linh hoạt trong quá trình huấn luyện.
+            cfg_omega_min/cfg_omega_max/cfg_omega_power_beta: Các giá trị ghi đè tùy chọn.
+            cfg_interval_conditioning: Lựa chọn ghi đè tùy chọn để lấy mẫu khoảng [tmin, tmax].
+            cfg_context_dropout: Tỉ lệ bỏ qua cho nhánh ngữ cảnh điều kiện.
+            return_components: Nếu True, trả về dictionary với chi tiết từng thành phần vô hướng (scalar breakdown).
+        """
+        b = x_data.shape[0]
+        device = x_data.device
+
+        channel_weights = None
+        shape_slice = None
+        material_slice = None
+        if dual_branch and shape_dim is not None and x_data.ndim >= 2:
+            total_dim = int(x_data.shape[-1])
+            shape_ch = max(0, min(int(shape_dim), total_dim))
+            if shape_ch < total_dim:
+                channel_weights = x_data.new_ones((total_dim,))
+                channel_weights[shape_ch:] = float(max(0.0, material_loss_weight))
+                shape_slice = slice(0, shape_ch)
+                material_slice = slice(shape_ch, total_dim)
+        
+        # Bước 1: Lấy mẫu nhiễu
+        e = torch.randn_like(x_data)
+        
+        # Bước 2: Lấy mẫu các cặp (t, r)
+        t, r = self._sample_t_r(b, device)
+        
+        # Bước 3: Nội suy z_t = (1-t)*x + t*e
+        z_t = self._interpolate(x_data, e, t)
+
+        # Bước 3.5: Điều kiện hóa điều hướng linh hoạt (Bài báo Mục 4.2), nếu được bật.
+        cfg_enabled = bool(cfg_conditioning)
+        omega_min = float(self.cfg_omega_min if cfg_omega_min is None else max(1.0, cfg_omega_min))
+        omega_max = float(self.cfg_omega_max if cfg_omega_max is None else max(omega_min, cfg_omega_max))
+        omega_beta = float(self.cfg_omega_power_beta if cfg_omega_power_beta is None else max(0.0, cfg_omega_power_beta))
+        interval_enabled = bool(self.enable_cfg_interval_conditioning if cfg_interval_conditioning is None else cfg_interval_conditioning)
+
+        if cfg_enabled:
+            omega = self._sample_cfg_omega(b, device, omega_min, omega_max, omega_beta).to(dtype=t.dtype)
+            if interval_enabled:
+                cfg_tmin, cfg_tmax = self._sample_cfg_interval(b, device)
+                in_interval = (t >= cfg_tmin) & (t <= cfg_tmax)
+                omega_effective = torch.where(in_interval, omega, torch.ones_like(omega))
+            else:
+                cfg_tmin = torch.zeros_like(t)
+                cfg_tmax = torch.ones_like(t)
+                omega_effective = omega
+        else:
+            omega = torch.ones_like(t)
+            cfg_tmin = torch.zeros_like(t)
+            cfg_tmax = torch.ones_like(t)
+            omega_effective = torch.ones_like(t)
+
+        context_cond = context
+        cfg_context_keep_ratio = torch.ones((), device=device)
+        if cfg_enabled:
+            drop_prob = float(max(0.0, min(1.0, cfg_context_dropout)))
+            if drop_prob > 0.0:
+                keep_mask = (torch.rand((b, 1), device=device) >= drop_prob).to(dtype=context.dtype)
+                context_cond = context * keep_mask
+                cfg_context_keep_ratio = keep_mask.mean()
+        
+        # Bước 4: Mục tiêu vận tốc có điều kiện
+        # Tối ưu hiệu năng: Khi CFG bật, gộp conditional + unconditional thành 1 forward pass duy nhất
+        # (batch doubling) thay vì 2 forward passes riêng biệt. Kết quả toán học giống hệt.
+        # `_want_hidden` chỉ True khi v_head tồn tại VÀ backbone hỗ trợ trả về hidden state
+        # (qua kwarg `return_hidden=True` của VoxelMamba). Backbone không hỗ trợ -> v_head fallback.
+        _want_hidden = bool(v_head is not None) and hasattr(model, 'get_hidden_state')
+        if cfg_enabled:
+            z_t_double = torch.cat([z_t, z_t], dim=0)
+            t_double = torch.cat([t, t], dim=0)
+            ctx_double = torch.cat([context_cond, torch.zeros_like(context_cond)], dim=0)
+            r_double = torch.cat([t, t], dim=0)
+            omega_double = torch.cat([omega_effective, omega_effective], dim=0)
+            cfg_tmin_double = torch.cat([cfg_tmin, cfg_tmin], dim=0)
+            cfg_tmax_double = torch.cat([cfg_tmax, cfg_tmax], dim=0)
+            
+            _fwd_kwargs = dict(
+                r=r_double, omega=omega_double,
+                cfg_tmin=cfg_tmin_double, cfg_tmax=cfg_tmax_double,
+            )
+            if _want_hidden:
+                _fwd_kwargs['return_hidden'] = True
+            
+            _fwd_out = model(z_t_double, t_double, ctx_double, **_fwd_kwargs)
+            
+            if _want_hidden and isinstance(_fwd_out, tuple):
+                v_both, h_both = _fwd_out
+                _cached_hidden = h_both[:b]  # Chỉ cần hidden state của phần conditional
+            else:
+                v_both = _fwd_out
+                _cached_hidden = None
+            
+            v_theta, v_uncond = v_both[:b], v_both[b:]
+            
+            coeff = (1.0 - (1.0 / omega_effective.clamp_min(1.0))).view(-1, *([1] * (x_data.ndim - 1)))
+            v_target = (e - x_data) + coeff * (v_theta.detach() - v_uncond.detach())
+        else:
+            _fwd_kwargs = dict(
+                r=t, omega=omega_effective, cfg_tmin=cfg_tmin, cfg_tmax=cfg_tmax,
+            )
+            if _want_hidden:
+                _fwd_kwargs['return_hidden'] = True
+            
+            _fwd_out = model(z_t, t, context_cond, **_fwd_kwargs)
+            
+            if _want_hidden and isinstance(_fwd_out, tuple):
+                v_theta, _cached_hidden = _fwd_out
+            else:
+                v_theta = _fwd_out
+                _cached_hidden = None
+            
+            v_target = e - x_data  # [B, L, D]
+        
+        # Mục tiêu khớp luồng thô (Raw flow matching target) (e - x), độc lập với tăng cường CFG.
+        # Được sử dụng cho việc giám sát v-head phụ trợ theo Phụ lục A của bài báo iMF:
+        # "Chúng tôi gắn thêm một hàm mất mát phụ trợ ‖v_θ − (e − x)‖² vào head này"
+        raw_v_target = e - x_data
+        
+        # === Phân nhánh: r=t (biên) vs r≠t (JVP) ===
+        mask_eq = (r == t)  # [B], True khi r=t
+        mask_eq_any = bool(mask_eq.any().item())
+        mask_eq_all = bool(mask_eq.all().item())
+        
+        # Khi r=t: u(z,t,t) ≡ v(z,t) → hàm mất mát v đơn giản (simple v-loss)
+        # Khi r≠t: hàm hợp V = u + (t-r)*sg(du/dt)
+        
+        v_target_loss = v_target
+        material_keep_ratio = torch.ones((), device=device)
+        if (
+            dual_branch
+            and shape_slice is not None
+            and material_slice is not None
+            and str(material_condition_source).lower() == "pred_detached"
+        ):
+            drop_prob = float(max(0.0, min(1.0, material_condition_dropout)))
+            if drop_prob > 0.0:
+                keep_mask = (
+                    torch.rand((b, 1, 1), device=device) >= drop_prob
+                ).to(dtype=v_target.dtype)
+                v_target_loss = v_target.clone()
+                gt_mat = v_target[..., material_slice]
+                pred_mat = v_theta[..., material_slice].detach()
+                v_target_loss[..., material_slice] = keep_mask * gt_mat + (1.0 - keep_mask) * pred_mat
+                material_keep_ratio = keep_mask.mean()
+
+        loss_shape = torch.zeros((), device=device)
+        loss_material = torch.zeros((), device=device)
+        if shape_slice is not None and material_slice is not None:
+            loss_shape = F.mse_loss(v_theta[..., shape_slice], v_target[..., shape_slice])
+            loss_material = F.mse_loss(v_theta[..., material_slice], v_target_loss[..., material_slice])
+
+        loss_boundary = torch.zeros((), device=device)
+        loss_jvp = torch.zeros((), device=device)
+        loss_v_head = torch.zeros((), device=device)
+        per_sample_v_head = None
+        
+        # Giám sát v-head phụ trợ (luôn luôn trên toàn bộ lô dữ liệu)
+        # Theo Phụ lục A của iMF: v-head sử dụng mục tiêu FM thô (e - x), KHÔNG PHẢI mục tiêu v_target được tăng cường CFG
+        # Tối ưu hiệu năng: tái sử dụng _cached_hidden từ forward pass đầu tiên,
+        # tránh gọi model.get_hidden_state() — tiết kiệm 1 forward pass hoàn chỉnh.
+        if v_head is not None:
+            if _cached_hidden is not None:
+                # Tái sử dụng hidden state đã tính từ forward pass #1 (cùng input z_t, t, ctx, r=t)
+                v_head_pred = v_head(_cached_hidden)
+                per_sample_v_head = ((v_head_pred - raw_v_target) ** 2).mean(dim=tuple(range(1, v_head_pred.ndim)))
+                loss_v_head = per_sample_v_head.mean()
+            elif hasattr(model, 'get_hidden_state'):
+                # Fallback: gọi get_hidden_state() nếu model không hỗ trợ return_hidden
+                h = model.get_hidden_state(
+                    z_t, t, context,
+                    r=t,
+                    omega=omega_effective,
+                    cfg_tmin=cfg_tmin,
+                    cfg_tmax=cfg_tmax,
+                )
+                v_head_pred = v_head(h)
+                per_sample_v_head = ((v_head_pred - raw_v_target) ** 2).mean(dim=tuple(range(1, v_head_pred.ndim)))
+                loss_v_head = per_sample_v_head.mean()
+            else:
+                v_head_pred = v_head(z_t)
+                per_sample_v_head = ((v_head_pred - raw_v_target) ** 2).mean(dim=tuple(range(1, v_head_pred.ndim)))
+                loss_v_head = per_sample_v_head.mean()
+
+        if mask_eq_all:
+            # Tất cả đều là biên → hàm mất mát khớp luồng đơn giản
+            per_sample_boundary = self._per_sample_weighted_mse(v_theta, v_target_loss, channel_weights)
+            with torch.no_grad():
+                self._update_adaptive_ema(t, per_sample_boundary.detach())
+            adaptive_w = self._get_adaptive_weights(t).detach()
+            loss = (per_sample_boundary * adaptive_w).mean()
+            if v_head is not None and per_sample_v_head is not None:
+                loss = loss + 0.1 * (per_sample_v_head * adaptive_w).mean()  # Adaptive weighting for v-head
+            loss_boundary = per_sample_boundary.mean()
+            if return_components:
+                return {
+                    "loss": loss,
+                    "loss_boundary": loss_boundary.detach(),
+                    "loss_jvp": loss_jvp.detach(),
+                    "loss_shape": loss_shape.detach(),
+                    "loss_material": loss_material.detach(),
+                    "loss_v_head": loss_v_head.detach(),
+                    "material_supervision_keep_ratio": material_keep_ratio.detach(),
+                    "cfg_context_keep_ratio": cfg_context_keep_ratio.detach(),
+                    "adaptive_weight_scale": adaptive_w.mean().detach(),
+                }
+            return loss
+        
+        # === Tính toán JVP cho r≠t ===
+        # Cần bật requires_grad cho z_t và t để tính JVP
+        z_t_jvp = z_t[~mask_eq].detach().requires_grad_(True)
+        t_jvp = t[~mask_eq].detach().requires_grad_(True)
+        r_jvp = r[~mask_eq]
+        omega_jvp = omega_effective[~mask_eq]
+        cfg_tmin_jvp = cfg_tmin[~mask_eq]
+        cfg_tmax_jvp = cfg_tmax[~mask_eq]
+        ctx_jvp = context_cond[~mask_eq] if context_cond.shape[0] == b else context_cond
+        v_target_jvp = v_target_loss[~mask_eq]
+        
+        # Lan truyền xuôi cho dự đoán u (u prediction)
+        u_pred = model(
+            z_t_jvp,
+            t_jvp,
+            ctx_jvp,
+            r=r_jvp,
+            omega=omega_jvp,
+            cfg_tmin=cfg_tmin_jvp,
+            cfg_tmax=cfg_tmax_jvp,
+        )
+
+        # Tính du/dt thông qua JVP với tiếp tuyến (dz/dt=v, dr/dt=0, dt/dt=1).
+        # v được xấp xỉ bởi v-head phụ trợ nếu có, ngược lại sử dụng dự đoán biên v_theta.
+        if v_head is not None:
+            v_tangent_jvp = v_head_pred[~mask_eq].detach()
+        else:
+            v_tangent_jvp = v_theta[~mask_eq].detach()
+            
+        try:
+            dudt = self._compute_dudt_jvp(
+                model,
+                z_t_jvp,
+                t_jvp,
+                r_jvp,
+                ctx_jvp,
+                v_tangent_jvp,
+                omega=omega_jvp,
+                cfg_tmin=cfg_tmin_jvp,
+                cfg_tmax=cfg_tmax_jvp,
+            )
+        except RuntimeError:
+            # Dự phòng cho các môi trường/toán tử không hỗ trợ JVP đáng tin cậy.
+            dt = 1e-3
+            t_plus = (t_jvp + dt).clamp(max=1.0 - self.sigma_min)
+            z_t_plus = self._interpolate(
+                x_data[~mask_eq], e[~mask_eq], t_plus
+            )
+            with torch.no_grad():
+                u_plus = model(
+                    z_t_plus,
+                    t_plus,
+                    ctx_jvp,
+                    r=r_jvp,
+                    omega=omega_jvp,
+                    cfg_tmin=cfg_tmin_jvp,
+                    cfg_tmax=cfg_tmax_jvp,
+                )
+                dudt = (u_plus - u_pred.detach()) / dt
+        
+        # Hàm hợp (Compound function): V = u + (t-r) * stop_grad(du/dt)
+        t_minus_r = (t_jvp - r_jvp).view(-1, *([1] * (u_pred.ndim - 1)))
+        V = u_pred + t_minus_r * dudt.detach()  # dừng lan truyền ngược (stop_grad) trên dudt
+        
+        # Hàm mất mát JVP: ||V - v_target||²
+        loss_jvp = self._weighted_mse(V, v_target_jvp, channel_weights)
+        per_sample_jvp = self._per_sample_weighted_mse(V, v_target_jvp, channel_weights)
+        
+        # Hàm mất mát biên (Boundary loss): ||v_theta - v_target||² (chỉ dành cho các mẫu có r=t)
+        if mask_eq_any:
+            loss_boundary = self._weighted_mse(v_theta[mask_eq], v_target_loss[mask_eq], channel_weights)
+            per_sample_boundary = self._per_sample_weighted_mse(v_theta[mask_eq], v_target_loss[mask_eq], channel_weights)
+        else:
+            loss_boundary = torch.tensor(0.0, device=device)
+            per_sample_boundary = torch.zeros((0,), device=device)
+        
+        # --- Adaptive loss weighting (MeanFlow paper, iMF Appendix A) ---
+        # Compute per-sample loss for EMA update, then apply per-sample adaptive
+        # weighting to the actual optimization objective.
+        with torch.no_grad():
+            per_sample_raw = torch.zeros(b, device=device)
+            if mask_eq_any:
+                per_sample_raw[mask_eq] = per_sample_boundary
+            if (~mask_eq).any():
+                per_sample_raw[~mask_eq] = per_sample_jvp
+            self._update_adaptive_ema(t, per_sample_raw)
+
+        adaptive_w = self._get_adaptive_weights(t).detach()
+        loss = (per_sample_raw * adaptive_w).mean()
+        adaptive_scale = adaptive_w.mean()
+        
+        if v_head is not None and per_sample_v_head is not None:
+            loss = loss + 0.1 * (per_sample_v_head * adaptive_w).mean()  # Adaptive weighting for v-head
+
+        if return_components:
+            return {
+                "loss": loss,
+                "loss_boundary": loss_boundary.detach(),
+                "loss_jvp": loss_jvp.detach(),
+                "loss_shape": loss_shape.detach(),
+                "loss_material": loss_material.detach(),
+                "loss_v_head": loss_v_head.detach(),
+                "material_supervision_keep_ratio": material_keep_ratio.detach(),
+                "cfg_context_keep_ratio": cfg_context_keep_ratio.detach(),
+                "adaptive_weight_scale": adaptive_scale.detach(),
+            }
+        return loss
+    
+    @torch.no_grad()
+    def sample_1_step(
+        self,
+        model: nn.Module,
+        context: torch.Tensor,
+        shape: Tuple[int, ...],
+        omega: Optional[torch.Tensor] = None,
+        cfg_tmin: Optional[torch.Tensor] = None,
+        cfg_tmax: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """
+        Lấy mẫu 1 bước iMF (1-Step Sampling): z_0 = z_1 - u_θ(z_1, r=0, t=1)
+        
+        Vì u_θ(z, t, t) ≡ v_θ(z, t) (điều kiện biên),
+        và khi r=0, t=1: u là vận tốc trung bình trên toàn bộ quỹ đạo (trajectory),
+        nên: z_0 = z_1 - u_θ(z_1, t=1)
+        
+        Bài báo: z₀ = z₁ - u_θ(z₁, r=0, t=1)
+        Mô hình nhận t=1 (tương ứng pure noise → dự đoán hướng về phía dữ liệu)
+        """
+        device = context.device
+        b = context.shape[0]
+
+        def _ensure_batch_scalar(val, default: float) -> torch.Tensor:
+            if val is None:
+                return torch.full((b,), default, device=device, dtype=context.dtype)
+            if not torch.is_tensor(val):
+                return torch.full((b,), float(val), device=device, dtype=context.dtype)
+            out = val.to(device=device, dtype=context.dtype)
+            if out.ndim == 0:
+                return out.expand(b)
+            if out.shape[0] != b:
+                return out.reshape(-1)[0].expand(b)
+            return out
+
+        omega_b = _ensure_batch_scalar(omega, 4.0).clamp_min(1.0)  # Áp dụng CFG (mặc định 4.0)
+        cfg_tmin_b = _ensure_batch_scalar(cfg_tmin, 0.2)  # Tắt CFG ở khoảng tinh chỉnh vi mô (t < 0.2)
+        cfg_tmax_b = _ensure_batch_scalar(cfg_tmax, 0.8)  # Tắt CFG ở khoảng nhiễu lớn (t > 0.8)
+        
+        # Bắt đầu từ nhiễu thuần túy (pure noise)
+        z_1 = torch.randn(shape, device=device)
+        r_0 = torch.zeros(b, device=device)
+        t_1 = torch.ones(b, device=device)  # t=1 (kết thúc tại nhiễu)
+        
+        # Áp dụng CFG interval: khi t nằm ngoài [tmin, tmax], đặt omega=1 (tắt CFG)
+        in_interval = (t_1 >= cfg_tmin_b) & (t_1 <= cfg_tmax_b)
+        omega_effective = torch.where(in_interval, omega_b, torch.ones_like(omega_b))
+
+        # Mô hình dự đoán vận tốc trung bình từ nhiễu → dữ liệu
+        u_pred = model(
+            z_1,
+            t_1,
+            context,
+            r=r_0,
+            omega=omega_effective,
+            cfg_tmin=cfg_tmin_b,
+            cfg_tmax=cfg_tmax_b,
+        )
+        
+        # Bước nhảy 1 lần (One-step jump): z_0 = z_1 - u (từ nhiễu đến dữ liệu)
+        z_0 = z_1 - u_pred
+        
+        return z_0
