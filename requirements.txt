@@ -1,0 +1,27 @@
+# Core Deep Learning
+--extra-index-url https://download.pytorch.org/whl/cu121
+torch==2.5.1
+torchvision==0.20.1
+torchaudio==2.5.1
+
+# Sparse Convolution & Mamba (Stage 1 & 2)
+spconv-cu121==2.3.8
+mamba-ssm==2.3.1
+causal-conv1d==1.6.1
+triton==3.1.0
+
+# Data & 3D Processing
+lmdb==2.2.0
+trimesh==4.11.3
+open3d==0.19.0
+scipy==1.17.1
+numpy
+o-voxel==0.0.1
+
+# Utilities
+tqdm==4.67.3
+wandb==0.25.1
+opencv-python-headless==4.13.0.92
+scikit-image==0.26.0
+transformers==5.3.0
+pyyaml
