@@ -38,16 +38,16 @@ echo "========================================================="
 TAR_FILE="$WORKSPACE_DIR/data/hybrid_context_lmdb.tar"
 tar -cf "$TAR_FILE" -C "$WORKSPACE_DIR/data" "hybrid_context.lmdb"
 
-echo "Nén xong: $(du -sh $TAR_FILE)"
+echo "Nén xong: $(du -sh "$TAR_FILE")"
 
-# Đồng bộ lên Drive
-rclone copy -P "$TAR_FILE" "$REMOTE_NAME":"$REMOTE_FOLDER/"
-
-if [ $? -eq 0 ]; then
+# Đồng bộ lên Drive (đường dẫn remote có khoảng trắng → một chuỗi remote:folder/)
+DEST_REMOTE="${REMOTE_NAME}:${REMOTE_FOLDER}/"
+if rclone copy -P "$TAR_FILE" "$DEST_REMOTE"; then
     echo "===================================================="
     echo "THÀNH CÔNG: Đã upload hybrid_context_lmdb.tar lên Google Drive!"
     echo "Lên Cloud, bạn có thể giải nén và dùng ngay cho VoxelMamba."
     echo "===================================================="
 else
-    echo "LỖI: Upload thất bại. Vui lòng kiểm tra lại rclone hoặc dung lượng."
+    echo "LỖI: Upload thất bại. Kiểm tra: rclone config ($REMOTE_NAME), mạng, quota Drive." >&2
+    exit 1
 fi
