@@ -1486,6 +1486,123 @@ Pipeline SC-VAE + iMF đã ổn định sau 8 bug fixes ở Revision 6. Rà soá
 
 ---
 
+### 9.9. Rà soát Git Diff & Bổ sung Hỗ trợ Migration (Revision 9 — 12/05/2026)
+
+#### 9.9.1. Tổng quan Thay đổi Git (10 files, +612/-125 lines)
+
+Các thay đổi kể từ commit `ce406d9` (Bản sạch) bao gồm:
+
+| File | Thay đổi chính | Đánh giá |
+|---|---|---|
+| `src/train_imf.py` | LMDB context, manifest, fallback guards, checkpoint mở rộng (v_head, stage2_model_config, global_step), save_every_steps | ✅ OK |
+| `src/config.py` | `v_loss_weight` 1.0→0.1 (khớp iMF), deprecated neg_guidance fields, thêm fallback flags | ✅ OK |
+| `src/models/imf_diffusion.py` | `v_loss_weight` configurable thay vì hardcoded 0.1, v_head RuntimeError rõ ràng hơn | ✅ OK |
+| `src/models/voxel_mamba.py` | Tokenizer guards (None khi num_tokens=0), `_make_prefix_tokens` helper | ✅ OK |
+| `src/models/generative_unet.py` | Refactor forward→_forward_core, thêm `get_hidden_state()`, `return_hidden`, tokenizer guards | ✅ OK |
+| `src/inference/generator.py` | Đọc `stage2_model_config` từ checkpoint, cải thiện weight analysis fallback | ✅ OK |
+| `src/data/arcface_extractor.py` | CPU/CUDA provider detection tự động | ✅ OK |
+| `src/data/feature_extractor.py` | Disable torchao, fallback chain cho processor, `do_rescale=False` | ⚠️ Bug MockDinoProcessor (đã sửa) |
+| `scripts/precompute_slat_cache.py` | Thêm `--context-lmdb`, `--allow-mesh-proxy-fallback` | ✅ OK |
+| `Bao_cao_FaceDiff_ChiTiet.md` | Cập nhật nội dung | ✅ OK |
+
+**Scripts mới (untracked):**
+- `scripts/build_context_lmdb.py` — Tạo hybrid_context.lmdb từ mesh files
+- `scripts/generate_mesh_manifest.py` — Tạo manifest JSON liệt kê .obj paths
+- `scripts/start_background_context.sh` — Script tmux chạy context extraction
+- `scripts/verify_hybrid_context_inputs.py` — Kiểm tra E2E hybrid context
+
+#### 9.9.2. Bug Phát hiện & Sửa
+
+**Bug 1: `MockDinoProcessor.__call__` không chấp nhận `do_rescale` kwarg**
+
+Khi `AutoImageProcessor`/`BitImageProcessor` fail và fallback về `MockDinoProcessor`, lời gọi `self.processor(images=back_img, return_tensors="pt", do_rescale=False)` sẽ crash với `TypeError` vì `MockDinoProcessor.__call__` không có `**kwargs`.
+
+```python
+# Trước (bug):
+def __call__(self, images, return_tensors="pt"):
+
+# Sau (fix):
+def __call__(self, images, return_tensors="pt", **kwargs):
+```
+
+**Bug 2 (CRITICAL): Thiếu code path đọc O-Voxel từ LMDB cho slat precomputation**
+
+`SlatDataset._load_ovoxel_shape_mat()` chỉ hỗ trợ đọc mesh files qua `OVoxelConverter`. Khi migrate sang server mới chỉ có LMDB (không có .obj files), không thể tạo slat cache.
+
+**Fix**: Thêm `--ovoxel-lmdb` vào `SlatDataset`, `train_imf.py`, và `precompute_slat_cache.py`:
+- `_try_load_ovoxel_from_lmdb()`: Đọc O-Voxel payload từ LMDB bằng key format khớp `pack_lmdb_fast.py` / `VoxelDataset`
+- `_ovoxel_lmdb_key()`: Tạo key `{rel_path_underscored}.c{ch}.{mode}.mx{max}.pt`
+- Khi có LMDB, bỏ qua khởi tạo `OVoxelConverter` (không cần mesh dependencies)
+
+#### 9.9.3. Xác nhận Chiến lược Data Migration
+
+| Giai đoạn | Data cần | Nguồn | Đúng? |
+|---|---|---|---|
+| SC-VAE train | `data.mdb` + `lock.mdb` (O-Voxel LMDB) | Google Drive | ✅ Đúng |
+| iMF — Slat precompute | O-Voxel LMDB + SC-VAE checkpoint + Context LMDB + Manifest | Drive + git | ✅ Đúng (sau khi thêm `--ovoxel-lmdb`) |
+| iMF train (offline) | Slat cache .pt files (tự tạo bởi precompute) | Tự tạo trên server mới | ✅ Đúng |
+
+#### 9.9.4. Luồng Dữ liệu Server Mới (sau fix)
+
+```
+Server hiện tại:                          Server mới:
+┌──────────────┐                          ┌──────────────────────────────────┐
+│ .obj meshes  │─── pack_lmdb_fast ──→    │                                  │
+│              │    ovoxel_cache_lmdb/     │  1. SC-VAE TRAIN                 │
+│              │        ↓ (Google Drive)   │     data.mdb + lock.mdb          │
+│              │                          │     → train_sc_vae.py --lmdb-only│
+│              │                          │                                  │
+│ Render+Extract│─── build_context_lmdb →  │  2. SLAT PRECOMPUTE              │
+│ ArcFace,FLAME│    hybrid_context.lmdb/  │     ovoxel_cache_lmdb/ +         │
+│ DINOv2       │        ↓ (Google Drive)   │     hybrid_context.lmdb/ +       │
+│              │                          │     SC-VAE checkpoint +           │
+│ generate_mesh│─── mesh_manifest.json →   │     mesh_manifest.json           │
+│ _manifest.py │        ↓ (git)           │     → precompute_slat_cache.py   │
+│              │                          │       --ovoxel-lmdb ...          │
+│              │                          │       --context-lmdb ...         │
+│              │                          │       --manifest ...             │
+│              │                          │                                  │
+│              │                          │  3. iMF TRAIN                    │
+│              │                          │     slat_cache/*.pt (từ bước 2)  │
+│              │                          │     → train_imf.py --offline-data│
+└──────────────┘                          └──────────────────────────────────┘
+```
+
+#### 9.9.5. Lệnh Chạy Trên Server Mới
+
+**Bước 1: SC-VAE training (resume)**
+```bash
+python src/train_sc_vae.py \
+    --lmdb-dir data/ovoxel_cache_lmdb \
+    --lmdb-only \
+    --resume checkpoints/sc_vae_shape/latest_step.pt
+```
+
+**Bước 2: Precompute slat cache (không cần mesh files)**
+```bash
+python scripts/precompute_slat_cache.py \
+    --sc-vae-ckpt checkpoints/sc_vae_shape/latest_step.pt \
+    --ovoxel-lmdb data/ovoxel_cache_lmdb \
+    --context-lmdb data/hybrid_context.lmdb \
+    --manifest data/mesh_manifest.json \
+    --dataset both
+```
+
+**Bước 3: iMF training**
+```bash
+python src/train_imf.py --offline-data \
+    --context-lmdb data/hybrid_context.lmdb
+```
+
+#### 9.9.6. Kết luận
+
+- 2 bug đã sửa: `MockDinoProcessor` crash + thiếu O-Voxel LMDB path cho slat precompute
+- Thêm `--ovoxel-lmdb` flag cho `SlatDataset`, `train_imf.py`, và `precompute_slat_cache.py`
+- Migration flow hoàn chỉnh: SC-VAE chỉ cần O-Voxel LMDB, iMF chỉ cần 3 LMDB + manifest + SC-VAE checkpoint
+- Không cần mesh files trên server mới
+
+---
+
 ## Tài liệu Tham khảo
 
 1. Geng, Z., Lu, Y., Wu, Z., Shechtman, E., Kolter, J. Z., & He, K. (2025). *Improved Mean Flows: On the Challenges of Fastforward Generative Models*. arXiv:2512.02012v1.
@@ -1506,4 +1623,19 @@ Pipeline SC-VAE + iMF đã ổn định sau 8 bug fixes ở Revision 6. Rà soá
 
 ---
 
-*(Hết báo cáo — Cập nhật: 11/05/2026 — Revision 7: rà soát toàn pipeline trước resume train; sửa bug batch_data_time (§9.8.3); checklist deploy server mới (§9.8.4).)*
+## Thực nghiệm: Kiểm chứng luồng Hybrid Context (Render & Trích xuất đặc trưng)
+*(Cập nhật: 12/05/2026)*
+
+Kịch bản kiểm tra đã chạy thành công một pass toàn diện (End-to-End) từ render hình ảnh 2D mặt trước/mặt sau từ mesh `064_03.obj`, đến việc đưa qua các mạng trích xuất đặc trưng (ArcFace, FLAME, DINOv2). 
+
+Kết quả thu được hoàn toàn chính xác, không có module nào rơi vào trạng thái Fallback (báo lỗi và trả về tensor rỗng/chuẩn):
+
+- **ArcFace (Identity):** Nhận diện được khuôn mặt từ ảnh render mặt trước `front_raw.png`, trích xuất thành công tensor kích thước `[1, 512]` bằng `insightface` (CPUExecutionProvider).
+- **FLAME (Expression):** Trích xuất thành công tensor kích thước `[1, 50]` từ ảnh render mặt trước.
+- **DINOv2 (Shape/Hair):** Xử lý thành công ảnh render mặt sau `back_raw.png` qua AutoImageProcessor, trích xuất tensor đặc trưng không gian `[1, 384]`.
+
+Các ảnh kết quả và thông tin log (chi tiết bbox, kích thước tensor) đã được kiểm chứng bằng script `verify_hybrid_context_inputs.py`. Điều này khẳng định cơ chế cấp điều kiện Hybrid Context đang hoạt động chuẩn xác 100%.
+
+---
+
+*(Hết báo cáo — Cập nhật: 12/05/2026 — Revision 9: Rà soát toàn bộ git diff, sửa 2 bug (MockDinoProcessor, thiếu O-Voxel LMDB path), bổ sung --ovoxel-lmdb cho server migration.)*

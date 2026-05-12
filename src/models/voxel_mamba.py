@@ -254,19 +254,28 @@ class VoxelMamba(nn.Module):
         )
         
         # Các bộ tạo token điều kiện hóa trong ngữ cảnh (In-context conditioning tokenizers)
-        self.context_tokenizer = nn.Sequential(
-            nn.Linear(context_dim, hidden_dim * num_context_tokens),
-            nn.SiLU(),
+        self.context_tokenizer = (
+            nn.Sequential(
+                nn.Linear(context_dim, hidden_dim * num_context_tokens),
+                nn.SiLU(),
+            )
+            if num_context_tokens > 0 else None
         )
         
-        self.time_tokenizer = nn.Sequential(
-            nn.Linear(self.time_embed_dim, hidden_dim * num_time_tokens),
-            nn.SiLU(),
+        self.time_tokenizer = (
+            nn.Sequential(
+                nn.Linear(self.time_embed_dim, hidden_dim * num_time_tokens),
+                nn.SiLU(),
+            )
+            if num_time_tokens > 0 else None
         )
         
-        self.r_tokenizer = nn.Sequential(
-            nn.Linear(self.time_embed_dim, hidden_dim * num_r_tokens),
-            nn.SiLU(),
+        self.r_tokenizer = (
+            nn.Sequential(
+                nn.Linear(self.time_embed_dim, hidden_dim * num_r_tokens),
+                nn.SiLU(),
+            )
+            if num_r_tokens > 0 else None
         )
         
         # Explicit (t-r) interval conditioning — iMF paper Tab. 4:
@@ -280,14 +289,20 @@ class VoxelMamba(nn.Module):
             nn.SiLU(),
             nn.Linear(self.time_embed_dim, self.time_embed_dim),
         )
-        self.interval_tokenizer = nn.Sequential(
-            nn.Linear(self.time_embed_dim, hidden_dim * num_interval_tokens),
-            nn.SiLU(),
+        self.interval_tokenizer = (
+            nn.Sequential(
+                nn.Linear(self.time_embed_dim, hidden_dim * num_interval_tokens),
+                nn.SiLU(),
+            )
+            if num_interval_tokens > 0 else None
         )
         
-        self.guidance_tokenizer = nn.Sequential(
-            nn.Linear(3, hidden_dim * num_guidance_tokens),  # [omega, t_min, t_max]
-            nn.SiLU(),
+        self.guidance_tokenizer = (
+            nn.Sequential(
+                nn.Linear(3, hidden_dim * num_guidance_tokens),  # [omega, t_min, t_max]
+                nn.SiLU(),
+            )
+            if num_guidance_tokens > 0 else None
         )
         
         # Ngăn xếp các khối Mamba hai chiều
@@ -327,6 +342,17 @@ class VoxelMamba(nn.Module):
                 print(f"[VoxelMamba] Hilbert ordering disabled: slat_length={slat_length} is not a perfect cube of power-of-2")
                 self.use_hilbert_ordering = False
         
+    def _make_prefix_tokens(
+        self,
+        tokenizer: Optional[nn.Module],
+        source: torch.Tensor,
+        num_tokens: int,
+        batch_size: int,
+    ) -> torch.Tensor:
+        if tokenizer is None or num_tokens <= 0:
+            return source.new_zeros((batch_size, 0, self.hidden_dim))
+        return tokenizer(source).view(batch_size, num_tokens, self.hidden_dim)
+
     def _forward_core(
         self,
         x_t: torch.Tensor,
@@ -356,16 +382,13 @@ class VoxelMamba(nn.Module):
         if self.use_hilbert_ordering:
             h = h[:, self._hilbert_to_raster, :]
         
-        ctx_emb = self.context_tokenizer(context)
-        ctx_tokens = ctx_emb.view(B, self.num_context_tokens, self.hidden_dim)
+        ctx_tokens = self._make_prefix_tokens(self.context_tokenizer, context, self.num_context_tokens, B)
         
         t_emb = self.time_mlp(t)
-        t_emb_expanded = self.time_tokenizer(t_emb)
-        time_tokens = t_emb_expanded.view(B, self.num_time_tokens, self.hidden_dim)
+        time_tokens = self._make_prefix_tokens(self.time_tokenizer, t_emb, self.num_time_tokens, B)
         
         r_emb = self.r_mlp(r)
-        r_emb_expanded = self.r_tokenizer(r_emb)
-        r_tokens = r_emb_expanded.view(B, self.num_r_tokens, self.hidden_dim)
+        r_tokens = self._make_prefix_tokens(self.r_tokenizer, r_emb, self.num_r_tokens, B)
         
         # (t-r) interval tokens — iMF paper Tab. 4 ("(t,r) cond: t-r"). Signed.
         # _sample_t_r() đảm bảo r ≤ t nên (t-r) ≥ 0; vẫn giữ signed để model học
@@ -373,12 +396,10 @@ class VoxelMamba(nn.Module):
         # native cho đầu vào không âm.
         interval = (t - r)
         interval_emb = self.interval_mlp(interval)
-        interval_emb_expanded = self.interval_tokenizer(interval_emb)
-        interval_tokens = interval_emb_expanded.view(B, self.num_interval_tokens, self.hidden_dim)
+        interval_tokens = self._make_prefix_tokens(self.interval_tokenizer, interval_emb, self.num_interval_tokens, B)
         
         guidance_input = torch.stack([omega, cfg_tmin, cfg_tmax], dim=-1)
-        g_emb = self.guidance_tokenizer(guidance_input)
-        guidance_tokens = g_emb.view(B, self.num_guidance_tokens, self.hidden_dim)
+        guidance_tokens = self._make_prefix_tokens(self.guidance_tokenizer, guidance_input, self.num_guidance_tokens, B)
         
         prefix = torch.cat([ctx_tokens, time_tokens, r_tokens, interval_tokens, guidance_tokens], dim=1)
         h = torch.cat([prefix, h], dim=1)

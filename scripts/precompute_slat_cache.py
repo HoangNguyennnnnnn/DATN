@@ -47,6 +47,11 @@ def _build_one_slat_dataset(
     include_ids,
     exclude_ids,
     single_ckpt_path: str,
+    allow_random_context_fallback: bool,
+    allow_mesh_proxy_fallback: bool,
+    context_lmdb_dir: str | None = None,
+    ovoxel_lmdb_dir: str | None = None,
+    manifest_list: list[str] | None = None,
 ):
     from src.train_imf import SlatDataset
 
@@ -76,6 +81,11 @@ def _build_one_slat_dataset(
         shape_sc_vae_checkpoint=str(imf_cfg.shape_sc_vae_checkpoint or single_ckpt_path),
         material_sc_vae_checkpoint=str(imf_cfg.material_sc_vae_checkpoint or single_ckpt_path),
         ovoxel_resolution=int(getattr(cfg.sc_vae, "ovoxel_resolution", 256)),
+        allow_random_context_fallback=bool(allow_random_context_fallback),
+        allow_mesh_proxy_fallback=bool(allow_mesh_proxy_fallback),
+        context_lmdb_dir=context_lmdb_dir,
+        ovoxel_lmdb_dir=ovoxel_lmdb_dir,
+        manifest_list=manifest_list,
     )
 
 
@@ -113,6 +123,11 @@ def main() -> None:
         help="KHÔNG khởi tạo renderer/ArcFace/FLAME/DINO — context ngẫu nhiên (chỉ để test tốc độ)",
     )
     parser.add_argument(
+        "--allow-mesh-proxy-fallback",
+        action="store_true",
+        help="Debug-only: cho phép mesh proxy fallback khi O-Voxel converter lỗi.",
+    )
+    parser.add_argument(
         "--faceverse-train-ids",
         type=str,
         default="train_faceverse_ids.txt",
@@ -132,6 +147,24 @@ def main() -> None:
         type=str,
         default="data/slat_cache_facescape",
         help="Thư mục cache FaceScape (mặc định giống train_imf)",
+    )
+    parser.add_argument(
+        "--context-lmdb",
+        type=str,
+        default=None,
+        help="Path to hybrid_context.lmdb (to skip GPU rendering during precomputation)",
+    )
+    parser.add_argument(
+        "--ovoxel-lmdb",
+        type=str,
+        default=None,
+        help="Path to ovoxel_cache_lmdb (to read O-Voxel data without mesh files)",
+    )
+    parser.add_argument(
+        "--manifest",
+        type=str,
+        default=None,
+        help="Path to mesh_manifest.json (to list samples without scanning filesystem)",
     )
     args = parser.parse_args()
 
@@ -176,9 +209,12 @@ def main() -> None:
     sc_vae.load_state_dict(state, strict=True)
     sc_vae = sc_vae.to(device).eval()
 
-    if args.use_random_context:
+    if args.use_random_context or args.context_lmdb:
         renderer = arcface = flame = dinov2 = None
-        print("[Precompute] WARN: --use-random-context → context trong cache KHÔNG phải hybrid thật")
+        if args.context_lmdb:
+            print(f"[Precompute] Using precomputed context from LMDB: {args.context_lmdb}")
+        else:
+            print("[Precompute] WARN: --use-random-context -> context trong cache KHÔNG phải hybrid thật")
     else:
         print("[Precompute] Loading hybrid context stack (renderer + ArcFace + FLAME + DINOv2)...")
         renderer = MeshRenderer(device=str(device), image_size=512)
@@ -194,8 +230,15 @@ def main() -> None:
         fs_inc = load_identity_set(args.facescape_train_ids)
         fs_exc = load_identity_set(args.facescape_test_ids)
 
+    manifest_data = None
+    if args.manifest and os.path.isfile(args.manifest):
+        import json
+        with open(args.manifest, "r", encoding="utf-8") as f:
+            manifest_data = json.load(f)
+        print(f"[Precompute] Loaded manifest from: {args.manifest}")
+
     datasets: list[tuple[str, object]] = []
-    if args.dataset in ("faceverse", "both") and os.path.isdir(cfg.data.faceverse_root):
+    if args.dataset in ("faceverse", "both") and (os.path.isdir(cfg.data.faceverse_root) or args.ovoxel_lmdb):
         ds = _build_one_slat_dataset(
             cfg=cfg,
             imf_cfg=imf_cfg,
@@ -210,10 +253,15 @@ def main() -> None:
             include_ids=fv_inc,
             exclude_ids=fv_exc,
             single_ckpt_path=os.path.abspath(args.sc_vae_ckpt),
+            allow_random_context_fallback=bool(args.use_random_context),
+            allow_mesh_proxy_fallback=bool(args.allow_mesh_proxy_fallback),
+            context_lmdb_dir=args.context_lmdb,
+            ovoxel_lmdb_dir=args.ovoxel_lmdb,
+            manifest_list=manifest_data.get("faceverse") if manifest_data else None,
         )
         if len(ds) > 0:
             datasets.append(("faceverse", ds))
-    if args.dataset in ("facescape", "both") and os.path.isdir(cfg.data.facescape_root):
+    if args.dataset in ("facescape", "both") and (os.path.isdir(cfg.data.facescape_root) or args.ovoxel_lmdb):
         ds = _build_one_slat_dataset(
             cfg=cfg,
             imf_cfg=imf_cfg,
@@ -228,6 +276,11 @@ def main() -> None:
             include_ids=fs_inc,
             exclude_ids=fs_exc,
             single_ckpt_path=os.path.abspath(args.sc_vae_ckpt),
+            allow_random_context_fallback=bool(args.use_random_context),
+            allow_mesh_proxy_fallback=bool(args.allow_mesh_proxy_fallback),
+            context_lmdb_dir=args.context_lmdb,
+            ovoxel_lmdb_dir=args.ovoxel_lmdb,
+            manifest_list=manifest_data.get("facescape") if manifest_data else None,
         )
         if len(ds) > 0:
             datasets.append(("facescape", ds))

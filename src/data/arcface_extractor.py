@@ -62,19 +62,26 @@ class ArcFaceExtractor:
         if INSIGHTFACE_AVAILABLE:
             print(f"[ArcFace] Khởi tạo InsightFace model pack: {model_name}")
             self.mode = "insightface"
+            self.use_cuda_provider = self.device.type == "cuda" and torch.cuda.is_available()
+            providers = ['CUDAExecutionProvider', 'CPUExecutionProvider'] if self.use_cuda_provider else ['CPUExecutionProvider']
+            ctx_id = 0 if self.use_cuda_provider else -1
             self.app = FaceAnalysis(
                 name=model_name,
-                providers=['CUDAExecutionProvider', 'CPUExecutionProvider']
+                providers=providers,
             )
-            self.app.prepare(ctx_id=0, det_size=(det_size, det_size))
-            print(f"[ArcFace] InsightFace đã sẵn sàng (ONNX + CUDA)")
+            self.app.prepare(ctx_id=ctx_id, det_size=(det_size, det_size))
+            self.providers = list(providers)
+            provider_desc = " + ".join(providers)
+            print(f"[ArcFace] InsightFace đã sẵn sàng (providers={provider_desc})")
         elif TORCHVISION_AVAILABLE:
             print(f"[ArcFace] Không tìm thấy InsightFace, sử dụng dự phòng ResNet-50")
             self.mode = "resnet_fallback"
             self._build_resnet_fallback()
+            self.providers = ["torchvision"]
         else:
             print(f"[ArcFace] Không có thư viện nào, sử dụng giá trị nhúng ngẫu nhiên (random embedding)")
             self.mode = "mock"
+            self.providers = ["mock"]
     
     def _build_resnet_fallback(self):
         """

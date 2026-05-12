@@ -1,14 +1,48 @@
 import torch
 from typing import Tuple
 
+import sys
+sys.modules['torchao'] = None
+
+PROCESSOR_BACKEND = None
 try:
     from transformers import AutoImageProcessor, AutoModel
-except ImportError:
-    pass
+    PROCESSOR_BACKEND = "AutoImageProcessor"
+except Exception:
+    AutoImageProcessor = None
+    try:
+        from transformers import AutoFeatureExtractor as AutoImageProcessor, AutoModel
+        PROCESSOR_BACKEND = "AutoFeatureExtractor"
+    except Exception:
+        AutoImageProcessor = None
+        AutoModel = None
 
 try:
-    # Sử dụng torchao cho việc lượng tử hóa (quantization) INT4 theo như mô tả trong RULES.md để bảo toàn VRAM cho RTX 4090
-    import torchao
+    from transformers import BitImageProcessor
+except Exception:
+    BitImageProcessor = None
+
+class MockDinoProcessor:
+    def __init__(self, size=224):
+        self.size = {"height": size, "width": size}
+        self.image_mean = [0.485, 0.456, 0.406]
+        self.image_std = [0.229, 0.224, 0.225]
+        import torchvision.transforms as T
+        self.transform = T.Compose([
+            T.Resize(size, interpolation=T.InterpolationMode.BICUBIC),
+            T.CenterCrop(size),
+            T.Normalize(mean=self.image_mean, std=self.image_std)
+        ])
+        
+    def __call__(self, images, return_tensors="pt", **kwargs):
+        if not isinstance(images, torch.Tensor):
+            raise ValueError("MockDinoProcessor expects a torch.Tensor")
+        pixel_values = self.transform(images)
+        return {"pixel_values": pixel_values}
+
+try:
+    # Torchao bị vô hiệu hóa để fix lỗi transformers
+    torchao = None
 except Exception as e:
     print(f"[DinoV3Extractor] torchao skipped: {e}")
     torchao = None
@@ -26,12 +60,35 @@ class DinoV3Extractor:
         quantize_int4: bool = False
     ):
         self.device = torch.device(device)
-        self.processor = AutoImageProcessor.from_pretrained(model_name)
+        if AutoImageProcessor is None or AutoModel is None:
+            raise RuntimeError(
+                "DinoV3Extractor requires transformers image processor support, but neither "
+                "AutoImageProcessor nor AutoFeatureExtractor could be imported in this environment."
+            )
+        self.processor_backend = str(PROCESSOR_BACKEND or "unknown")
+        try:
+            self.processor = AutoImageProcessor.from_pretrained(model_name)
+        except Exception as e:
+            print(f"[DinoV2Extractor] AutoImageProcessor failed: {e}. Trying BitImageProcessor...")
+            if BitImageProcessor is not None:
+                try:
+                    self.processor = BitImageProcessor.from_pretrained(model_name)
+                    self.processor_backend = "BitImageProcessor"
+                except Exception as e2:
+                    print(f"[DinoV2Extractor] BitImageProcessor failed: {e2}. Falling back to MockProcessor.")
+                    self.processor = MockDinoProcessor(size=224)
+                    self.processor_backend = "MockDinoProcessor"
+            else:
+                print(f"[DinoV2Extractor] BitImageProcessor unavailable. Falling back to MockProcessor.")
+                self.processor = MockDinoProcessor(size=224)
+                self.processor_backend = "MockDinoProcessor"
+
         
-        print(f"[DinoV2Extractor] Loading {model_name} in bfloat16...")
+        self.model_dtype = torch.bfloat16 if self.device.type == "cuda" else torch.float32
+        print(f"[DinoV2Extractor] Loading {model_name} with {self.processor_backend} in {self.model_dtype}...")
         self.model = AutoModel.from_pretrained(
             model_name, 
-            torch_dtype=torch.bfloat16
+            torch_dtype=self.model_dtype
         ).to(self.device).eval()
 
         if quantize_int4 and torchao is not None:
@@ -55,8 +112,15 @@ class DinoV3Extractor:
         """
         mem_before = torch.cuda.memory_allocated(self.device) / (1024**2)
 
-        # Xử lý (Process) ảnh mặt sau
-        back_inputs = self.processor(images=back_img, return_tensors="pt").to(self.device, dtype=torch.bfloat16)
+        # Xử lý (Process) ảnh mặt sau, tắt rescale vì back_img đã ở dạng [0, 1]
+        back_inputs = self.processor(images=back_img, return_tensors="pt", do_rescale=False)
+        back_inputs = {
+            key: (
+                value.to(self.device, dtype=self.model_dtype)
+                if torch.is_floating_point(value) else value.to(self.device)
+            )
+            for key, value in back_inputs.items()
+        }
         back_outputs = self.model(**back_inputs)
 
         # Token CLS [B, 384]
@@ -66,4 +130,3 @@ class DinoV3Extractor:
         print(f"[DinoV2Extractor] Memory Delta: {mem_after - mem_before:.2f} MB")
         
         return back_cls
-

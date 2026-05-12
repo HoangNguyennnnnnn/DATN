@@ -320,6 +320,15 @@ class FaceDiffGenerator:
             return None
         return self._normalize_state_dict(sd)
 
+    def _extract_imf_checkpoint_payload(self, ckpt_path: str | None) -> dict | None:
+        if not ckpt_path or not os.path.exists(ckpt_path):
+            return None
+        try:
+            ckpt = torch.load(ckpt_path, map_location='cpu', weights_only=False)
+        except Exception:
+            return None
+        return ckpt if isinstance(ckpt, dict) else None
+
     def _infer_stage2_model_config(self, ckpt_path: str | None, default_input_dim: int, default_context_dim: int) -> dict:
         train_cfg = TrainConfig().imf
         cfg = {
@@ -343,6 +352,11 @@ class FaceDiffGenerator:
             "expand": int(getattr(train_cfg, "mamba_expand", 2)),
             "dropout": float(getattr(train_cfg, "dropout", 0.0)),
         }
+
+        ckpt_payload = self._extract_imf_checkpoint_payload(ckpt_path)
+        if isinstance(ckpt_payload, dict) and isinstance(ckpt_payload.get("stage2_model_config"), dict):
+            cfg.update(ckpt_payload["stage2_model_config"])
+            return cfg
 
         sd = self._extract_imf_state_dict(ckpt_path)
         if not isinstance(sd, dict):
@@ -368,14 +382,20 @@ class FaceDiffGenerator:
             r_w = sd.get("r_tokenizer.0.weight", None)
             if isinstance(r_w, torch.Tensor) and r_w.ndim == 2 and int(cfg["hidden_dim"]) > 0:
                 cfg["num_r_tokens"] = max(1, int(r_w.shape[0] // int(cfg["hidden_dim"])))
+            else:
+                cfg["num_r_tokens"] = 0
 
             interval_w = sd.get("interval_tokenizer.0.weight", None)
             if isinstance(interval_w, torch.Tensor) and interval_w.ndim == 2 and int(cfg["hidden_dim"]) > 0:
                 cfg["num_interval_tokens"] = max(1, int(interval_w.shape[0] // int(cfg["hidden_dim"])))
+            else:
+                cfg["num_interval_tokens"] = 0
 
             guide_w = sd.get("guidance_tokenizer.0.weight", None)
             if isinstance(guide_w, torch.Tensor) and guide_w.ndim == 2 and int(cfg["hidden_dim"]) > 0:
                 cfg["num_guidance_tokens"] = max(1, int(guide_w.shape[0] // int(cfg["hidden_dim"])))
+            else:
+                cfg["num_guidance_tokens"] = 0
 
             layer_ids = []
             for key in sd.keys():
@@ -401,6 +421,22 @@ class FaceDiffGenerator:
         context_proj = sd.get("context_tokens.0.weight", None)
         if isinstance(context_proj, torch.Tensor) and context_proj.ndim == 2:
             cfg["context_dim"] = int(context_proj.shape[1])
+
+        time_proj = sd.get("time_tokenizer.proj.0.weight", None)
+        if isinstance(time_proj, torch.Tensor) and time_proj.ndim == 2 and int(cfg["hidden_dims"][-1]) > 0:
+            cfg["num_time_tokens"] = max(1, int(time_proj.shape[0] // int(cfg["hidden_dims"][-1])))
+
+        r_proj = sd.get("r_tokenizer.proj.0.weight", None)
+        if isinstance(r_proj, torch.Tensor) and r_proj.ndim == 2 and int(cfg["hidden_dims"][-1]) > 0:
+            cfg["num_r_tokens"] = max(1, int(r_proj.shape[0] // int(cfg["hidden_dims"][-1])))
+        else:
+            cfg["num_r_tokens"] = 0
+
+        guide_proj = sd.get("guidance_tokenizer.proj.0.weight", None)
+        if isinstance(guide_proj, torch.Tensor) and guide_proj.ndim == 2 and int(cfg["hidden_dims"][-1]) > 0:
+            cfg["num_guidance_tokens"] = max(1, int(guide_proj.shape[0] // int(cfg["hidden_dims"][-1])))
+        else:
+            cfg["num_guidance_tokens"] = 0
 
         bottleneck_layers = []
         for key in sd.keys():
@@ -445,6 +481,8 @@ class FaceDiffGenerator:
             num_bottleneck_layers=int(stage2_cfg["num_bottleneck_layers"]),
             num_context_tokens=int(stage2_cfg["num_context_tokens"]),
             num_time_tokens=int(stage2_cfg["num_time_tokens"]),
+            num_r_tokens=int(stage2_cfg.get("num_r_tokens", 0)),
+            num_guidance_tokens=int(stage2_cfg.get("num_guidance_tokens", 0)),
         )
 
     def _load_imf_checkpoint(self, model: nn.Module, ckpt_path: str):

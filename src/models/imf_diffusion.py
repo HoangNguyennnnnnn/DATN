@@ -320,6 +320,7 @@ class ImprovedMeanFlow:
         cfg_omega_power_beta: Optional[float] = None,
         cfg_interval_conditioning: Optional[bool] = None,
         cfg_context_dropout: float = 0.1,
+        v_loss_weight: float = 0.1,
         return_components: bool = False,
     ):
         """
@@ -343,6 +344,7 @@ class ImprovedMeanFlow:
             cfg_omega_min/cfg_omega_max/cfg_omega_power_beta: Các giá trị ghi đè tùy chọn.
             cfg_interval_conditioning: Lựa chọn ghi đè tùy chọn để lấy mẫu khoảng [tmin, tmax].
             cfg_context_dropout: Tỉ lệ bỏ qua cho nhánh ngữ cảnh điều kiện.
+            v_loss_weight: Trọng số auxiliary v-head loss.
             return_components: Nếu True, trả về dictionary với chi tiết từng thành phần vô hướng (scalar breakdown).
         """
         b = x_data.shape[0]
@@ -519,9 +521,10 @@ class ImprovedMeanFlow:
                 per_sample_v_head = ((v_head_pred - raw_v_target) ** 2).mean(dim=tuple(range(1, v_head_pred.ndim)))
                 loss_v_head = per_sample_v_head.mean()
             else:
-                v_head_pred = v_head(z_t)
-                per_sample_v_head = ((v_head_pred - raw_v_target) ** 2).mean(dim=tuple(range(1, v_head_pred.ndim)))
-                loss_v_head = per_sample_v_head.mean()
+                raise RuntimeError(
+                    "v_head requires a backbone hidden-state interface. "
+                    "Implement get_hidden_state() or forward(..., return_hidden=True) on the backbone."
+                )
 
         if mask_eq_all:
             # Tất cả đều là biên → hàm mất mát khớp luồng đơn giản
@@ -531,7 +534,7 @@ class ImprovedMeanFlow:
             adaptive_w = self._get_adaptive_weights(t).detach()
             loss = (per_sample_boundary * adaptive_w).mean()
             if v_head is not None and per_sample_v_head is not None:
-                loss = loss + 0.1 * (per_sample_v_head * adaptive_w).mean()  # Adaptive weighting for v-head
+                loss = loss + float(v_loss_weight) * (per_sample_v_head * adaptive_w).mean()
             loss_boundary = per_sample_boundary.mean()
             if return_components:
                 return {
@@ -639,7 +642,7 @@ class ImprovedMeanFlow:
         adaptive_scale = adaptive_w.mean()
         
         if v_head is not None and per_sample_v_head is not None:
-            loss = loss + 0.1 * (per_sample_v_head * adaptive_w).mean()  # Adaptive weighting for v-head
+            loss = loss + float(v_loss_weight) * (per_sample_v_head * adaptive_w).mean()
 
         if return_components:
             return {

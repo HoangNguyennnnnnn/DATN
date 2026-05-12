@@ -457,7 +457,10 @@ class IMFUNet1D(nn.Module):
     ):
         super().__init__()
         self.input_dim = input_dim
+        self.hidden_dims = list(hidden_dims)
         self.bottleneck_dim = hidden_dims[-1]
+        self.hidden_dim = hidden_dims[0]
+        self.num_bottleneck_layers = num_bottleneck_layers
         self.num_context_tokens = num_context_tokens
         self.num_time_tokens = num_time_tokens
         self.num_r_tokens = num_r_tokens
@@ -481,10 +484,10 @@ class IMFUNet1D(nn.Module):
         
         # === Cải tiến 2: In-context Conditioning ===
         # Context → prefix tokens (thay CrossAttention)
-        self.context_tokenizer = ContextTokenizer(context_dim, self.bottleneck_dim, num_context_tokens)
-        self.time_tokenizer = TimeTokenizer(self.time_dim, self.bottleneck_dim, num_time_tokens)
-        self.r_tokenizer = TimeTokenizer(self.time_dim, self.bottleneck_dim, num_r_tokens)
-        self.guidance_tokenizer = GuidanceTokenizer(self.bottleneck_dim, num_guidance_tokens)
+        self.context_tokenizer = ContextTokenizer(context_dim, self.bottleneck_dim, num_context_tokens) if num_context_tokens > 0 else None
+        self.time_tokenizer = TimeTokenizer(self.time_dim, self.bottleneck_dim, num_time_tokens) if num_time_tokens > 0 else None
+        self.r_tokenizer = TimeTokenizer(self.time_dim, self.bottleneck_dim, num_r_tokens) if num_r_tokens > 0 else None
+        self.guidance_tokenizer = GuidanceTokenizer(self.bottleneck_dim, num_guidance_tokens) if num_guidance_tokens > 0 else None
         
         # Init conv  
         self.init_conv = nn.Conv1d(input_dim, hidden_dims[0], 3, padding=1)
@@ -545,7 +548,18 @@ class IMFUNet1D(nn.Module):
             else:
                 self.use_hilbert_ordering = False
 
-    def forward(
+    def _make_prefix_tokens(
+        self,
+        tokenizer: Optional[nn.Module],
+        source: torch.Tensor,
+        num_tokens: int,
+    ) -> torch.Tensor:
+        if tokenizer is None or num_tokens <= 0:
+            model_dim = int(self.bottleneck_dim)
+            return source.new_zeros((source.shape[0], 0, model_dim))
+        return tokenizer(source)
+
+    def _forward_core(
         self,
         x_t: torch.Tensor,
         t: torch.Tensor,
@@ -556,25 +570,12 @@ class IMFUNet1D(nn.Module):
         cfg_tmax: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
-        Lan truyền xuôi (Forward pass):
-        1. Conv1d encoder thực hiện giảm lấy mẫu (downsample)
-        2. Trải phẳng nút thắt cổ chai (Flatten bottleneck) → nối các token tiền tố (concat prefix tokens) → SelfAttention nhiều lớp
-        3. Loại bỏ các token tiền tố → Conv1d decoder thực hiện tăng lấy mẫu (upsample)
-
-        Tham số:
-            x_t: các token tiềm ẩn có nhiễu (noisy latent tokens) [B, L, D] hoặc [B, D, L]
-            t: dấu thời gian kết thúc [B]
-            context: vector điều kiện hóa [B, C]
-            r: dấu thời gian bắt đầu [B], mặc định None -> r=t (điều kiện biên)
-            omega: điều kiện hóa thang đo hướng dẫn (guidance scale conditioning) [B], mặc định 1.0 (không hướng dẫn)
-            cfg_tmin: bắt đầu khoảng CFG [B], mặc định 0.0
-            cfg_tmax: kết thúc khoảng CFG [B], mặc định 1.0
+        Shared hidden-state path for forward() and get_hidden_state().
+        Returns final decoder features in canonical [B, L, hidden_dim] layout.
         """
         # Định dạng đầu vào [B, L, D] → [B, D, L]
-        orig_shape = False
         if x_t.ndim == 3 and x_t.shape[-1] == self.input_dim:
             x_t = x_t.permute(0, 2, 1)
-            orig_shape = True
 
         # Hilbert reorder: raster → hilbert (cải thiện spatial locality cho Conv1d)
         if self.use_hilbert_ordering:
@@ -624,10 +625,10 @@ class IMFUNet1D(nn.Module):
         # x: [B, C, L] → [B, L, C] → concat prefix → [B, L+K, C]
         x_seq = x.permute(0, 2, 1)  # [B, L, C]
         
-        ctx_tokens = self.context_tokenizer(context)  # [B, 8, C]
-        time_tokens = self.time_tokenizer(time_cond_emb)      # [B, 4, C]
-        r_tokens = self.r_tokenizer(r_emb)                    # [B, 4, C]
-        guidance_tokens = self.guidance_tokenizer(guidance_cond)  # [B, 4, C]
+        ctx_tokens = self._make_prefix_tokens(self.context_tokenizer, context, self.num_context_tokens)
+        time_tokens = self._make_prefix_tokens(self.time_tokenizer, time_cond_emb, self.num_time_tokens)
+        r_tokens = self._make_prefix_tokens(self.r_tokenizer, r_emb, self.num_r_tokens)
+        guidance_tokens = self._make_prefix_tokens(self.guidance_tokenizer, guidance_cond, self.num_guidance_tokens)
         
         # Nối (Concat): [time_tokens | r_tokens | guidance_tokens | ctx_tokens | data_tokens]
         num_prefix = self.num_context_tokens + self.num_time_tokens + self.num_r_tokens + self.num_guidance_tokens
@@ -657,17 +658,63 @@ class IMFUNet1D(nn.Module):
             x = block2(x, time_cond_emb)
         
         # Đầu ra cuối cùng với RMSNorm
-        out = self.final_norm(x.permute(0, 2, 1)).permute(0, 2, 1)
-        out = self.final_act(out)
-        out = self.final_proj(out)
-        
-        if orig_shape:
+        hidden = self.final_norm(x.permute(0, 2, 1))
+        if self.use_hilbert_ordering:
+            hidden = hidden[:, self._raster_to_hilbert, :]
+        return hidden
+
+    def forward(
+        self,
+        x_t: torch.Tensor,
+        t: torch.Tensor,
+        context: torch.Tensor,
+        r: Optional[torch.Tensor] = None,
+        omega: Optional[torch.Tensor] = None,
+        cfg_tmin: Optional[torch.Tensor] = None,
+        cfg_tmax: Optional[torch.Tensor] = None,
+        return_hidden: bool = False,
+    ) -> torch.Tensor:
+        """
+        Lan truyền xuôi dự đoán vận tốc.
+        return_hidden=True trả về (velocity, hidden_state) để tái sử dụng cho v-head.
+        """
+        orig_shape = bool(x_t.ndim == 3 and x_t.shape[-1] == self.input_dim)
+        hidden = self._forward_core(
+            x_t,
+            t,
+            context,
+            r=r,
+            omega=omega,
+            cfg_tmin=cfg_tmin,
+            cfg_tmax=cfg_tmax,
+        )
+        out = self.final_act(hidden)
+        out = self.final_proj(out.permute(0, 2, 1)).permute(0, 2, 1)
+
+        if not orig_shape:
             out = out.permute(0, 2, 1)
-            # Hilbert inverse: hilbert → raster (trả output về thứ tự gốc)
-            if self.use_hilbert_ordering:
-                out = out[:, self._raster_to_hilbert, :]
-        else:
-            if self.use_hilbert_ordering:
-                out = out[:, :, self._raster_to_hilbert]
-        
+
+        if return_hidden:
+            return out, hidden
         return out
+
+    def get_hidden_state(
+        self,
+        x_t: torch.Tensor,
+        t: torch.Tensor,
+        context: torch.Tensor,
+        r: Optional[torch.Tensor] = None,
+        omega: Optional[torch.Tensor] = None,
+        cfg_tmin: Optional[torch.Tensor] = None,
+        cfg_tmax: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Trả về hidden state cuối decoder dưới dạng [B, L, hidden_dim]."""
+        return self._forward_core(
+            x_t,
+            t,
+            context,
+            r=r,
+            omega=omega,
+            cfg_tmin=cfg_tmin,
+            cfg_tmax=cfg_tmax,
+        )

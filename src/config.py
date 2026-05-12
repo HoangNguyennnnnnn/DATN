@@ -260,19 +260,19 @@ class IMFConfig:
     use_v_loss: bool = True              # Dùng v-loss thay vì u-loss (huấn luyện ổn định hơn)
     use_auxiliary_v_head: bool = True    # Dùng khối v-head phụ trợ để dự đoán vận tốc cận biên
     v_head_dim: int = 512               # Chiều ẩn cho khối phụ trợ v-head
-    v_loss_weight: float = 1.0           # Trọng số của hàm mất mát vận tốc
-    boundary_condition_ratio: float = 0.5  # 50% mẫu sử dụng r=t (điều kiện biên)
+    v_loss_weight: float = 0.1           # Trọng số auxiliary v-head loss; khớp objective đang dùng trong iMF paper impl
+    boundary_condition_ratio: float = 0.5  # Deprecated: dùng ratio_r_neq_t để suy ra boundary ratio thực tế
     cfg_omega_min: float = 1.0              # Cận dưới thang điều hướng (1.0 = không điều hướng)
     cfg_omega_max: float = 8.0              # Cận trên thang điều hướng
     cfg_omega_power_beta: float = 1.0       # Giá trị beta hàm lũy thừa cho p(omega) ~ omega^-beta
     cfg_context_dropout: float = 0.1        # Loại bỏ các ngữ cảnh điều kiện để học nhánh vô điều kiện ổn định
     cfg_interval_conditioning: bool = True  # Điều kiện hóa trên đoạn [tmin, tmax] giống trong phụ lục iMF
     adaptive_loss_weighting: bool = True    # iMF Appendix A: per-bin EMA reweighting cho main + v-head loss
-    neg_guidance_enable: bool = False      # Bật Điều hướng Ngữ cảnh m (Negative Context Guidance - Far-Neg) trong quá trình huấn luyện
-    neg_guidance_scale: float = 0.0        # Mức đẩy khỏi ngữ cảnh âm, >0 để kích hoạt
-    neg_guidance_fallback: str = "random"  # random|zero khi kho Far-Neg chưa đủ lớn
-    far_neg_min_candidates: int = 32       # Số embedding tối thiểu trong kho để lựa chọn Far-Neg
-    far_neg_pool_size: int = 1024          # Kích thước kho chứa embedding tối đa của Far-Neg
+    neg_guidance_enable: bool = False      # Deprecated: negative guidance training chưa được wire trong stage-2 runtime hiện tại
+    neg_guidance_scale: float = 0.0        # Deprecated: inference-only path có hỗ trợ, training path chưa dùng
+    neg_guidance_fallback: str = "random"  # Deprecated cùng neg_guidance_enable
+    far_neg_min_candidates: int = 32       # Deprecated cùng neg_guidance_enable
+    far_neg_pool_size: int = 1024          # Deprecated cùng neg_guidance_enable
     ema_decay: float = 0.9995          # Giảm xuống nhẹ để thích nghi tốt hơn với 20K mẫu
     use_ema: bool = True               # EMA cải thiện chất lượng lấy mẫu
     dropout: float = 0.05              # Bổ sung một chút dropout để tránh overfit đối với 20K mẫu
@@ -287,6 +287,8 @@ class IMFConfig:
     
     # Tối ưu hóa Dữ liệu luồng
     use_precomputed_data: bool = False # Nếu true, bỏ qua load DINO, Arcface, Flame, chạy offline.
+    allow_random_context_fallback: bool = False  # Debug-only: cho phép cache/train với context ngẫu nhiên khi extractor lỗi
+    allow_mesh_proxy_fallback: bool = False      # Debug-only: cho phép thay O-Voxel bằng mesh proxy khi converter lỗi
     
     # Độ chính xác
     use_amp: bool = True
@@ -360,4 +362,3 @@ class TrainConfig:
 if __name__ == "__main__":
     cfg = TrainConfig()
     cfg.print_summary()
-

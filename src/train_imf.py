@@ -26,6 +26,7 @@ import json
 import hashlib
 import argparse
 import random
+import warnings
 import numpy as np
 import torch
 import torch.nn as nn
@@ -117,7 +118,7 @@ class SlatDataset(Dataset):
     
     Bộ đệm (Caching): Slat tokens được lưu đệm vào các tệp .pt để tăng tốc độ.
     """
-    CACHE_SCHEMA_VERSION = 2
+    CACHE_SCHEMA_VERSION = 3
     
     def __init__(self, data_root: str, sc_vae: SC_VAE,
                  dataset_name: str,
@@ -136,7 +137,15 @@ class SlatDataset(Dataset):
                  single_sc_vae_checkpoint: str | None = None,
                  shape_sc_vae_checkpoint: str | None = None,
                  material_sc_vae_checkpoint: str | None = None,
-                 ovoxel_resolution: int = 256):
+                 ovoxel_resolution: int = 256,
+                 allow_random_context_fallback: bool = False,
+                 allow_mesh_proxy_fallback: bool = False,
+                 context_lmdb_dir: str | None = None,
+                 manifest_list: list[str] | None = None,
+                 ovoxel_lmdb_dir: str | None = None,
+                 ovoxel_lmdb_in_channels: int = 10,
+                 ovoxel_lmdb_feature_mode: str = "shape_mat",
+                 ovoxel_lmdb_max_voxels: int = 350000):
         self.data_root = data_root
         self.sc_vae = sc_vae
         self.dataset_name = str(dataset_name)
@@ -162,16 +171,72 @@ class SlatDataset(Dataset):
         self.shape_sc_vae_checkpoint = shape_sc_vae_checkpoint
         self.material_sc_vae_checkpoint = material_sc_vae_checkpoint
         self.ovoxel_resolution = int(max(8, ovoxel_resolution))
+        self.allow_random_context_fallback = bool(allow_random_context_fallback)
+        self.allow_mesh_proxy_fallback = bool(allow_mesh_proxy_fallback)
         self.ovoxel_converter = None
         self.samples = []
 
-        try:
-            self.ovoxel_converter = OVoxelConverter(
-                resolution=self.ovoxel_resolution,
-                device="cpu",
+        # LMDB cho Hybrid Context (Offline mode)
+        self.context_lmdb_dir = context_lmdb_dir
+        self.context_lmdb_env = None
+        self.context_lmdb_txn = None
+
+        if self.context_lmdb_dir and os.path.isdir(self.context_lmdb_dir):
+            import lmdb
+            self.context_lmdb_env = lmdb.open(
+                self.context_lmdb_dir,
+                readonly=True,
+                lock=False,
+                readahead=True,
+                meminit=False,
+                max_readers=512,
             )
-        except Exception as exc:
-            print(f"[SlatDataset] Warning: O-Voxel converter init failed, using mesh fallback: {exc}")
+            self.context_lmdb_txn = self.context_lmdb_env.begin(write=False)
+            print(f"[SlatDataset] Connected to Hybrid Context LMDB: {self.context_lmdb_dir}")
+
+        # LMDB cho O-Voxel data (dùng thay mesh files khi không có .obj trên server mới)
+        self.ovoxel_lmdb_dir = ovoxel_lmdb_dir
+        self.ovoxel_lmdb_env = None
+        self.ovoxel_lmdb_txn = None
+        self.ovoxel_lmdb_in_channels = int(ovoxel_lmdb_in_channels)
+        self.ovoxel_lmdb_feature_mode = str(ovoxel_lmdb_feature_mode)
+        self.ovoxel_lmdb_max_voxels = int(ovoxel_lmdb_max_voxels)
+
+        if self.ovoxel_lmdb_dir and os.path.isdir(self.ovoxel_lmdb_dir):
+            import lmdb
+            self.ovoxel_lmdb_env = lmdb.open(
+                self.ovoxel_lmdb_dir,
+                readonly=True,
+                lock=False,
+                readahead=True,
+                meminit=False,
+                max_readers=512,
+            )
+            self.ovoxel_lmdb_txn = self.ovoxel_lmdb_env.begin(write=False)
+            print(f"[SlatDataset] Connected to O-Voxel LMDB: {self.ovoxel_lmdb_dir}")
+
+        needs_encoder = (self.sc_vae is not None or
+                         (self.dual_branch and (self.shape_sc_vae is not None or self.material_sc_vae is not None)))
+        has_ovoxel_lmdb = self.ovoxel_lmdb_txn is not None
+        if needs_encoder and not has_ovoxel_lmdb:
+            try:
+                self.ovoxel_converter = OVoxelConverter(
+                    resolution=self.ovoxel_resolution,
+                    device="cpu",
+                )
+            except Exception as exc:
+                if self.allow_mesh_proxy_fallback:
+                    warnings.warn(
+                        f"[SlatDataset] O-Voxel converter init failed; using explicit debug mesh proxy fallback: {exc}",
+                        RuntimeWarning,
+                    )
+                else:
+                    raise RuntimeError(
+                        "O-Voxel converter init failed and mesh-proxy fallback is disabled. "
+                        "Enable debug fallback explicitly with allow_mesh_proxy_fallback=True."
+                    ) from exc
+        elif has_ovoxel_lmdb:
+            print(f"[SlatDataset] Skipping OVoxelConverter init (using O-Voxel LMDB instead)")
         
         os.makedirs(cache_dir, exist_ok=True)
         self.cache_contract = self._build_cache_contract()
@@ -179,10 +244,23 @@ class SlatDataset(Dataset):
         self.cache_tag = f"slatv{self.CACHE_SCHEMA_VERSION}_{hashlib.sha1(contract_blob.encode('utf-8')).hexdigest()[:12]}"
         print(f"[SlatDataset] Cache tag: {self.cache_tag}")
         
-        # Quét các tệp mesh đệ quy
+        # Quét các tệp mesh (hoặc dùng manifest nếu có)
         skipped_by_include = 0
         skipped_by_exclude = 0
-        if os.path.isdir(data_root):
+
+        if manifest_list is not None:
+            print(f"[SlatDataset] Using manifest for {self.dataset_name} ({len(manifest_list)} entries)")
+            for rel_path in manifest_list:
+                obj_path = os.path.join(data_root, rel_path)
+                identity = extract_identity_from_obj_path(obj_path, self.data_root, self.dataset_name)
+                if self.include_ids is not None and identity not in self.include_ids:
+                    skipped_by_include += 1
+                    continue
+                if self.exclude_ids is not None and identity in self.exclude_ids:
+                    skipped_by_exclude += 1
+                    continue
+                self.samples.append(obj_path)
+        elif os.path.isdir(data_root):
             for root_dir, _, files in os.walk(data_root):
                 for f in sorted(files):
                     if f.endswith('.obj'):
@@ -213,6 +291,16 @@ class SlatDataset(Dataset):
         return f"{os.path.basename(abs_path)}:{stat.st_size}:{stat.st_mtime_ns}"
 
     def _build_cache_contract(self) -> dict:
+        if self.allow_random_context_fallback:
+            context_source_policy = "random_debug"
+        else:
+            context_source_policy = "hybrid_required"
+        if self.ovoxel_lmdb_dir:
+            ovoxel_source_policy = "ovoxel_lmdb"
+        elif self.allow_mesh_proxy_fallback:
+            ovoxel_source_policy = "mesh_proxy_debug"
+        else:
+            ovoxel_source_policy = "ovoxel_required"
         return {
             "schema_version": int(self.CACHE_SCHEMA_VERSION),
             "dataset_name": self.dataset_name,
@@ -228,6 +316,10 @@ class SlatDataset(Dataset):
             "single_sc_vae_checkpoint": self._checkpoint_signature(self.single_sc_vae_checkpoint),
             "shape_sc_vae_checkpoint": self._checkpoint_signature(self.shape_sc_vae_checkpoint),
             "material_sc_vae_checkpoint": self._checkpoint_signature(self.material_sc_vae_checkpoint),
+            "context_source_policy": context_source_policy,
+            "ovoxel_source_policy": ovoxel_source_policy,
+            "allow_random_context_fallback": bool(self.allow_random_context_fallback),
+            "allow_mesh_proxy_fallback": bool(self.allow_mesh_proxy_fallback),
         }
     
     def __len__(self) -> int:
@@ -253,6 +345,19 @@ class SlatDataset(Dataset):
             return meta.get("cache_tag") == self.cache_tag and "slat" in payload and "context" in payload
         except Exception:
             return False
+
+    def _make_random_context(self, reason: str) -> torch.Tensor:
+        if not self.allow_random_context_fallback:
+            raise RuntimeError(
+                f"{reason}. Hybrid context fallback is disabled; "
+                "enable allow_random_context_fallback=True only for debug runs."
+            )
+        warnings.warn(
+            f"[SlatDataset] Using explicit debug random-context fallback: {reason}",
+            RuntimeWarning,
+        )
+        context = torch.randn(self.context_dim)
+        return torch.nn.functional.normalize(context, p=2, dim=-1)
 
     @torch.no_grad()
     def __getitem__(self, idx: int):
@@ -288,7 +393,21 @@ class SlatDataset(Dataset):
         # --- Quy trình Mã hóa (Encode) (khi không bật offline-data) ---
         # Mã hóa lưới (Encode mesh) → Slat tokens
         slat, context = self._encode_mesh(obj_path)
-        
+
+        # Nếu context trả về None (do offline mode), thử lấy từ LMDB
+        if context is None and self.context_lmdb_txn is not None:
+            rel_path_portable = os.path.relpath(obj_path, self.data_root)
+            key = f"{self.dataset_name}/{rel_path_portable}".encode('utf-8')
+            context_data = self.context_lmdb_txn.get(key)
+            if context_data is not None:
+                import io
+                context = torch.load(io.BytesIO(context_data), map_location="cpu", weights_only=False).float()
+                if context.ndim == 0:
+                    context = context.unsqueeze(0)
+
+        if context is None:
+            context = self._make_random_context(f"Context not found in LMDB or Extractor for {obj_path}")
+
         # Cache
         slat = slat.cpu()
         context = context.cpu()
@@ -304,7 +423,7 @@ class SlatDataset(Dataset):
             },
             cache_path,
         )
-        
+
         return slat, context
     
     @torch.no_grad()
@@ -347,16 +466,56 @@ class SlatDataset(Dataset):
                 # Gộp [1, 946] rồi nén (squeeze) thành [946]
                 context = create_hybrid_context(identity, expr, back_sh).squeeze(0)
             except Exception as e:
-                print(f"[SlatDataset] Lỗi khi trích xuất vector do renderer: {e}. Fallback ngẫu nhiên.")
-                context = torch.nn.functional.normalize(torch.randn(946), p=2, dim=-1)
+                context = self._make_random_context(
+                    f"Hybrid context extraction failed for {obj_path}: {e}"
+                )
         else:
-            context = torch.randn(946)
-            context = torch.nn.functional.normalize(context, p=2, dim=-1)
+            # Trả về None để __getitem__ thử lấy từ LMDB
+            context = None
         
         return slat, context
 
+    def _ovoxel_lmdb_key(self, obj_path: str) -> str:
+        """Tạo LMDB key khớp với format của pack_lmdb_fast / VoxelDataset."""
+        rel = os.path.relpath(obj_path, self.data_root)
+        c = self.ovoxel_lmdb_in_channels
+        fm = self.ovoxel_lmdb_feature_mode
+        mx = self.ovoxel_lmdb_max_voxels
+        safe = rel.replace(os.sep, '_').replace('.obj', f'.c{c}.{fm}.mx{mx}.pt')
+        return safe
+
+    def _try_load_ovoxel_from_lmdb(self, obj_path: str):
+        """Thử đọc O-Voxel payload từ LMDB. Trả về (features, coords) hoặc None."""
+        if self.ovoxel_lmdb_txn is None:
+            return None
+        key = self._ovoxel_lmdb_key(obj_path)
+        data = self.ovoxel_lmdb_txn.get(key.encode('utf-8'))
+        if data is None:
+            return None
+        import io
+        payload = torch.load(io.BytesIO(data), map_location="cpu", weights_only=False)
+        if isinstance(payload, torch.Tensor):
+            feats = payload.to(dtype=torch.float32)
+            if feats.ndim == 2 and feats.shape[1] >= 10:
+                return feats[:, :10].contiguous(), None
+            return feats, None
+        if isinstance(payload, dict):
+            feats = payload["features"].to(dtype=torch.float32)
+            coords = payload.get("coords", None)
+            if coords is not None:
+                coords = coords.to(dtype=torch.int32)
+            if feats.ndim == 2 and feats.shape[1] >= 10:
+                feats = feats[:, :10].contiguous()
+            return feats, coords
+        return None
+
     def _load_ovoxel_shape_mat(self, obj_path: str):
         """Tải payload O-Voxel 10 kênh hợp nhất [shape7, rgb3]."""
+        # Ưu tiên đọc từ O-Voxel LMDB (cho server mới không có mesh files)
+        lmdb_result = self._try_load_ovoxel_from_lmdb(obj_path)
+        if lmdb_result is not None:
+            return lmdb_result
+
         if self.ovoxel_converter is not None:
             try:
                 payload = self.ovoxel_converter.process_mesh(obj_path)
@@ -366,7 +525,18 @@ class SlatDataset(Dataset):
                     raise ValueError(f"Unexpected shape_mat_features shape: {tuple(feats.shape)}")
                 return feats[:, :10].contiguous(), coords.contiguous()
             except Exception as exc:
-                print(f"[SlatDataset] O-Voxel conversion failed for {obj_path}, fallback mesh proxy: {exc}")
+                if not self.allow_mesh_proxy_fallback:
+                    raise RuntimeError(
+                        f"O-Voxel conversion failed for {obj_path} and mesh-proxy fallback is disabled: {exc}"
+                    ) from exc
+                warnings.warn(
+                    f"[SlatDataset] O-Voxel conversion failed; using explicit debug mesh-proxy fallback for {obj_path}: {exc}",
+                    RuntimeWarning,
+                )
+        elif not self.allow_mesh_proxy_fallback:
+            raise RuntimeError(
+                f"O-Voxel converter is unavailable for {obj_path} and mesh-proxy fallback is disabled."
+            )
 
         # Fallback path keeps training runnable even when converter/runtime is unavailable.
         import trimesh
@@ -512,10 +682,60 @@ def _resolve_material_config(imf_cfg) -> None:
     imf_cfg.material_target_in_channels = expected_channels
 
 
+def _build_stage2_model_config(model: nn.Module, imf_cfg, model_input_dim: int) -> dict:
+    if bool(getattr(imf_cfg, "use_voxel_mamba", True)):
+        return {
+            "arch": "voxel_mamba",
+            "input_dim": int(model_input_dim),
+            "context_dim": int(getattr(imf_cfg, "context_dim", 946)),
+            "slat_length": int(getattr(imf_cfg, "slat_length", 4096)),
+            "hidden_dim": int(getattr(model, "hidden_dim", getattr(imf_cfg, "mamba_hidden_dim", 512))),
+            "num_layers": int(getattr(imf_cfg, "mamba_num_layers", 12)),
+            "backend": str(getattr(model, "backend", getattr(imf_cfg, "voxel_mamba_backend", "auto"))),
+            "strict": bool(getattr(imf_cfg, "voxel_mamba_strict", False)),
+            "num_context_tokens": int(getattr(model, "num_context_tokens", getattr(imf_cfg, "mamba_num_context_tokens", 8))),
+            "num_time_tokens": int(getattr(model, "num_time_tokens", getattr(imf_cfg, "mamba_num_time_tokens", 4))),
+            "num_r_tokens": int(getattr(model, "num_r_tokens", getattr(imf_cfg, "mamba_num_r_tokens", 4))),
+            "num_interval_tokens": int(getattr(model, "num_interval_tokens", getattr(imf_cfg, "mamba_num_interval_tokens", 4))),
+            "num_guidance_tokens": int(getattr(model, "num_guidance_tokens", getattr(imf_cfg, "mamba_num_guidance_tokens", 4))),
+            "d_state": int(getattr(imf_cfg, "mamba_d_state", 16)),
+            "d_conv": int(getattr(imf_cfg, "mamba_d_conv", 4)),
+            "expand": int(getattr(imf_cfg, "mamba_expand", 2)),
+            "dropout": float(getattr(imf_cfg, "dropout", 0.0)),
+        }
+
+    return {
+        "arch": "imf_unet",
+        "input_dim": int(model_input_dim),
+        "context_dim": int(getattr(imf_cfg, "context_dim", 946)),
+        "slat_length": int(getattr(imf_cfg, "slat_length", 4096)),
+        "hidden_dims": list(getattr(model, "hidden_dims", getattr(imf_cfg, "hidden_dims", [160, 320, 640]))),
+        "num_bottleneck_layers": int(getattr(model, "num_bottleneck_layers", getattr(imf_cfg, "num_bottleneck_layers", 6))),
+        "num_context_tokens": int(getattr(model, "num_context_tokens", 8)),
+        "num_time_tokens": int(getattr(model, "num_time_tokens", 4)),
+        "num_r_tokens": int(getattr(model, "num_r_tokens", 4)),
+        "num_guidance_tokens": int(getattr(model, "num_guidance_tokens", 4)),
+    }
+
+
 # ============================================================
 # Checkpoint
 # ============================================================
-def save_checkpoint(model, optimizer, scheduler, scaler, ema, epoch, loss, path):
+def save_checkpoint(
+    model,
+    optimizer,
+    scheduler,
+    scaler,
+    ema,
+    epoch,
+    loss,
+    path,
+    *,
+    v_head=None,
+    stage2_model_config: dict | None = None,
+    global_step: int | None = None,
+    best_loss: float | None = None,
+):
     os.makedirs(os.path.dirname(path), exist_ok=True)
     state = {
         'epoch': epoch,
@@ -524,26 +744,75 @@ def save_checkpoint(model, optimizer, scheduler, scaler, ema, epoch, loss, path)
         'scheduler_state_dict': scheduler.state_dict(),
         'scaler_state_dict': scaler.state_dict() if scaler else None,
         'loss': loss,
+        'global_step': int(global_step if global_step is not None else 0),
+        'best_loss': float(best_loss if best_loss is not None else loss),
     }
     if ema is not None:
         state['ema_state_dict'] = ema.state_dict()
+    if v_head is not None:
+        state['v_head_state_dict'] = v_head.state_dict()
+    if stage2_model_config is not None:
+        state['stage2_model_config'] = dict(stage2_model_config)
     torch.save(state, path)
     print(f"  💾 Checkpoint saved: {path}")
 
 
-def load_checkpoint(path, model, optimizer=None, scheduler=None, scaler=None, ema=None):
+def load_checkpoint(
+    path,
+    model,
+    optimizer=None,
+    scheduler=None,
+    scaler=None,
+    ema=None,
+    v_head=None,
+):
     ckpt = torch.load(path, map_location="cpu", weights_only=False)
     model.load_state_dict(ckpt['model_state_dict'])
-    if optimizer and 'optimizer_state_dict' in ckpt:
-        optimizer.load_state_dict(ckpt['optimizer_state_dict'])
-    if scheduler and 'scheduler_state_dict' in ckpt:
-        scheduler.load_state_dict(ckpt['scheduler_state_dict'])
-    if scaler and ckpt.get('scaler_state_dict'):
-        scaler.load_state_dict(ckpt['scaler_state_dict'])
-    if ema and 'ema_state_dict' in ckpt:
-        ema.load_state_dict(ckpt['ema_state_dict'])
-    print(f"  ✅ Resumed from epoch {ckpt['epoch']} (loss={ckpt['loss']:.4f})")
-    return ckpt['epoch']
+    downgrade_reasons = []
+
+    ckpt_v_head_state = ckpt.get('v_head_state_dict')
+    if v_head is not None:
+        if isinstance(ckpt_v_head_state, dict):
+            v_head.load_state_dict(ckpt_v_head_state)
+        else:
+            downgrade_reasons.append("checkpoint missing v_head_state_dict")
+    elif isinstance(ckpt_v_head_state, dict):
+        downgrade_reasons.append("checkpoint contains v_head_state_dict but current run has no v_head")
+
+    resumed_full = True
+    if downgrade_reasons:
+        resumed_full = False
+    else:
+        try:
+            if optimizer and 'optimizer_state_dict' in ckpt:
+                optimizer.load_state_dict(ckpt['optimizer_state_dict'])
+            if scheduler and 'scheduler_state_dict' in ckpt:
+                scheduler.load_state_dict(ckpt['scheduler_state_dict'])
+            if scaler and ckpt.get('scaler_state_dict'):
+                scaler.load_state_dict(ckpt['scaler_state_dict'])
+            if ema and 'ema_state_dict' in ckpt:
+                ema.load_state_dict(ckpt['ema_state_dict'])
+        except (ValueError, RuntimeError) as exc:
+            resumed_full = False
+            downgrade_reasons.append(f"optimizer/scheduler state mismatch: {exc}")
+
+    if resumed_full:
+        print(f"  ✅ Resumed full stage-2 state from epoch {ckpt['epoch']} (loss={ckpt['loss']:.4f})")
+    else:
+        print(
+            "  ⚠️ Auto-downgraded to model-only resume: "
+            + "; ".join(downgrade_reasons)
+        )
+        print(f"  ✅ Loaded model weights from epoch {ckpt['epoch']} (loss={ckpt['loss']:.4f})")
+
+    return {
+        "epoch": int(ckpt.get('epoch', 0)),
+        "loss": float(ckpt.get('loss', 0.0)),
+        "best_loss": float(ckpt.get('best_loss', ckpt.get('loss', float('inf')))),
+        "global_step": int(ckpt.get('global_step', 0)),
+        "resumed_full": bool(resumed_full),
+        "stage2_model_config": ckpt.get('stage2_model_config'),
+    }
 
 
 def get_lr_scheduler(optimizer, cfg, steps_per_epoch: int = 100):
@@ -566,12 +835,17 @@ def train_imf(
     facescape_train_ids_file: str = "train_facescape_ids.txt",
     facescape_test_ids_file: str = "test_facescape_ids.txt",
     disable_id_filters: bool = False,
+    context_lmdb_dir: str | None = None,
+    ovoxel_lmdb_dir: str | None = None,
+    manifest_path: str | None = None,
 ):
     """Vòng lặp huấn luyện chính (Main training loop) cho iMF U-Net."""
     
     device = torch.device(cfg.device)
     imf_cfg = cfg.imf
     _resolve_material_config(imf_cfg)
+    if bool(getattr(imf_cfg, "neg_guidance_enable", False)) or float(getattr(imf_cfg, "neg_guidance_scale", 0.0)) > 0.0:
+        print("  [Config] Warning: negative guidance training fields are currently deprecated/unused in train_imf.")
     
     # Seed
     random.seed(cfg.seed)
@@ -676,6 +950,13 @@ def train_imf(
         shape_sc_vae = None
         material_sc_vae = None
     
+    # ---- Nạp Manifest (nếu có) ----
+    manifest_data = None
+    if manifest_path and os.path.isfile(manifest_path):
+        with open(manifest_path, "r", encoding="utf-8") as f:
+            manifest_data = json.load(f)
+        print(f"  ✅ Loaded mesh manifest from: {manifest_path}")
+
     # ---- Dataset ----
     print("\n[3/5] Building Slat Dataset...")
     datasets_to_concat = []
@@ -719,6 +1000,11 @@ def train_imf(
             shape_sc_vae_checkpoint=shape_ckpt_path,
             material_sc_vae_checkpoint=material_ckpt_path,
             ovoxel_resolution=int(getattr(cfg.sc_vae, "ovoxel_resolution", 256)),
+            allow_random_context_fallback=bool(getattr(imf_cfg, "allow_random_context_fallback", False)),
+            allow_mesh_proxy_fallback=bool(getattr(imf_cfg, "allow_mesh_proxy_fallback", False)),
+            context_lmdb_dir=context_lmdb_dir,
+            ovoxel_lmdb_dir=ovoxel_lmdb_dir,
+            manifest_list=manifest_data.get("faceverse") if manifest_data else None,
         )
         if len(fv_dataset) > 0:
             datasets_to_concat.append(fv_dataset)
@@ -751,6 +1037,11 @@ def train_imf(
             shape_sc_vae_checkpoint=shape_ckpt_path,
             material_sc_vae_checkpoint=material_ckpt_path,
             ovoxel_resolution=int(getattr(cfg.sc_vae, "ovoxel_resolution", 256)),
+            allow_random_context_fallback=bool(getattr(imf_cfg, "allow_random_context_fallback", False)),
+            allow_mesh_proxy_fallback=bool(getattr(imf_cfg, "allow_mesh_proxy_fallback", False)),
+            context_lmdb_dir=context_lmdb_dir,
+            ovoxel_lmdb_dir=ovoxel_lmdb_dir,
+            manifest_list=manifest_data.get("facescape") if manifest_data else None,
         )
         if len(fs_dataset) > 0:
             datasets_to_concat.append(fs_dataset)
@@ -823,6 +1114,8 @@ def train_imf(
         ).to(device)
         print(f"  Architecture: Hybrid U-DiT {imf_cfg.hidden_dims}")
 
+    stage2_model_config = _build_stage2_model_config(model, imf_cfg, model_input_dim)
+
     # ---- Compilation (RTX 4090 Optimization) ----
     # torch.compile tương thích với IMFUNet1D và VoxelMamba (GRU fallback).
     # Chỉ bỏ qua khi dùng mamba-ssm CUDA kernels (không tương thích).
@@ -855,8 +1148,12 @@ def train_imf(
     if getattr(imf_cfg, "use_v_loss", True) and getattr(imf_cfg, "use_auxiliary_v_head", True):
         print("  [v-loss] Adding auxiliary v-head...")
         v_head_dim = getattr(imf_cfg, "v_head_dim", 512)
+        if stage2_model_config["arch"] == "voxel_mamba":
+            model_hidden_dim = int(stage2_model_config["hidden_dim"])
+        else:
+            model_hidden_dim = int(stage2_model_config["hidden_dims"][0])
         v_head = nn.Sequential(
-            nn.Linear(model.hidden_dim if hasattr(model, 'hidden_dim') else imf_cfg.mamba_hidden_dim, v_head_dim),
+            nn.Linear(model_hidden_dim, v_head_dim),
             nn.SiLU(),
             nn.Linear(v_head_dim, model_input_dim)
         ).to(device)
@@ -876,7 +1173,8 @@ def train_imf(
             f"material_loss_weight={float(imf_cfg.material_loss_weight):.3f}"
         )
     if getattr(imf_cfg, "use_v_loss", True):
-        print(f"  [v-loss] Enabled with boundary_ratio={getattr(imf_cfg, 'boundary_condition_ratio', 0.5)}")
+        boundary_ratio = 1.0 - float(getattr(imf_cfg, "ratio_r_neq_t", 0.5))
+        print(f"  [v-loss] Enabled with boundary_ratio={boundary_ratio:.3f}, weight={float(getattr(imf_cfg, 'v_loss_weight', 0.1)):.3f}")
     
     # EMA
     ema = EMA(model, decay=imf_cfg.ema_decay) if imf_cfg.use_ema else None
@@ -914,19 +1212,27 @@ def train_imf(
     if imf_cfg.resume_from and os.path.exists(imf_cfg.resume_from):
         if imf_cfg.resume_model_only:
             print("  [Resume] model-only mode: loading model weights and epoch, skipping optimizer/scheduler/scaler/ema states.")
-        start_epoch = load_checkpoint(
+        ckpt_info = load_checkpoint(
             imf_cfg.resume_from,
             model,
             optimizer=None if imf_cfg.resume_model_only else optimizer,
             scheduler=None if imf_cfg.resume_model_only else scheduler,
             scaler=None if imf_cfg.resume_model_only else scaler,
             ema=None if imf_cfg.resume_model_only else ema,
+            v_head=v_head,
         )
+        start_epoch = int(ckpt_info["epoch"])
+        best_loss = float(ckpt_info["best_loss"])
+        if not imf_cfg.resume_model_only and ckpt_info.get("global_step", 0) > 0:
+            global_step = int(ckpt_info["global_step"])
+        else:
+            global_step = start_epoch * len(dataloader)
+    else:
+        global_step = start_epoch * len(dataloader)
     
     # ---- Training ----
     print(f"\n[4/5] Training for {imf_cfg.num_epochs} epochs...")
     os.makedirs(imf_cfg.checkpoint_dir, exist_ok=True)
-    global_step = start_epoch * len(dataloader)
     
     for epoch in range(start_epoch, imf_cfg.num_epochs):
         if imf_cfg.num_epochs > 1:
@@ -967,6 +1273,7 @@ def train_imf(
                     cfg_omega_power_beta=float(getattr(imf_cfg, "cfg_omega_power_beta", 1.0)),
                     cfg_interval_conditioning=bool(getattr(imf_cfg, "cfg_interval_conditioning", True)),
                     cfg_context_dropout=float(getattr(imf_cfg, "cfg_context_dropout", 0.1)),
+                    v_loss_weight=float(getattr(imf_cfg, "v_loss_weight", 0.1)),
                     return_components=True,
                 )
 
@@ -1004,6 +1311,22 @@ def train_imf(
                 epoch_jvp_loss += loss_jvp_val
                 epoch_cfg_context_keep += cfg_keep_val
             global_step += 1
+
+            if imf_cfg.save_every_steps > 0 and global_step % int(imf_cfg.save_every_steps) == 0:
+                save_checkpoint(
+                    model,
+                    optimizer,
+                    scheduler,
+                    scaler,
+                    ema,
+                    epoch + 1,
+                    loss.item(),
+                    os.path.join(imf_cfg.checkpoint_dir, "latest_step.pt"),
+                    v_head=v_head,
+                    stage2_model_config=stage2_model_config,
+                    global_step=global_step,
+                    best_loss=min(float(best_loss), float(loss.item())),
+                )
             
             # WandB step logging
             if cfg.wandb.enabled and WANDB_AVAILABLE and global_step % cfg.wandb.log_every_steps == 0:
@@ -1063,7 +1386,11 @@ def train_imf(
         if (epoch + 1) % imf_cfg.save_every_epochs == 0:
             save_checkpoint(
                 model, optimizer, scheduler, scaler, ema, epoch + 1, avg_loss,
-                os.path.join(imf_cfg.checkpoint_dir, f"epoch_{epoch+1}.pt")
+                os.path.join(imf_cfg.checkpoint_dir, f"epoch_{epoch+1}.pt"),
+                v_head=v_head,
+                stage2_model_config=stage2_model_config,
+                global_step=global_step,
+                best_loss=best_loss,
             )
         
         # Lưu checkpoint tốt nhất
@@ -1071,7 +1398,11 @@ def train_imf(
             best_loss = avg_loss
             save_checkpoint(
                 model, optimizer, scheduler, scaler, ema, epoch + 1, avg_loss,
-                os.path.join(imf_cfg.checkpoint_dir, "best.pt")
+                os.path.join(imf_cfg.checkpoint_dir, "best.pt"),
+                v_head=v_head,
+                stage2_model_config=stage2_model_config,
+                global_step=global_step,
+                best_loss=best_loss,
             )
     
     # ---- Hoàn thành ----
@@ -1121,11 +1452,16 @@ def main():
     parser.add_argument("--no-wandb", action="store_true", help="Disable WandB")
     parser.add_argument("--no-ema", action="store_true", help="Disable EMA")
     parser.add_argument("--offline-data", action="store_true", help="Kích hoạt chế độ tải Slat từ ổ cứng, bỏ qua Instantiate model Extractor để tiết kiệm VRAM.")
+    parser.add_argument("--allow-random-context-fallback", action="store_true", help="Debug-only: allow random hybrid context fallback when extractors fail.")
+    parser.add_argument("--allow-mesh-proxy-fallback", action="store_true", help="Debug-only: allow mesh-proxy fallback when O-Voxel conversion fails.")
     parser.add_argument("--faceverse-train-ids", type=str, default="train_faceverse_ids.txt", help="Path to FaceVerse train IDs file")
     parser.add_argument("--faceverse-test-ids", type=str, default="test_faceverse_ids.txt", help="Path to FaceVerse test IDs file (excluded from train)")
     parser.add_argument("--facescape-train-ids", type=str, default="train_facescape_ids.txt", help="Path to FaceScape train IDs file")
     parser.add_argument("--facescape-test-ids", type=str, default="test_facescape_ids.txt", help="Path to FaceScape test IDs file (excluded from train)")
     parser.add_argument("--disable-id-filters", action="store_true", help="Disable train/test identity file filtering for custom datasets")
+    parser.add_argument("--context-lmdb", type=str, default=None, help="Path to hybrid_context.lmdb for offline context loading")
+    parser.add_argument("--ovoxel-lmdb", type=str, default=None, help="Path to ovoxel_cache_lmdb for reading O-Voxel data without mesh files")
+    parser.add_argument("--manifest", type=str, default=None, help="Path to mesh_manifest.json to avoid scanning .obj files")
     args = parser.parse_args()
     
     cfg = TrainConfig()
@@ -1200,6 +1536,10 @@ def main():
         cfg.imf.use_ema = False
     if args.offline_data:
         cfg.imf.use_precomputed_data = True
+    if args.allow_random_context_fallback:
+        cfg.imf.allow_random_context_fallback = True
+    if args.allow_mesh_proxy_fallback:
+        cfg.imf.allow_mesh_proxy_fallback = True
     
     train_imf(
         cfg,
@@ -1208,6 +1548,9 @@ def main():
         facescape_train_ids_file=args.facescape_train_ids,
         facescape_test_ids_file=args.facescape_test_ids,
         disable_id_filters=bool(args.disable_id_filters),
+        context_lmdb_dir=args.context_lmdb,
+        ovoxel_lmdb_dir=args.ovoxel_lmdb,
+        manifest_path=args.manifest,
     )
 
 
