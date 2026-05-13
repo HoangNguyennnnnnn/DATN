@@ -1,10 +1,10 @@
 # Báo cáo Nghiên cứu Chuyên sâu: FaceDiff — Hệ thống Tạo sinh Khuôn mặt 3D Một Bước trên Đơn GPU
 
-**Ngày cập nhật:** 11/05/2026 (revision 6 — đối chiếu kỹ paper iMF 2512.02012v1 + DiM-3D 2406.05038v1; rà soát toàn bộ pipeline và sửa 8 lỗi/bug nghiêm trọng)  
+**Ngày cập nhật:** 13/05/2026 (revision 10 — báo cáo tiến độ toàn diện, rà soát VoxelMamba vs DiM-3D, chuẩn bị Cloud GPU deployment)  
 **Tác giả:** Nhóm nghiên cứu FaceDiff  
 **Cấu hình Mục tiêu:** Đơn GPU RTX 4090 (24GB VRAM)  
 **Bộ dữ liệu:** FaceVerse_3D & FaceScape  
-**Trạng thái checkpoint:** SC-VAE epoch 397/500 (`checkpoints/sc_vae_shape/interrupt.pt`), tiếp tục train bằng `bash scripts/resume_from_397.sh`.
+**Trạng thái checkpoint:** SC-VAE epoch 399/500 đang chạy (Step 621,450, Loss 0.1078). ETA hoàn thành: sáng 16/05/2026.
 
 ---
 
@@ -1638,4 +1638,189 @@ Các ảnh kết quả và thông tin log (chi tiết bbox, kích thước tenso
 
 ---
 
-*(Hết báo cáo — Cập nhật: 12/05/2026 — Revision 9: Rà soát toàn bộ git diff, sửa 2 bug (MockDinoProcessor, thiếu O-Voxel LMDB path), bổ sung --ovoxel-lmdb cho server migration.)*
+---
+
+## Báo cáo Tiến độ Toàn diện — 13/05/2026 (Revision 10)
+
+### Tổng quan Trạng thái Dự án
+
+| Thành phần | Trạng thái | Chi tiết |
+|---|---|---|
+| **SC-VAE (Stage 1)** | 🟢 Đang chạy | Epoch 399/500 · Step 621,450 · Loss 0.1078 |
+| **Hybrid Context LMDB** | ✅ Hoàn tất | 20,939 bản ghi × 946 chiều · 84 MB |
+| **O-Voxel Cache LMDB** | ✅ Hoàn tất | ~21,000 mẫu · 272 GB |
+| **Mesh Manifest** | ✅ Hoàn tất | 2,310 FaceVerse + 18,658 FaceScape = 20,968 mesh |
+| **Upload Google Drive** | ✅ Hoàn tất | ovoxel\_cache.tar + hybrid\_context\_lmdb.tar + manifest + checkpoint |
+| **VoxelMamba (Stage 2)** | ⏳ Chờ SC-VAE xong | Code đã sẵn sàng, data offline đã đủ |
+| **Cloud GPU Setup** | 📋 Đã chuẩn bị | Script `cloud_full_setup.sh` tự động hoá toàn bộ |
+
+### 1. SC-VAE Training — Giai đoạn 1
+
+#### Tiến độ hiện tại (14:07 ngày 13/05/2026)
+
+```
+Epoch 399/500 | Step 621,450
+Total Loss:  0.1078
+Recon Loss:  0.0260  (rất thấp → tái tạo hình khối chính xác)
+KL Loss:     14.7553 (kiểm soát tốt nhờ KL Annealing)
+Rho Loss:    0.0738
+VRAM:        5,159 MB / 24,576 MB (21%)
+OOM skips:   0 | NaN skips: 0  (hoàn toàn ổn định)
+```
+
+#### Ước tính thời gian
+
+| Thông số | Giá trị |
+|---|---|
+| Thời gian 1 epoch (batch=1, accum=132) | ~37 phút |
+| Epoch còn lại | 101 (399 → 500) |
+| Thời gian còn lại | ~63 giờ ≈ 2.6 ngày |
+| Ngày dự kiến hoàn thành | **Sáng 16/05/2026** |
+
+#### So sánh tốc độ batch\_size
+
+| Batch Size | Accum Steps | Effective Batch | Thời gian/epoch | Ghi chú |
+|---|---|---|---|---|
+| 4 | 33 | 132 | ~30.5 phút | Cấu hình cũ (epoch 360–397) |
+| 1 | 132 | 132 | ~37.2 phút | Cấu hình hiện tại (+22%, an toàn OOM) |
+
+> **Nhận xét:** Giảm batch size từ 4 xuống 1 chỉ làm chậm thêm 22% (do bottleneck nằm ở sparse convolution chứ không phải batch parallelism), trong khi loại bỏ hoàn toàn nguy cơ OOM.
+
+#### Lịch sử Checkpoint
+
+| File | Thời gian | Epoch |
+|---|---|---|
+| `epoch_360.pt` | 09/05 05:18 | 360 |
+| `epoch_370.pt` | 09/05 19:27 | 370 |
+| `epoch_380.pt` | 10/05 00:32 | 380 |
+| `epoch_390.pt` | 10/05 05:37 | 390 |
+| `latest_step.pt` | 10/05 04:41 | 397 |
+| `interrupt.pt` | 10/05 09:11 | 397 |
+
+### 2. Dữ liệu Offline — Đã Sẵn Sàng 100%
+
+Toàn bộ dữ liệu cần thiết cho Giai đoạn 2 (VoxelMamba/iMF) đã được tiền xử lý và tải lên Google Drive thành công.
+
+#### 2.1 Hybrid Context LMDB (`hybrid_context.lmdb`)
+
+- **Số bản ghi:** 20,939 / 20,968 (99.86% — 29 mesh lỗi render từ dataset gốc)
+- **Kích thước:** 84 MB
+- **Cấu trúc vector (946 chiều):**
+  - ArcFace Identity: 512 chiều (L2-normalized)
+  - FLAME Expression: 50 chiều
+  - DINOv2 Shape/Hair: 384 chiều
+- **Key format:** Portable relative paths (hoạt động trên mọi máy)
+- **Thời gian xây dựng:** ~20 giờ (12–13/05/2026)
+
+#### 2.2 O-Voxel Cache LMDB (`ovoxel_cache_lmdb/`)
+
+- **Số bản ghi:** ~21,000 mẫu O-Voxel 10 kênh
+- **Kích thước:** 272 GB
+- **Feature channels:** `[v(3), delta(3), gamma(1), r(1), g(1), b(1)]` = 10 kênh (shape\_mat)
+
+#### 2.3 Mesh Manifest (`mesh_manifest.json`)
+
+- **FaceVerse:** 2,310 mesh
+- **FaceScape:** 18,658 mesh
+- **Tổng cộng:** 20,968 mesh
+- **Chức năng:** Cho phép DataLoader duyệt dataset mà không cần file `.obj` gốc trên Cloud
+
+#### 2.4 Trạng thái Google Drive (`FaceDiff Data/`)
+
+| File | Kích thước | Trạng thái |
+|---|---|---|
+| `ovoxel_cache.tar` | 271.4 GiB | ✅ Đã upload |
+| `hybrid_context_lmdb.tar` | 83 MiB | ✅ Đã upload |
+| `mesh_manifest.json` | 812 KB | ✅ Đã upload |
+| `checkpoints/sc_vae_shape/latest_step.pt` | 403 MB | ✅ Đã upload |
+| `checkpoints/sc_vae_shape/epoch_390.pt` | 403 MB | ✅ Đã upload |
+
+### 3. Rà soát Kiến trúc VoxelMamba vs Bài báo DiM-3D
+
+Đã rà soát toàn bộ file `src/models/voxel_mamba.py` so với bài báo gốc *"Efficient 3D Shape Generation via Diffusion Mamba with Bidirectional SSMs"* (Mo et al., 2024, arXiv:2406.05038).
+
+#### Đối chiếu kiến trúc
+
+| Thành phần (Bài báo) | Triển khai FaceDiff | Đánh giá |
+|---|---|---|
+| Bidirectional SSM (forward + backward scan) | `BidirectionalMambaBlock` (dòng 102–164) | ✅ Đúng |
+| Voxel → Patch → Sequence flattening | `input_embed` + Hilbert ordering | ✅ Tốt hơn (Hilbert > raster) |
+| Class token conditioning | In-context prefix tokens (ctx+t+r+interval+guidance) | ✅ Tốt hơn (linh hoạt hơn class embedding) |
+| Linear complexity O(N) | Mamba SSM, fallback GRU | ✅ Đúng |
+| Normalization | RMSNorm (thay LayerNorm) | ✅ Hiệu quả hơn |
+| Zero-init output projection | `nn.init.zeros_` (dòng 326–327) | ✅ Đúng (best practice DiT) |
+
+#### Điểm mở rộng so với bài báo gốc
+
+1. **Hilbert Space-Filling Curve** (`src/hilbert.py`): Sắp xếp token 3D theo đường cong Hilbert thay vì raster scan, bảo toàn spatial locality tốt hơn cho SSM tuần tự.
+2. **iMF Conditioning**: Mở rộng time conditioning sang `(t, r, t−r, ω, t_min, t_max)` theo bài báo iMF (Geng et al., 2025).
+3. **Auxiliary v-head**: Khối dự đoán vận tốc phụ trợ, chia sẻ hidden state qua `forward(return_hidden=True)` để tránh forward pass thừa.
+
+#### Kết luận rà soát
+
+> **Kiến trúc VoxelMamba đã triển khai đúng và mở rộng hợp lý so với bài báo DiM-3D.**
+> Không phát hiện lỗi kiến trúc nào cần sửa.
+
+### 4. Kế hoạch Triển khai Cloud GPU
+
+#### Cấu hình máy mới
+- **GPU:** RTX 3090 Ti (24 GB VRAM)
+- **RAM:** 64 GB
+- **SSD:** 700 GB
+
+#### Quy trình triển khai (Tự động hoá)
+
+Đã chuẩn bị script `scripts/cloud_full_setup.sh` thực hiện tự động:
+1. Cài đặt Conda + PyTorch 2.5.1 + CUDA 12.1
+2. Cài dependencies (`requirements.txt` + `install_o_voxel.sh` + `requirements-mamba.txt`)
+3. Cấu hình rclone kết nối Google Drive
+4. Tải dữ liệu bằng Streaming Extraction (không cần lưu file `.tar`)
+5. Xác nhận dữ liệu đầy đủ
+
+```bash
+# Chỉ cần 2 lệnh trên máy mới:
+git clone https://github.com/HoangNguyennnnnnn/DATN.git ~/facediff
+cd ~/facediff && bash scripts/cloud_full_setup.sh
+```
+
+#### Lệnh train trên Cloud GPU
+
+**SC-VAE Resume (Stage 1):**
+```bash
+python -u src/train_sc_vae.py \
+    --dataset both --feature-mode shape_mat --in-channels 10 \
+    --lmdb-only --checkpoint-dir checkpoints/sc_vae_shape \
+    --resume checkpoints/sc_vae_shape/latest_step.pt \
+    --gradient-accumulation-steps 132 --batch-size 1 \
+    --resume-scheduler-mode cosine_restart --resume-extend-epochs 100 \
+    --resume-target-min-lr 1e-6 --enable-stage2-render-loss \
+    --no-torch-compile --lr 1e-5
+```
+
+**VoxelMamba Offline (Stage 2):**
+```bash
+python src/train_imf.py \
+    --offline-data \
+    --context-lmdb data/hybrid_context.lmdb \
+    --manifest data/mesh_manifest.json \
+    --sc-vae-ckpt checkpoints/sc_vae_shape/latest_step.pt \
+    --batch-size 32 --num-workers 8 --dataset both
+```
+
+### 5. Tổng kết Milestone
+
+| Milestone | Ngày hoàn thành | Ghi chú |
+|---|---|---|
+| SC-VAE Epoch 360 | 09/05 | Checkpoint ổn định đầu tiên |
+| SC-VAE Epoch 390 | 10/05 | Loss giảm đều |
+| O-Voxel LMDB hoàn tất | ~04/05 | 272 GB, 21K mẫu |
+| Hybrid Context LMDB hoàn tất | 13/05 | 20,939 bản ghi × 946-D |
+| Upload toàn bộ data lên Drive | 13/05 | ovoxel + context + manifest + checkpoint |
+| Rà soát VoxelMamba vs DiM-3D | 13/05 | Đúng kiến trúc, không cần sửa |
+| Cloud setup script hoàn tất | 13/05 | `cloud_full_setup.sh` |
+| SC-VAE Epoch 500 (dự kiến) | **16/05** | ETA 63 giờ |
+| Khởi động VoxelMamba Stage 2 | **16–17/05** | Sau khi SC-VAE hội tụ |
+
+---
+
+*(Hết báo cáo — Cập nhật: 13/05/2026 — Revision 10: Báo cáo tiến độ toàn diện, rà soát VoxelMamba vs DiM-3D, chuẩn bị Cloud GPU deployment.)*

@@ -196,34 +196,69 @@ def extract_ovoxel_mesh(coords: torch.Tensor, feats: torch.Tensor, aabb, res: in
         verts_np = verts.cpu().numpy()
         faces_np = faces.cpu().numpy()
         
-        # 2. Geometry Post-processing (Open3D)
+        # 2. Geometry Post-processing (trimesh repair + Open3D smoothing)
+        #    Follows TRELLIS.2 postprocess.py pipeline:
+        #    fill_holes → cleanup → simplify → repair → unify orientations → smooth
         try:
-            import open3d as o3d
-            o3d_mesh = o3d.geometry.TriangleMesh()
-            o3d_mesh.vertices = o3d.utility.Vector3dVector(verts_np.astype(np.float64))
-            o3d_mesh.triangles = o3d.utility.Vector3iVector(faces_np.astype(np.int32))
-            
-            # Basic cleanup
-            o3d_mesh.remove_degenerate_triangles()
-            o3d_mesh.remove_duplicated_triangles()
-            o3d_mesh.remove_unreferenced_vertices()
-            o3d_mesh.remove_non_manifold_edges()
+            import trimesh as _tm
 
-            # Decimation to match target density
-            if target_faces > 0 and len(o3d_mesh.triangles) > target_faces:
-                o3d_mesh = o3d_mesh.simplify_quadric_decimation(target_faces)
-            
-            # Taubin Smoothing (preserves volume better than Laplacian)
+            mesh = _tm.Trimesh(vertices=verts_np, faces=faces_np, process=False)
+            n_before = len(mesh.faces)
+
+            # Step 1: Fix normals & face orientations (KEY for correct shading)
+            _tm.repair.fix_normals(mesh)
+            _tm.repair.fix_winding(mesh)
+
+            # Step 2: Fill small holes
+            _tm.repair.fill_holes(mesh)
+
+            # Step 3: Remove degenerate/duplicate faces
+            mask_nondeg = mesh.nondegenerate_faces()
+            if not mask_nondeg.all():
+                mesh.update_faces(mask_nondeg)
+            _, unique_idx = np.unique(np.sort(mesh.faces, axis=1), axis=0, return_index=True)
+            if len(unique_idx) < len(mesh.faces):
+                mask_uniq = np.zeros(len(mesh.faces), dtype=bool)
+                mask_uniq[unique_idx] = True
+                mesh.update_faces(mask_uniq)
+            mesh.remove_unreferenced_vertices()
+
+            # Step 4: Remove small disconnected components (noise)
+            if mesh.body_count > 1:
+                components = mesh.split(only_watertight=False)
+                mesh = max(components, key=lambda c: len(c.faces))
+
+            # Step 5: Decimation (if target specified)
+            if target_faces > 0 and len(mesh.faces) > target_faces:
+                mesh = mesh.simplify_quadric_decimation(target_faces)
+                # Re-fix normals after decimation
+                _tm.repair.fix_normals(mesh)
+
+            # Step 6: Taubin smoothing via Open3D
             if smooth_iters > 0:
-                o3d_mesh = o3d_mesh.filter_smooth_taubin(number_of_iterations=smooth_iters)
-                
-            o3d_mesh.remove_degenerate_triangles()
-            o3d_mesh.remove_unreferenced_vertices()
-            
-            verts_np = np.asarray(o3d_mesh.vertices, dtype=np.float32)
-            faces_np = np.asarray(o3d_mesh.triangles, dtype=np.int64)
+                import open3d as o3d
+                o3d_mesh = o3d.geometry.TriangleMesh()
+                o3d_mesh.vertices = o3d.utility.Vector3dVector(
+                    np.asarray(mesh.vertices, dtype=np.float64))
+                o3d_mesh.triangles = o3d.utility.Vector3iVector(
+                    np.asarray(mesh.faces, dtype=np.int32))
+                o3d_mesh = o3d_mesh.filter_smooth_taubin(
+                    number_of_iterations=smooth_iters,
+                    lambda_filter=0.5, mu=-0.53
+                )
+                o3d_mesh.remove_degenerate_triangles()
+                o3d_mesh.remove_unreferenced_vertices()
+                verts_np = np.asarray(o3d_mesh.vertices, dtype=np.float32)
+                faces_np = np.asarray(o3d_mesh.triangles, dtype=np.int64)
+            else:
+                verts_np = np.asarray(mesh.vertices, dtype=np.float32)
+                faces_np = np.asarray(mesh.faces, dtype=np.int64)
+
+            n_after = faces_np.shape[0]
+            if n_before != n_after:
+                print(f"    Post-process: {n_before:,} → {n_after:,} faces")
         except Exception as e:
-            print(f"[WARN] Open3D post-processing failed: {e}")
+            print(f"[WARN] Mesh post-processing failed: {e}")
 
         # 3. IDW k-NN Color Mapping
         from scipy.spatial import cKDTree
@@ -281,13 +316,23 @@ def save_comparison_figure(inp_xyz, inp_rgb, rec_xyz, rec_rgb, mse_dict, out_png
     ax2.set_title("Reconstruction", fontsize=11)
     ax2.set_axis_off()
 
-    # Error histogram
+    # Error histogram (nearest-neighbor distance from recon → GT)
     ax3 = fig.add_subplot(1, 4, 3)
-    n_common = min(len(inp_xyz), len(rec_xyz))
-    err = np.mean((inp_xyz[:n_common] - rec_xyz[:n_common]) ** 2, axis=1)
-    ax3.hist(err, bins=50, color="coral", alpha=0.8)
-    ax3.set_title("Per-point XYZ MSE", fontsize=11)
-    ax3.set_xlabel("MSE")
+    try:
+        from scipy.spatial import cKDTree
+        tree_gt = cKDTree(inp_xyz[np.random.choice(len(inp_xyz), min(50000, len(inp_xyz)), replace=False)])
+        rec_sample = rec_xyz[np.random.choice(len(rec_xyz), min(50000, len(rec_xyz)), replace=False)]
+        err, _ = tree_gt.query(rec_sample)
+        ax3.hist(err, bins=50, color="coral", alpha=0.8)
+        ax3.set_title("NN Distance (Recon→GT)", fontsize=11)
+        ax3.set_xlabel("Distance")
+    except Exception:
+        # Fallback: paired MSE if arrays happen to match
+        n_common = min(len(inp_xyz), len(rec_xyz))
+        err = np.mean((inp_xyz[:n_common] - rec_xyz[:n_common]) ** 2, axis=1)
+        ax3.hist(err, bins=50, color="coral", alpha=0.8)
+        ax3.set_title("Per-point XYZ MSE", fontsize=11)
+        ax3.set_xlabel("MSE")
 
     # Metrics text
     ax4 = fig.add_subplot(1, 4, 4)
@@ -496,7 +541,7 @@ def test_one_sample(
     else:
         print("  [WARN] Mesh extraction failed")
 
-    # Also export GT mesh
+    # Export GT mesh (intersection-aligned, for paired comparison)
     gt_verts, gt_faces, gt_colors = extract_ovoxel_mesh(
         aligned_coords, target_aligned, aabb, resolution, is_logits=False
     )
@@ -505,9 +550,19 @@ def test_one_sample(
         export_colored_mesh_ply(gt_verts, gt_faces, gt_colors, gt_mesh_path)
         print(f"  Exported: input_mesh_colored.ply ({len(gt_verts):,} verts, {len(gt_faces):,} faces)")
 
+    # Export FULL GT mesh (all voxels, no intersection filtering)
+    full_gt_verts, full_gt_faces, full_gt_colors = extract_ovoxel_mesh(
+        sparse_input.indices[:, 1:4], target, aabb, resolution, is_logits=False
+    )
+    if full_gt_verts is not None:
+        full_gt_mesh_path = os.path.join(sample_dir, "full_gt_mesh_colored.ply")
+        export_colored_mesh_ply(full_gt_verts, full_gt_faces, full_gt_colors, full_gt_mesh_path)
+        print(f"  Exported: full_gt_mesh_colored.ply ({len(full_gt_verts):,} verts, {len(full_gt_faces):,} faces)")
+
     # Save comparison figure
+    # Use FULL GT (all voxels) for the comparison figure instead of intersection-only
     save_comparison_figure(
-        target_world, target_rgb_np, recon_world, recon_rgb_np,
+        full_gt_world, full_gt_rgb, recon_world, recon_rgb_np,
         mse_dict,
         os.path.join(sample_dir, "comparison.png"),
         f"SC-VAE Recon: {sample_name}",
