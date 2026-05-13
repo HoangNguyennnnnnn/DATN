@@ -24,6 +24,8 @@ bash scripts/install_o_voxel.sh
 
 Script cài lần lượt **CuMesh → FlexGEMM → o_voxel** (cùng repo TRELLIS.2). `CUDA_HOME` phải trùng toolkit đang dùng để compile (`nvcc --version`).
 
+Nếu báo **không có nvcc**: image chỉ có runtime GPU — cài compiler ví dụ `apt-get install -y cuda-nvcc-12-4` (đổi bản cho khớp repo NVIDIA / driver), hoặc dùng Docker **`nvidia/cuda:*-devel`**.
+
 **Nếu build `cumesh` / `flex_gemm` / `o_voxel` vẫn fail:** xem log đầy đủ (`pip install ... -v`). Trên **server chỉ resume train từ LMDB đã pack**, có thể **không cần** `o_voxel`: dùng `--lmdb-dir ... --lmdb-only` cho SC-VAE và `--ovoxel-lmdb` cho precompute — không gọi mesh→O-Voxel trên máy đó. Khi đó chỉ cần giải nén data LMDB + checkpoint; `o_voxel` chỉ bắt buộc nếu bạn chạy pipeline đọc `.obj` và convert.
 
 ### Mamba-ssm / causal-conv1d (tùy chọn — hay lỗi `Failed building wheel`)
