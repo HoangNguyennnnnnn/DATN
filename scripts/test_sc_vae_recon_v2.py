@@ -301,18 +301,25 @@ def save_comparison_figure(inp_xyz, inp_rgb, rec_xyz, rec_rgb, mse_dict, out_png
         idx = np.random.choice(len(xyz), size=n, replace=False)
         return xyz[idx], rgb[idx]
 
+    def depth_sort(xyz, rgb):
+        """Sort points back-to-front by z (painter's algorithm) for correct overlap."""
+        order = np.argsort(xyz[:, 2])
+        return xyz[order], rgb[order]
+
     inp_s, inp_c = subsample(inp_xyz, inp_rgb)
     rec_s, rec_c = subsample(rec_xyz, rec_rgb)
+    inp_s, inp_c = depth_sort(inp_s, inp_c)
+    rec_s, rec_c = depth_sort(rec_s, rec_c)
 
     # Input with color
     ax1 = fig.add_subplot(1, 4, 1, projection="3d")
-    ax1.scatter(inp_s[:, 0], inp_s[:, 1], inp_s[:, 2], c=inp_c, s=0.5)
+    ax1.scatter(inp_s[:, 0], inp_s[:, 1], inp_s[:, 2], c=inp_c, s=0.5, depthshade=False)
     ax1.set_title("Input (GT)", fontsize=11)
     ax1.set_axis_off()
 
     # Recon with color
     ax2 = fig.add_subplot(1, 4, 2, projection="3d")
-    ax2.scatter(rec_s[:, 0], rec_s[:, 1], rec_s[:, 2], c=rec_c, s=0.5)
+    ax2.scatter(rec_s[:, 0], rec_s[:, 1], rec_s[:, 2], c=rec_c, s=0.5, depthshade=False)
     ax2.set_title("Reconstruction", fontsize=11)
     ax2.set_axis_off()
 
