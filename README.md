@@ -21,6 +21,19 @@ bash scripts/install_o_voxel.sh
 
 Cần **git**, compiler (**g++**), và CUDA phù hợp (image `nvidia/cuda:*-devel` thường đủ để build phụ thuộc `CuMesh` / `FlexGEMM`).
 
+### Mamba-ssm / causal-conv1d (tùy chọn — hay lỗi `Failed building wheel`)
+
+`requirements.txt` **không** còn cài `mamba-ssm` / `causal-conv1d` (phải compile CUDA). **VoxelMamba** tự **fallback GRU** nếu chưa có hai gói này — train vẫn chạy, chỉ chậm hơn.
+
+Để bật kernel Mamba, sau khi `torch` + `nvcc` OK:
+
+```bash
+apt-get update && apt-get install -y ninja-build git build-essential cmake
+export CUDA_HOME="$(dirname "$(dirname "$(command -v nvcc)")")"
+export MAX_JOBS=4
+bash scripts/install_mamba_optional.sh
+```
+
 ## 1. Contract dữ liệu
 
 - Cache chuẩn: `.c10.shape_mat.mx100000.pt`.

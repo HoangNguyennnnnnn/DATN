@@ -1,0 +1,13 @@
+# Cài SAU khi `pip install -r requirements.txt` đã xong và torch CUDA hoạt động.
+# causal-conv1d phải cài TRƯỚC mamba-ssm.
+#
+# Trên Ubuntu / image CUDA devel:
+#   apt-get update && apt-get install -y ninja-build git build-essential cmake
+#   export CUDA_HOME="$(dirname "$(dirname "$(which nvcc)")")"   # thường /usr/local/cuda
+#   export MAX_JOBS=4
+#   pip install -r requirements-mamba.txt
+#
+# Nếu vẫn fail: train Stage-2 vẫn chạy với GRU fallback (xem src/models/voxel_mamba.py).
+
+causal-conv1d==1.6.1
+mamba-ssm==2.3.1
