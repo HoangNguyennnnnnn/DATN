@@ -16,10 +16,15 @@ Runtime mặc định hiện tại:
 Gói PyPI `o-voxel` không tồn tại; FaceDiff dùng **`o_voxel`** từ [microsoft/TRELLIS.2](https://github.com/microsoft/TRELLIS.2) (`subdirectory=o-voxel`). Sau khi `pip install -r requirements.txt` **thành công**, chạy:
 
 ```bash
+apt-get update && apt-get install -y git build-essential cmake ninja-build
+export CUDA_HOME="$(dirname "$(dirname "$(command -v nvcc)")")"
+export MAX_JOBS=4
 bash scripts/install_o_voxel.sh
 ```
 
-Cần **git**, compiler (**g++**), và CUDA phù hợp (image `nvidia/cuda:*-devel` thường đủ để build phụ thuộc `CuMesh` / `FlexGEMM`).
+Script cài lần lượt **CuMesh → FlexGEMM → o_voxel** (cùng repo TRELLIS.2). `CUDA_HOME` phải trùng toolkit đang dùng để compile (`nvcc --version`).
+
+**Nếu build `cumesh` / `flex_gemm` / `o_voxel` vẫn fail:** xem log đầy đủ (`pip install ... -v`). Trên **server chỉ resume train từ LMDB đã pack**, có thể **không cần** `o_voxel`: dùng `--lmdb-dir ... --lmdb-only` cho SC-VAE và `--ovoxel-lmdb` cho precompute — không gọi mesh→O-Voxel trên máy đó. Khi đó chỉ cần giải nén data LMDB + checkpoint; `o_voxel` chỉ bắt buộc nếu bạn chạy pipeline đọc `.obj` và convert.
 
 ### Mamba-ssm / causal-conv1d (tùy chọn — hay lỗi `Failed building wheel`)
 
