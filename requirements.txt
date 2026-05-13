@@ -1,3 +1,4 @@
+# Python 3.11 khuyến nghị (3.13: torchvision pin lỗi; 3.10: scipy 1.17+ không có wheel).
 # Core Deep Learning
 --extra-index-url https://download.pytorch.org/whl/cu121
 torch==2.5.1
@@ -16,7 +17,7 @@ trimesh==4.11.3
 open3d==0.19.0
 scipy==1.17.1
 numpy
-o-voxel==0.0.1
+# o_voxel (import: o_voxel) không có wheel PyPI — lấy từ microsoft/TRELLIS.2. Cài SAU bước pip install -r (xem scripts/install_o_voxel.sh).
 
 # Utilities
 tqdm==4.67.3

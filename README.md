@@ -11,6 +11,16 @@ Runtime mặc định hiện tại:
 - Dual-branch (shape vs material) vẫn được hỗ trợ qua flag `--dual-branch`.
 - Hybrid U-DiT vẫn được hỗ trợ và inference tự nhận backbone theo checkpoint.
 
+### Cài `o_voxel` (không có trên PyPI)
+
+Gói PyPI `o-voxel` không tồn tại; FaceDiff dùng **`o_voxel`** từ [microsoft/TRELLIS.2](https://github.com/microsoft/TRELLIS.2) (`subdirectory=o-voxel`). Sau khi `pip install -r requirements.txt` **thành công**, chạy:
+
+```bash
+bash scripts/install_o_voxel.sh
+```
+
+Cần **git**, compiler (**g++**), và CUDA phù hợp (image `nvidia/cuda:*-devel` thường đủ để build phụ thuộc `CuMesh` / `FlexGEMM`).
+
 ## 1. Contract dữ liệu
 
 - Cache chuẩn: `.c10.shape_mat.mx100000.pt`.
