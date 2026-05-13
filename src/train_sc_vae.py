@@ -1658,7 +1658,8 @@ def main():
     parser.add_argument("--in-channels", type=int, default=None, help="Override SC-VAE in_channels")
     parser.add_argument("--feature-mode", type=str, default=None, choices=["geom6", "geom_mat12", "mat6", "rgb3", "shape_native", "shape_mat"], help="Override O-Voxel feature branch")
     parser.add_argument("--checkpoint-dir", type=str, default=None, help="Override checkpoint output directory")
-    parser.add_argument("--enable-stage2-render-loss", action="store_true", help="Enable stage-2 render/perceptual loss")
+    parser.add_argument("--enable-stage2-render-loss", action="store_true", help="Enable stage-2 render/perceptual loss (LPIPS+SSIM; needs >24GB VRAM)")
+    parser.add_argument("--disable-stage2-render-loss", action="store_true", help="Force disable stage-2 render/perceptual loss (safe for 24GB GPUs)")
     parser.add_argument("--stage2-render-start-epoch", type=int, default=None, help="Epoch to start stage-2 render/perceptual loss")
     parser.add_argument("--stage2-render-weight", type=float, default=None, help="Global weight for stage-2 render branch")
     parser.add_argument("--stage2-perceptual-weight", type=float, default=None, help="Weight for stage-2 perceptual term")
@@ -1746,6 +1747,8 @@ def main():
         cfg.sc_vae.checkpoint_dir = args.checkpoint_dir
     if args.enable_stage2_render_loss:
         cfg.sc_vae.use_stage2_render_loss = True
+    if args.disable_stage2_render_loss:
+        cfg.sc_vae.use_stage2_render_loss = False
     if args.stage2_render_start_epoch is not None:
         cfg.sc_vae.stage2_render_start_epoch = max(0, int(args.stage2_render_start_epoch))
     if args.stage2_render_weight is not None:

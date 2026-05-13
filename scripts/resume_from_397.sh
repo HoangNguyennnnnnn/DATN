@@ -16,6 +16,7 @@
 #   EXTEND_EPOCHS    default: 100
 #   TARGET_MIN_LR    default: 1e-6
 #   LOG_FILE         default: logs/resume_from_397_<timestamp>.log
+#   ENABLE_STAGE2_RENDER_LOSS  default: 0 (omit --enable-stage2-render-loss; ~24GB GPUs OOM if set to 1)
 #
 # Notes:
 # - The codebase has been audited against TRELLIS.2 (microsoft/TRELLIS.2);
@@ -58,9 +59,21 @@ echo "[resume_from_397] CKPT=${CKPT}"
 echo "[resume_from_397] EXTEND_EPOCHS=${EXTEND_EPOCHS}  TARGET_MIN_LR=${TARGET_MIN_LR}"
 echo "[resume_from_397] LOG_FILE=${LOG_FILE}"
 
-# We deliberately keep the original shape_mat / 10-channel / batch-4 / accum-33
-# contract so the resume_contract sha1 inside the checkpoint matches and
-# load_checkpoint() does not refuse the resume.
+STAGE2_ARGS=()
+if [[ "${ENABLE_STAGE2_RENDER_LOSS:-0}" == "1" ]]; then
+    STAGE2_ARGS+=(--enable-stage2-render-loss)
+    echo "[resume_from_397] ENABLE_STAGE2_RENDER_LOSS=1 (LPIPS/render; needs >24GB VRAM)"
+else
+    STAGE2_ARGS+=(--disable-stage2-render-loss)
+    echo "[resume_from_397] stage-2 render loss OFF (set ENABLE_STAGE2_RENDER_LOSS=1 to enable)"
+fi
+
+# NOTE: resume_contract sha1 will mismatch (model-only resume is fine).
+# Batch/accum tunable via env for GPU memory constraints (RTX 4090 shared).
+BATCH_SIZE="${BATCH_SIZE:-2}"
+GRAD_ACCUM="${GRAD_ACCUM:-66}"
+echo "[resume_from_397] BATCH_SIZE=${BATCH_SIZE}  GRAD_ACCUM=${GRAD_ACCUM}  (effective=$(( BATCH_SIZE * GRAD_ACCUM )))"
+
 exec python -u src/train_sc_vae.py \
     --dataset both \
     --feature-mode shape_mat \
@@ -68,10 +81,10 @@ exec python -u src/train_sc_vae.py \
     --lmdb-only \
     --checkpoint-dir checkpoints/sc_vae_shape \
     --resume "${CKPT}" \
-    --gradient-accumulation-steps 33 \
-    --batch-size 4 \
+    --gradient-accumulation-steps "${GRAD_ACCUM}" \
+    --batch-size "${BATCH_SIZE}" \
     --resume-scheduler-mode cosine_restart \
     --resume-extend-epochs "${EXTEND_EPOCHS}" \
     --resume-target-min-lr "${TARGET_MIN_LR}" \
-    --enable-stage2-render-loss \
+    "${STAGE2_ARGS[@]}" \
     "$@" 2>&1 | tee -a "${LOG_FILE}"

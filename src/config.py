@@ -105,7 +105,7 @@ class SCVAEConfig:
     # Hàm mất mát kết xuất Giai đoạn 2 (Huấn luyện hai giai đoạn theo bài báo TRELLIS.2)
     # Giai đoạn 1 (0-49): Tái tạo trực tiếp O-Voxel - không gian đặc trưng thuần túy
     # Giai đoạn 2 (50+): Thêm giám sát cảm nhận dựa trên kết xuất để nâng cao chất lượng thị giác
-    use_stage2_render_loss: bool = True       # Bật giám sát nhận thức (perceptual supervision)
+    use_stage2_render_loss: bool = False      # OFF mặc định: LPIPS/render OOM trên 24GB GPU; bật bằng --enable-stage2-render-loss
     stage2_render_start_epoch: int = 50        # Chờ các đặc trưng hình dáng ổn định
     stage2_render_weight: float = 1.0          # Pt.(7) trong bài báo
     stage2_perceptual_weight: float = 0.2      # Theo bài báo: L1 + 0.2*SSIM + 0.2*LPIPS
