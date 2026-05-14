@@ -96,6 +96,30 @@ def _project_features_to_map(
     return torch.cat([mask_map, depth_map, feat_map], dim=0)
 
 
+def _depth_to_normal(
+    depth: torch.Tensor,
+    mask: torch.Tensor,
+) -> torch.Tensor:
+    """Tính pháp tuyến bề mặt từ bản đồ độ sâu bằng sai phân hữu hạn (finite differences).
+
+    Args:
+        depth: [B, 1, H, W] depth map (trực giao - orthographic)
+        mask:  [B, 1, H, W] mặt nạ chiếm đóng nhị phân (binary occupancy mask)
+    Returns:
+        normals: [B, 3, H, W] bản đồ pháp tuyến (chỉ hợp lệ tại vùng mask > 0)
+    """
+    # Sai phân trung tâm trên depth (central finite differences)
+    pad_d = F.pad(depth, (1, 1, 1, 1), mode="replicate")
+    dz_dx = (pad_d[:, :, 1:-1, 2:] - pad_d[:, :, 1:-1, :-2]) * 0.5
+    dz_dy = (pad_d[:, :, 2:, 1:-1] - pad_d[:, :, :-2, 1:-1]) * 0.5
+    # Normal = normalize(-dz/dx, -dz/dy, 1)
+    normals = torch.cat([-dz_dx, -dz_dy, torch.ones_like(dz_dx)], dim=1)
+    normals = F.normalize(normals, dim=1, eps=1e-6)
+    # Chỉ giữ pháp tuyến tại vùng mask > 0
+    normals = normals * mask
+    return normals
+
+
 def _ssim_loss(pred: torch.Tensor, tgt: torch.Tensor) -> torch.Tensor:
     """Hàm loss SSIM nhỏ cho các bản đồ đặc trưng được chiếu (tensor CHW ưu tiên lô - batch-first CHW tensors)."""
     c1 = 0.01 ** 2
@@ -332,6 +356,12 @@ def compute_stage2_render_perceptual_loss(
 
             render_loss_acc = render_loss_acc + F.l1_loss(pred_mask, tgt_mask) + 10.0 * F.l1_loss(pred_depth, tgt_depth)
             perceptual_loss_acc = perceptual_loss_acc + _d_p_loss(pred_norm, tgt_norm)
+            # Depth-to-normal loss (λ_normal=1, TRELLIS.2 Eq.8)
+            pred_surf_n = _depth_to_normal(pred_depth, pred_mask)
+            tgt_surf_n = _depth_to_normal(tgt_depth, tgt_mask)
+            joint_m = ((pred_mask > 0) & (tgt_mask > 0)).float()
+            render_loss_acc = render_loss_acc + F.l1_loss(pred_surf_n * joint_m, tgt_surf_n * joint_m)
+            perceptual_loss_acc = perceptual_loss_acc + _d_p_loss(pred_surf_n * joint_m, tgt_surf_n * joint_m)
             views_used += 1
             continue
 
@@ -435,11 +465,17 @@ def compute_stage2_render_perceptual_loss(
             tgt_mra = torch.stack(tgt_mra_list, dim=0)
 
             render_loss_acc = render_loss_acc + F.l1_loss(pred_mask, tgt_mask) + 10.0 * F.l1_loss(pred_depth, tgt_depth)
+            # Depth-to-normal loss (λ_normal=1, TRELLIS.2 Eq.8)
+            pred_surf_n = _depth_to_normal(pred_depth, pred_mask)
+            tgt_surf_n = _depth_to_normal(tgt_depth, tgt_mask)
+            joint_m = ((pred_mask > 0) & (tgt_mask > 0)).float()
+            render_loss_acc = render_loss_acc + F.l1_loss(pred_surf_n * joint_m, tgt_surf_n * joint_m)
             perceptual_loss_acc = (
                 perceptual_loss_acc
                 + _d_p_loss(pred_norm, tgt_norm)
                 + _d_p_loss(pred_c, tgt_c)
                 + _d_p_loss(pred_mra, tgt_mra)
+                + _d_p_loss(pred_surf_n * joint_m, tgt_surf_n * joint_m)
             )
             views_used += 1
             continue
@@ -497,10 +533,16 @@ def compute_stage2_render_perceptual_loss(
             tgt_c = torch.stack(tgt_c_list, dim=0)
 
             render_loss_acc = render_loss_acc + F.l1_loss(pred_mask, tgt_mask) + 10.0 * F.l1_loss(pred_depth, tgt_depth)
+            # Depth-to-normal loss (λ_normal=1, TRELLIS.2 Eq.8)
+            pred_surf_n = _depth_to_normal(pred_depth, pred_mask)
+            tgt_surf_n = _depth_to_normal(tgt_depth, tgt_mask)
+            joint_m = ((pred_mask > 0) & (tgt_mask > 0)).float()
+            render_loss_acc = render_loss_acc + F.l1_loss(pred_surf_n * joint_m, tgt_surf_n * joint_m)
             perceptual_loss_acc = (
                 perceptual_loss_acc
                 + _d_p_loss(pred_norm, tgt_norm)
                 + _d_p_loss(pred_c, tgt_c)
+                + _d_p_loss(pred_surf_n * joint_m, tgt_surf_n * joint_m)
             )
             views_used += 1
             continue

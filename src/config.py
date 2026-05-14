@@ -111,6 +111,7 @@ class SCVAEConfig:
     stage2_perceptual_weight: float = 0.2      # Theo bài báo: L1 + 0.2*SSIM + 0.2*LPIPS
     stage2_render_views: int = 2               # [PERF] 2 góc (front+side) đủ bao phủ khuôn mặt, tiết kiệm ~2.7%
     stage2_render_image_size: int = 64         # [PERF] LPIPS chuẩn ở 64px, tiết kiệm ~4% (scatter 4x nhỏ hơn)
+    stage2_normal_weight: float = 1.0          # λ_normal: Trọng số pháp tuyến bề mặt từ depth (TRELLIS.2 standard)
     stage2_max_points_per_batch: int = 10000000 # CHẾ ĐỘ CHẤT LƯỢNG CAO: Giữ 100% điểm cho LPIPS loss
     
     # Các voxel cho mỗi lưới (Chiến lược VRAM tối đa)
@@ -143,6 +144,10 @@ class SCVAEConfig:
     adaptive_clip_percentile: float = 95.0 # Cắt các đỉnh đột biến vượt quá bách phân vị thứ 95
     grad_clip: float = 1.0             # Giá trị dự phòng nếu adaptive tắt
     
+    # EMA (Exponential Moving Average) — TRELLIS.2 standard
+    use_ema: bool = True               # Bật EMA cho model weights (VRAM: ~140MB cho 35M params)
+    ema_decay: float = 0.9999          # Decay rate theo TRELLIS.2 (0.9999)
+
     # Tối ưu hóa bộ nhớ
     use_gradient_checkpointing: bool = False  # Vô hiệu hóa để tăng tốc (VRAM cho phép)
     clear_cache_every_n_batches: int = 0       # Vô hiệu hóa để giữ VRAM ổn định và ngăn việc sụt giảm 1.7GB

@@ -8,6 +8,51 @@ import torch
 from torch.optim.lr_scheduler import LambdaLR
 
 
+class EMA:
+    """Exponential Moving Average for model weights (TRELLIS.2 standard).
+
+    VRAM usage: ~4 bytes × num_params (e.g., 35M params → ~140MB).
+    Shadow weights are stored on the same device as model params.
+    """
+
+    def __init__(self, model: torch.nn.Module, decay: float = 0.9999):
+        self.decay = decay
+        self.shadow = {}
+        self.backup = {}
+        for name, param in model.named_parameters():
+            if param.requires_grad:
+                self.shadow[name] = param.data.clone()
+
+    @torch.no_grad()
+    def update(self, model: torch.nn.Module):
+        """Update shadow weights after optimizer.step()."""
+        for name, param in model.named_parameters():
+            if param.requires_grad and name in self.shadow:
+                self.shadow[name].mul_(self.decay).add_(param.data, alpha=1.0 - self.decay)
+
+    def apply_shadow(self, model: torch.nn.Module):
+        """Swap model weights with EMA shadow (for validation/inference)."""
+        for name, param in model.named_parameters():
+            if param.requires_grad and name in self.shadow:
+                self.backup[name] = param.data.clone()
+                param.data.copy_(self.shadow[name])
+
+    def restore(self, model: torch.nn.Module):
+        """Restore original weights after validation."""
+        for name, param in model.named_parameters():
+            if param.requires_grad and name in self.backup:
+                param.data.copy_(self.backup[name])
+        self.backup = {}
+
+    def state_dict(self):
+        return {k: v.cpu() for k, v in self.shadow.items()}
+
+    def load_state_dict(self, state_dict, model: torch.nn.Module):
+        for name, param in model.named_parameters():
+            if param.requires_grad and name in state_dict:
+                self.shadow[name] = state_dict[name].to(param.device)
+
+
 def align_recon_target(recon_x: torch.Tensor, out_indices: torch.Tensor, target_x: torch.Tensor, target_indices: torch.Tensor):
     """Căn chỉnh tái tạo/mục tiêu thưa thớt (sparse recon/target) thông qua việc khớp chỉ số không gian băm (hashed spatial index matching) chính xác."""
     from src.models.sc_vae import _hash_indices, _SPARSE_HASH_BASE
@@ -253,6 +298,7 @@ def save_checkpoint(
     global_step=None,
     batch_size=None,
     metadata=None,
+    ema=None,
 ):
     """Lưu checkpoint đầy đủ để resume."""
     os.makedirs(os.path.dirname(path), exist_ok=True)
@@ -266,6 +312,8 @@ def save_checkpoint(
         'scaler_state_dict': scaler.state_dict() if scaler else None,
         'loss': loss,
     }
+    if ema is not None:
+        payload['ema_state_dict'] = ema.state_dict()
     if isinstance(metadata, dict):
         payload.update(metadata)
     tmp_path = f"{path}.tmp.{os.getpid()}.{random.randint(0, 10**9)}"

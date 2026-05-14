@@ -46,7 +46,9 @@ else
 fi
 
 echo "[STEP 4] Resuming SC-VAE training from $LATEST_CKPT..."
-echo "  Target: 500 epochs"
+echo "  Target: 500+200 epochs (cosine restart)"
+echo "  EMA: enabled (decay=0.9999, ~140MB VRAM)"
+echo "  Stage2 render loss: enabled (depth x10, LPIPS, SSIM)"
 echo "  LR warmup: 500 steps (~3.4 epochs)"
 echo "  num_workers: 4 (reduced from 8 to prevent OOM)"
 echo "  Starting at: $(date)"
@@ -58,6 +60,11 @@ PYTHONUNBUFFERED=1 python src/train_sc_vae.py \
     --gradient-accumulation-steps 33 \
     --save-every-steps 2000 --val-every-epochs 10 \
     --perf-log-every-steps 50 --num-workers 4 \
+    --enable-ema --ema-decay 0.9999 \
+    --enable-stage2-render-loss \
+    --resume-scheduler-mode cosine_restart \
+    --resume-extend-epochs 200 \
+    --resume-target-min-lr 1e-6 \
     2>&1 | stdbuf -oL tee -a logs/train_sc_vae_gamma_fixed.log
 
 echo ""

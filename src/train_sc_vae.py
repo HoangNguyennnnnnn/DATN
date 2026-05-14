@@ -48,6 +48,7 @@ from src.scvae_train.data import (
 )
 from src.scvae_train.render import compute_stage2_render_perceptual_loss
 from src.scvae_train.runtime import (
+    EMA,
     align_recon_target,
     is_oom_error as _is_oom_error,
     is_sparse_runtime_error as _is_sparse_runtime_error,
@@ -624,7 +625,15 @@ def train_sc_vae(
     
     param_count = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"  Parameters: {param_count:,} ({param_count/1e6:.1f}M)")
-    
+
+    # ---- EMA (Exponential Moving Average) ----
+    ema = None
+    if getattr(vae_cfg, 'use_ema', False):
+        ema_decay = float(getattr(vae_cfg, 'ema_decay', 0.9999))
+        ema = EMA(model, decay=ema_decay)
+        ema_vram_mb = param_count * 4 / (1024**2)
+        print(f"  EMA: decay={ema_decay}, shadow VRAM≈{ema_vram_mb:.0f}MB")
+
     # ---- Optimizer ----
     # Thử nghiệm Fused AdamW nếu trên CUDA (yêu cầu torch >= 2.0)
     optimizer_kwargs = {
@@ -663,6 +672,7 @@ def train_sc_vae(
         "data_signature": data_signature,
         "resume_contract": resume_contract,
     }
+    # EMA state will be injected into metadata at save time via _inject_ema_state()
     
     # spconv v2.x không hỗ trợ bfloat16 trong một số ops (KeyError), 
     # nên chúng ta dùng float16. Các bộ kẹp (Clamps) đã thêm ở bước trước 
@@ -720,6 +730,10 @@ def train_sc_vae(
                 raise exc
         start_epoch = int(ckpt.get('epoch', 0))
         global_step = int(ckpt.get('global_step', start_epoch * len(dataloader)) or 0)
+        # Restore EMA shadow weights if available
+        if ema is not None and 'ema_state_dict' in ckpt:
+            ema.load_state_dict(ckpt['ema_state_dict'], model)
+            print(f"  EMA: restored shadow weights from checkpoint")
         ckpt_batch_size = ckpt.get('batch_size', None)
         if ckpt_batch_size is not None and ckpt_batch_size != vae_cfg.batch_size and not vae_cfg.resume_model_only:
             print(
@@ -1199,6 +1213,9 @@ def train_sc_vae(
                         continue
                     if scaler.get_scale() >= prev_scale:
                         scheduler.step()
+                        # EMA: update shadow weights after successful optimizer step
+                        if ema is not None:
+                            ema.update(model)
                     step_time = time.perf_counter() - step_t0
                 else:
                     step_time = 0.0
@@ -1243,6 +1260,7 @@ def train_sc_vae(
                             global_step=global_step,
                             batch_size=vae_cfg.batch_size,
                             metadata=checkpoint_metadata,
+                            ema=ema,
                         )
 
                     if cfg.wandb.enabled and WANDB_AVAILABLE and global_step % cfg.wandb.log_every_steps == 0:
@@ -1346,6 +1364,9 @@ def train_sc_vae(
 
             val_avg_loss = None
             if val_dataloader is not None and ((epoch + 1) % max(int(vae_cfg.val_every_epochs), 1) == 0):
+                # Use EMA weights for validation (better quality estimate)
+                if ema is not None:
+                    ema.apply_shadow(model)
                 model.eval()
                 val_loss_sum = 0.0
                 val_cd_sum = 0.0
@@ -1543,6 +1564,10 @@ def train_sc_vae(
                             "val/stage2_skipped_batches": val_stage2_skips,
                         }, step=global_step)
 
+                # Restore training weights after validation
+                if ema is not None:
+                    ema.restore(model)
+
             # Lưu checkpoint
             if (epoch + 1) % vae_cfg.save_every_epochs == 0:
                 save_checkpoint(
@@ -1551,6 +1576,7 @@ def train_sc_vae(
                     global_step=global_step,
                     batch_size=vae_cfg.batch_size,
                     metadata=checkpoint_metadata,
+                    ema=ema,
                 )
 
             # Lưu checkpoint tốt nhất dựa trên loss xác thực để tránh quá khớp (overfitting) với loss huấn luyện.
@@ -1562,6 +1588,7 @@ def train_sc_vae(
                     global_step=global_step,
                     batch_size=vae_cfg.batch_size,
                     metadata=checkpoint_metadata,
+                    ema=ema,
                 )
             
             # Xóa bộ đệm GPU ở cuối epoch để đảm bảo trạng thái sạch sẽ cho epoch tiếp theo
@@ -1583,6 +1610,7 @@ def train_sc_vae(
             global_step=global_step,
             batch_size=vae_cfg.batch_size,
             metadata=checkpoint_metadata,
+            ema=ema,
         )
         print("[INTERRUPT] Safe checkpoint saved. You can resume later.")
     except Exception as exc:
@@ -1601,6 +1629,7 @@ def train_sc_vae(
             global_step=global_step,
             batch_size=vae_cfg.batch_size,
             metadata=checkpoint_metadata,
+            ema=ema,
         )
         report_path = _write_crash_report(
             vae_cfg.checkpoint_dir,
@@ -1658,6 +1687,9 @@ def main():
     parser.add_argument("--in-channels", type=int, default=None, help="Override SC-VAE in_channels")
     parser.add_argument("--feature-mode", type=str, default=None, choices=["geom6", "geom_mat12", "mat6", "rgb3", "shape_native", "shape_mat"], help="Override O-Voxel feature branch")
     parser.add_argument("--checkpoint-dir", type=str, default=None, help="Override checkpoint output directory")
+    parser.add_argument("--enable-ema", action="store_true", help="Enable EMA (Exponential Moving Average) for model weights (~140MB VRAM)")
+    parser.add_argument("--disable-ema", action="store_true", help="Disable EMA")
+    parser.add_argument("--ema-decay", type=float, default=None, help="EMA decay rate (default: 0.9999)")
     parser.add_argument("--enable-stage2-render-loss", action="store_true", help="Enable stage-2 render/perceptual loss (LPIPS+SSIM; needs >24GB VRAM)")
     parser.add_argument("--disable-stage2-render-loss", action="store_true", help="Force disable stage-2 render/perceptual loss (safe for 24GB GPUs)")
     parser.add_argument("--stage2-render-start-epoch", type=int, default=None, help="Epoch to start stage-2 render/perceptual loss")
@@ -1745,6 +1777,12 @@ def main():
         cfg.sc_vae.input_feature_mode = args.feature_mode
     if args.checkpoint_dir is not None:
         cfg.sc_vae.checkpoint_dir = args.checkpoint_dir
+    if args.enable_ema:
+        cfg.sc_vae.use_ema = True
+    if args.disable_ema:
+        cfg.sc_vae.use_ema = False
+    if args.ema_decay is not None:
+        cfg.sc_vae.ema_decay = float(args.ema_decay)
     if args.enable_stage2_render_loss:
         cfg.sc_vae.use_stage2_render_loss = True
     if args.disable_stage2_render_loss:
