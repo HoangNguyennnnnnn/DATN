@@ -4,7 +4,7 @@
 **Tác giả:** Nhóm nghiên cứu FaceDiff  
 **Cấu hình Mục tiêu:** Đơn GPU RTX 4090 (24GB VRAM)  
 **Bộ dữ liệu:** FaceVerse_3D & FaceScape  
-**Trạng thái checkpoint:** SC-VAE epoch 399/500 đang chạy (Step 621,450, Loss 0.1078). ETA hoàn thành: sáng 16/05/2026.
+**Trạng thái checkpoint:** SC-VAE epoch 442/700 đang chạy (Step 627,800, recon_loss=0.0224). Resume từ epoch 441 với EMA + Depth-to-Normal Loss + Cosine Restart +200 epochs.
 
 ---
 
@@ -1144,14 +1144,14 @@ Số liệu thực tế đọc trực tiếp từ `data_signature` được hash
 | Loss weights — render depth | $\lambda_{\text{depth}} = 10$ | $10$ (identical) |
 | Loss weights — render mask | $\lambda_{\text{mask}} = 1$ | $1$ (identical) |
 | Loss weights — Perceptual | L1 + 0.2 SSIM + 0.2 LPIPS | **Identical** |
-| Loss weights — Normal | $\lambda_{\text{normal}} = 1$ (TRELLIS.2 có) | **chưa triển khai** (FaceDiff sẽ thêm sau khi tích hợp `nvdiffrast`) |
-| Optimizer | AdamW lr=1e-4, EMA 0.9999, AdaptiveGradClipper | AdamW lr=5e-5 (1e-5 cho ckpt epoch 397), không EMA, vanilla `clip_grad_norm_` |
+| Loss weights — Normal | $\lambda_{\text{normal}} = 1$ (TRELLIS.2 có) | $\lambda_{\text{normal}} = 1$ — **✅ 14/05** depth-to-normal via finite differences trên depth maps |
+| Optimizer | AdamW lr=1e-4, EMA 0.9999, AdaptiveGradClipper | AdamW lr=1e-5 (resume), **EMA 0.9999 ✅ 14/05**, AdaptiveGradClipper ✅ |
 
-**Khác biệt cốt lõi còn lại sau revision 2:**
-1. **Render loss**: TRELLIS.2 render actual mesh qua `nvdiffrast` differentiable rasterizer → depth/normals/PBR shading chính xác. FaceDiff project point features lên 2D maps → xấp xỉ. Sau fix Bug 4 + Bug 7 (dv-corrected positions, activated dv), FaceDiff supervision chính xác hơn nhưng vẫn cần tích hợp `nvdiffrast` để bằng spec.
+**Khác biệt cốt lõi còn lại sau revision 3 (14/05/2026):**
+1. **Render loss**: TRELLIS.2 render actual mesh qua `nvdiffrast` differentiable rasterizer → depth/normals/PBR shading chính xác. FaceDiff project point features lên 2D maps → xấp xỉ. `nvdiffrast` 0.4.0 đã cài; tích hợp mesh rasterization thay thế point projection sẽ thực hiện ở lượt train tiếp theo.
 2. **Encoder/Decoder downsample**: TRELLIS.2 dùng `SparseSpatial2Channel/Channel2Spatial` zero-param (chỉ reshape & permute features), không tốn FLOPs. FaceDiff dùng strided sparse conv tốn thêm $C^2 \cdot k^3$ FLOPs/level nhưng dễ build với spconv 2.x.
-3. **EMA weights** + **AdaptiveGradClipper**: TRELLIS.2 mặc định bật cả hai. FaceDiff hiện chưa có; có thể là next-step optimisation cho stability ở giai đoạn fine-tune.
-4. **Normal loss**: TRELLIS.2 dùng `lambda_normal=1`. FaceDiff sẽ thêm khi nvdiffrast hoạt động.
+3. ~~**EMA weights**~~: ✅ **Đã triển khai** (14/05) — decay=0.9999, shadow VRAM ~134MB. Tích hợp vào training loop, checkpoint, resume.
+4. ~~**Normal loss**~~: ✅ **Đã triển khai** (14/05) — `_depth_to_normal()` tính pháp tuyến từ depth maps bằng sai phân hữu hạn. L1 + 0.2×SSIM + 0.2×LPIPS trên normal maps, khớp TRELLIS.2 spec.
 
 ### 7.4. Phân tích Thiết kế
 
@@ -1180,12 +1180,15 @@ Số liệu thực tế đọc trực tiếp từ `data_signature` được hash
 | Fix LR Warmup | 6000 → 500 steps | 5 phút | ✅ 09/05 |
 | Audit + Fix 5 Bug đầu | Test script + render loss | — | ✅ 10/05 (revision 1) |
 | **Audit TRELLIS.2 + Fix 7 Bug mới** (Bug 6→12) | Activations, KL, LayerNorm32, scheduler resume | — | ✅ 10/05 (revision 2) |
-| **SC-VAE resume 397→497** | 100 epoch × ~30 min với `cosine_restart` từ 9.94e-6 → 1e-6 | ~50h | ⏳ Chạy bằng `bash scripts/resume_from_397.sh` |
+| **SC-VAE resume 397→497** | 100 epoch × ~30 min với `cosine_restart` từ 9.94e-6 → 1e-6 | ~50h | ✅ Hoàn thành epoch 441 |
+| **EMA + Depth-to-Normal + Cosine Restart** | Thêm EMA (0.9999), normal loss (λ=1), cosine restart +200ep | — | ✅ 14/05 (revision 3) |
+| **nvdiffrast** | Cài nvdiffrast 0.4.0 cho future mesh rasterization | — | ✅ 14/05 |
+| **SC-VAE resume 441→700** | +200 epoch, cosine restart với EMA + normal loss + render loss | ~75h | ⏳ Đang chạy (epoch 442) |
 | **Precompute Slat + context (iMF)** | `python scripts/precompute_slat_cache.py --sc-vae-ckpt … --dataset both --skip-existing` → đầy đủ hybrid context (đã sửa bug bản cũ) | ~3–8h tuỳ I/O/GPU | ✅ Công cụ + báo cáo Mục 4.4.0 (revision 3) |
 | **iMF train với `--offline-data`** | Tăng batch sau precompute; không nạp SC-VAE/DINO trên GPU train | song song SC-VAE nếu cần | ⏳ Sau khi cache đủ |
 | iMF Training (online, không offline) | 400 epochs, batch 48 | ~27h | ⏳ Tuỳ chọn nếu không precompute |
 | E2E Test | Inference + mesh quality | ~0.5 day | ⏳ |
-| **Tổng** | | **~4.5 ngày** | **ETA: 14-15/05** |
+| **Tổng** | | **~7 ngày** | **ETA: 18-19/05** |
 
 **Dự báo hội tụ SC-VAE** (cập nhật theo loss thực tế của log gốc):
 

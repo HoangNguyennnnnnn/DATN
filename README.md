@@ -69,9 +69,18 @@ python src/train_sc_vae.py \
   --lmdb-only \
   --checkpoint-dir checkpoints/sc_vae_shape
 
-# Stage 1: resume từ checkpoint epoch 397 với cosine warm-restart
-bash scripts/resume_from_397.sh                 # mặc định CKPT=interrupt.pt, EXTEND_EPOCHS=100
-EXTEND_EPOCHS=200 bash scripts/resume_from_397.sh   # kéo dài 200 epoch
+# Stage 1: resume với EMA + normal loss + cosine restart
+python src/train_sc_vae.py \
+  --resume checkpoints/sc_vae_shape/interrupt.pt \
+  --lr 1e-5 --no-torch-compile \
+  --batch-size 1 --gradient-accumulation-steps 132 \
+  --enable-ema --ema-decay 0.9999 \
+  --enable-stage2-render-loss \
+  --resume-scheduler-mode cosine_restart \
+  --resume-extend-epochs 200 --resume-target-min-lr 1e-6
+
+# Hoặc dùng script tự động (Steps 4→5→6)
+bash scripts/resume_from_step4.sh
 
 # Stage 2: iMF mặc định
 python src/train_imf.py \
@@ -95,7 +104,7 @@ python src/train_imf.py \
   --material-target-in-channels 3
 ```
 
-## 3. Sửa lớn so với phiên bản trước (audit ngày 2026-05-10)
+## 3. Sửa lớn so với phiên bản trước (audit ngày 2026-05-10, cập nhật 2026-05-14)
 
 Sau khi đối chiếu code với TRELLIS.2 chính thống (`microsoft/TRELLIS.2`,
 `trellis2/models/sc_vaes/sparse_unet_vae.py` + `fdg_vae.py`), các điểm sau đã
@@ -125,6 +134,18 @@ Sau khi đối chiếu code với TRELLIS.2 chính thống (`microsoft/TRELLIS.2
    + CLI flag `--resume-scheduler-mode {continue, constant_min_lr, cosine_restart}`
    cho phép fine-tune sau khi cosine ban đầu đã chạy gần hết (epoch 397/500)
    mà không phải reset optimizer state hay base_lr.
+7. **EMA (Exponential Moving Average)** — `src/scvae_train/runtime.py:EMA` class,
+   decay=0.9999 theo TRELLIS.2 standard. Shadow weights lưu trên GPU (~134MB cho 35M params).
+   Tích hợp vào training loop (update sau optimizer step), validation (apply_shadow/restore),
+   checkpoint (save/load `ema_state_dict`). CLI: `--enable-ema`, `--ema-decay`.
+8. **Depth-to-Normal Loss** — `src/scvae_train/render.py:_depth_to_normal()` tính
+   pháp tuyến bề mặt từ depth maps bằng sai phân hữu hạn (finite differences).
+   Tích hợp vào Stage 2 render loss cho tất cả feature modes (shape_mat, geom6,
+   shape_native, geom_mat12) với λ_normal=1, khớp TRELLIS.2 Eq.8.
+   Loss: L1(normal) + L1 + 0.2×SSIM + 0.2×LPIPS trên normal maps.
+9. **nvdiffrast 0.4.0** — Đã cài đặt NVIDIA differentiable rasterizer.
+   Hiện chưa tích hợp vào render loss (vẫn dùng point projection);
+   sẽ thay thế bằng mesh rasterization ở lượt train tiếp theo.
 
 ## 4. Debug nhanh cache → mesh
 
