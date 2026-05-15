@@ -1,10 +1,10 @@
 # Báo cáo Nghiên cứu Chuyên sâu: FaceDiff — Hệ thống Tạo sinh Khuôn mặt 3D Một Bước trên Đơn GPU
 
-**Ngày cập nhật:** 15/05/2026 (revision 11 — fix Dual Contouring bug, thêm Poisson mesh, phân tích khả thi mesh-based rendering loss)  
+**Ngày cập nhật:** 15/05/2026 (revision 12 — RGB render loss fix, xác minh DC algorithm, phân tích mesh hole root cause)  
 **Tác giả:** Nhóm nghiên cứu FaceDiff  
 **Cấu hình Mục tiêu:** Đơn GPU RTX 4090 (24GB VRAM)  
 **Bộ dữ liệu:** FaceVerse_3D & FaceScape  
-**Trạng thái checkpoint:** SC-VAE epoch 473/700 đang chạy (Step 632,450, recon_loss=0.0217). Inline validation tắt, đánh giá qua `test_sc_vae_recon_v2.py` với TRELLIS.2 Dual Contouring + Poisson mesh.
+**Trạng thái checkpoint:** SC-VAE epoch 393/700 đang chạy (Step 620,700, recon_loss=0.0266, Loss=0.1081). RGB render loss fix đã áp dụng. Thuật toán DC đã xác minh đúng 100% trên GT data.
 
 ---
 
@@ -2016,5 +2016,73 @@ File output: `recon_poisson_colored.ply` được xuất song song với `recon_
 
 ---
 
-*(Hết báo cáo — Cập nhật: 15/05/2026 — Revision 11: Fix Dual Contouring bug, thêm Poisson mesh, phân tích khả thi mesh-based rendering loss.)*
+## 11. Revision 12 — RGB Render Loss Fix & DC Algorithm Verification (15/05/2026)
+
+### 11.1. RGB Render Loss Fix
+
+**Bug phát hiện:** Trong `src/scvae_train/render.py` (hàm `compute_stage2_render_perceptual_loss`), kênh RGB được truyền trực tiếp dưới dạng raw logits (`recon_s[:, 7:10]`) vào phép chiếu orthographic, trong khi target RGB đã nằm trong [0, 1]. Điều này gây gradient instability cho LPIPS loss.
+
+```diff
+# render.py dòng 518
+- rgb_recon = recon_s[:, 7:10]
++ rgb_recon = recon_s[:, 7:10].clamp(0.0, 1.0)
+```
+
+**Tác động:** Loss hội tụ ổn định hơn sau bản vá. Training resume từ `epoch_390.pt` với RGB fix, không có NaN/OOM.
+
+### 11.2. Xác minh Thuật toán Dual Contouring
+
+Để xác định nguyên nhân mesh bị lỗ, thực hiện kiểm thử DC trên dữ liệu Ground Truth thuần (sample `001_01`, 320,252 voxels từ LMDB):
+
+| Metric | GT Data | Model Output (Epoch 390) |
+|---|---|---|
+| Input voxels | 320,252 | 348,392 |
+| Active edges | 320,533 | 361,549 |
+| Potential quads | 320,533 | 361,549 |
+| **Valid quads** | **320,533 (100.0%)** | **355,929 (98.4%)** |
+| **Dropped quads** | **0 (0.0%)** | **5,620 (1.6%)** |
+| Final faces | 641,066 | 711,858 |
+
+**Kết luận:** Thuật toán DC **hoạt động đúng 100%** trên GT data. Lỗ mesh hoàn toàn do model output:
+- **5,620 quads bị drop** vì model dự đoán active edge ở voxel biên nhưng không sinh voxel neighbor cần thiết
+- Nguyên nhân: corner 0 (voxel gốc) luôn OK, nhưng corners 1-3 (neighbors) bị thiếu trong sparse grid
+
+### 11.3. Activations — Đã Xác minh Đúng với TRELLIS.2
+
+Đối chiếu inference activations với `TRELLIS.2/trellis2/models/sc_vaes/fdg_vae.py` dòng 97-110:
+
+| Channel | Activation | Range | Đúng? |
+|---|---|---|---|
+| DV (0:3) | `(1+2×0.5)·sigmoid(h) - 0.5` | [-0.5, 1.5] | ✅ |
+| Flag (3:6) | `h > 0` (eval) / `sigmoid(h)` (train) | {0, 1} | ✅ |
+| Gamma (6:7) | `softplus(h)` | [0, ∞) | ✅ |
+| RGB (7:10) | `clamp(h, 0, 1)` | [0, 1] | ✅ |
+
+Tất cả activations trong pipeline inference **khớp hoàn toàn** với TRELLIS.2 reference.
+
+### 11.4. Training Status
+
+| Metric | Giá trị |
+|---|---|
+| Epoch | 393/700 |
+| Total Loss | 0.1081 |
+| Recon Loss | 0.0266 |
+| KL Loss | 14.76 |
+| VRAM | 16,945 MB |
+| OOM/NaN/Sparse skips | 0 / 0 / 0 |
+| Stage2 render time | ~330ms/step |
+| ETA | ~2026-05-22 |
+| PID | 3122035 |
+| Log | `logs/resume_e390_rgbfix_20260515_143736.log` |
+
+### 11.5. Kết luận & Hành động Tiếp theo
+
+1. **DC algorithm:** Đã xác minh đúng — không cần sửa
+2. **Mesh holes (1.6%):** Sẽ giảm khi model cải thiện flag prediction qua thêm 300 epochs
+3. **RGB render loss fix:** Đã áp dụng, training ổn định
+4. **Mốc đánh giá tiếp:** Epoch 500 — chạy lại mesh diagnostic để đo % quads dropped
+
+---
+
+*(Hết báo cáo — Cập nhật: 15/05/2026 — Revision 12: RGB render loss fix, xác minh DC algorithm 100% đúng, phân tích mesh hole root cause 1.6% dropped quads.)*
 

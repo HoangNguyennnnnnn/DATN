@@ -1,27 +1,40 @@
-# Datasets & Cache (CRITICAL: Do not upload to GitHub)
+# ============================================================
+# FaceDiff .gitignore
+# ============================================================
+
+# ── Datasets & Caches (CRITICAL: never upload) ──
 /data/
+*.lmdb
+*.mdb
+
+# ── Model Checkpoints ──
+checkpoints/
+*.pt
+*.pth
+*.bin
+*.safetensors
+*.ckpt
+
+# ── Training Outputs ──
 outputs/
 val_samples/
-*.pt
-*.lmdb
-*.shape_mat
-*.mx100000
+test_dc_diagnostic/
+logs/
+*.log
+wandb/
+
+# ── Conda / Python Environment ──
 miniconda3/
 snap/
-third_party/
-
-# Model Checkpoints
-checkpoints/
-*.bin
-*.pth
-
-# Python
 __pycache__/
 *.py[cod]
 *$py.class
 *.so
+*.o
 .Python
 env/
+venv/
+.venv/
 build/
 develop-eggs/
 dist/
@@ -38,19 +51,49 @@ wheels/
 .installed.cfg
 *.egg
 
-# IDEs & System
+# ── Third-party (vendored separately) ──
+third_party/
+
+# ── IDEs & Editors ──
 .vscode/
+.vscode-server/
 .idea/
+.cursor/
+.cursor-server/
+.windsurf-server/
+
+# ── AI Agents & Tools ──
+.gemini/
+.claude/
+.claude.json
+.cline/
+.codeium/
+.codex/
+.copilot/
+.antigravity-server/
+
+# ── System & Dotfiles ──
 .DS_Store
 .ipynb_checkpoints
-.gemini/
 .env
+.netrc
+.ssh/
+.cache/
+.config/
+.local/
+.conda/
+.anaconda/
+.dotnet/
+.java/
+.nv/
+.triton/
+.flex_gemm/
+.insightface/
+.bash_history
+.bash_logout
+.bashrc
+.profile
+.wget-hsts
 
-# Logs
-logs/
-*.log
-wandb/
-
-# User Home Directory specific (since the workspace is used as $HOME)
-.*
+# ── Keep .gitignore itself ──
 !.gitignore
