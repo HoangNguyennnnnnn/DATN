@@ -515,8 +515,11 @@ def compute_stage2_render_perceptual_loss(
                 tgt_norm_list.append(tgt_shape[2:5])
 
                 # RGB projection uses dv-corrected positions (consistent with shape)
-                pred_rgb = _project_features_to_map(s["pts_pred"], recon_s[:, 7:10], axes, image_size)
-                tgt_rgb = _project_features_to_map(s["pts_tgt"], target_s[:, 7:10], axes, image_size)
+                # BUG FIX: recon_s is raw logits (apply_output_activations=False).
+                # Flags at line 504 correctly got sigmoid, but RGB was missed.
+                # clamp(0,1) matches the activation in _shape_mat_recon_loss.
+                pred_rgb = _project_features_to_map(s["pts_pred"], recon_s[:, 7:10].clamp(0.0, 1.0), axes, image_size)
+                tgt_rgb = _project_features_to_map(s["pts_tgt"], target_s[:, 7:10].clamp(0.0, 1.0), axes, image_size)
                 pred_c_list.append(pred_rgb[2:5])
                 tgt_c_list.append(tgt_rgb[2:5])
 
