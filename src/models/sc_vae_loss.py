@@ -9,17 +9,19 @@ class SCVAELoss(nn.Module):
     1. Reconstruction Loss: MSE (cho features như màu, roughness) hoặc BCE (cho mask/điểm).
     2. KL Divergence Loss: Ép phân phối của Slat Token về dạng Gaussian chuẩn (0, 1) để cho phép U-Net sinh mẫu mượt mà.
     """
-    def __init__(self, kl_weight: float = 1e-4, use_bce_for_geom: bool = False, rho_loss_weight: float = 1.0):
+    def __init__(self, kl_weight: float = 1e-4, use_bce_for_geom: bool = False, rho_loss_weight: float = 1.0, rho_pos_weight: float = 1.0):
         """
         Args:
             kl_weight (float): Trọng số cân bằng KL Divergence. Quá cao sẽ làm mờ texture, quá thấp sẽ khiến sinh mẫu Flow Matching khó hội tụ.
             use_bce_for_geom (bool): Nếu True, sử dụng Binary Cross Entropy cho Geometry logic thay vì MSE.
             rho_loss_weight (float): Trọng số cho Focal Loss của Early-Pruning (rho mask).
+            rho_pos_weight (float): pos_weight cho rho BCE — >1 phạt FN nặng hơn FP để cải thiện recall.
         """
         super().__init__()
         self.kl_weight = kl_weight
         self.use_bce_for_geom = use_bce_for_geom
         self.rho_loss_weight = rho_loss_weight
+        self.rho_pos_weight = rho_pos_weight
 
     def _shape_recon_loss(self, recon_x: torch.Tensor, target_x: torch.Tensor, feature_mode: str) -> torch.Tensor:
         """Geometry-centric reconstruction terms for shape branches."""
@@ -185,7 +187,8 @@ class SCVAELoss(nn.Module):
                     continue
                 if logits.numel() == 0 or targets.numel() == 0:
                     continue
-                terms.append(F.binary_cross_entropy_with_logits(logits, targets, reduction='mean'))
+                pw = logits.new_tensor([self.rho_pos_weight]) if self.rho_pos_weight != 1.0 else None
+                terms.append(F.binary_cross_entropy_with_logits(logits, targets, reduction='mean', pos_weight=pw))
             if len(terms) > 0:
                 rho_loss = torch.stack(terms).mean()
 

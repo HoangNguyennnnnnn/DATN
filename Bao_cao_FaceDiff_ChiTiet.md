@@ -1,10 +1,10 @@
 # Báo cáo Nghiên cứu Chuyên sâu: FaceDiff — Hệ thống Tạo sinh Khuôn mặt 3D Một Bước trên Đơn GPU
 
-**Ngày cập nhật:** 13/05/2026 (revision 10 — báo cáo tiến độ toàn diện, rà soát VoxelMamba vs DiM-3D, chuẩn bị Cloud GPU deployment)  
+**Ngày cập nhật:** 15/05/2026 (revision 11 — fix Dual Contouring bug, thêm Poisson mesh, phân tích khả thi mesh-based rendering loss)  
 **Tác giả:** Nhóm nghiên cứu FaceDiff  
 **Cấu hình Mục tiêu:** Đơn GPU RTX 4090 (24GB VRAM)  
 **Bộ dữ liệu:** FaceVerse_3D & FaceScape  
-**Trạng thái checkpoint:** SC-VAE epoch 442/700 đang chạy (Step 627,800, recon_loss=0.0224). Resume từ epoch 441 với EMA + Depth-to-Normal Loss + Cosine Restart +200 epochs.
+**Trạng thái checkpoint:** SC-VAE epoch 473/700 đang chạy (Step 632,450, recon_loss=0.0217). Inline validation tắt, đánh giá qua `test_sc_vae_recon_v2.py` với TRELLIS.2 Dual Contouring + Poisson mesh.
 
 ---
 
@@ -1821,9 +1821,200 @@ python src/train_imf.py \
 | Upload toàn bộ data lên Drive | 13/05 | ovoxel + context + manifest + checkpoint |
 | Rà soát VoxelMamba vs DiM-3D | 13/05 | Đúng kiến trúc, không cần sửa |
 | Cloud setup script hoàn tất | 13/05 | `cloud_full_setup.sh` |
-| SC-VAE Epoch 500 (dự kiến) | **16/05** | ETA 63 giờ |
-| Khởi động VoxelMamba Stage 2 | **16–17/05** | Sau khi SC-VAE hội tụ |
+| **Fix Dual Contouring mesh extraction** | **15/05** | **3 bug: sai dữ liệu đầu vào + sai activation + xoá mảnh rời** |
+| **Thêm Poisson Surface Reconstruction** | **15/05** | **Mesh kín hoàn toàn, 2.3M faces** |
+| SC-VAE Epoch 473 (hiện tại) | 15/05 | Step 632,450, recon_loss=0.0217 |
+| SC-VAE Epoch 500 (dự kiến) | **17/05** | ETA ~48 giờ |
+| Khởi động VoxelMamba Stage 2 | **17–18/05** | Sau khi SC-VAE hội tụ |
 
 ---
 
-*(Hết báo cáo — Cập nhật: 13/05/2026 — Revision 10: Báo cáo tiến độ toàn diện, rà soát VoxelMamba vs DiM-3D, chuẩn bị Cloud GPU deployment.)*
+## 10. Revision 11 — Phân tích Khả thi: Mesh-Based Rendering Loss (15/05/2026)
+
+### 10.1. Tổng quan Vấn đề
+
+FaceDiff hiện sử dụng **Point Cloud Splatting** (chiếu trực giao, scatter-based) ở Stage-2 Render Loss (Công thức SC-3, SC-4). Phương pháp này có 3 hạn chế:
+1. **Độ phân giải thấp** (64px) — thiếu chi tiết cục bộ
+2. **Không render bề mặt thực** — chỉ "tát" (scatter) điểm lên canvas, không tính occluded points hay face normals
+3. **Không differentiable mesh** — Gradient không truyền ngược qua topology (delta flags, gamma split)
+
+TRELLIS.2 sử dụng **nvdiffrast Mesh Rendering** (GPU-accelerated, differentiable rasterization) ở **1024px** ngay từ đầu training. Mesh được trích xuất bằng Dual Contouring ở **training mode** (differentiable qua gamma) mỗi step.
+
+### 10.2. Kiến trúc Mesh Rendering của TRELLIS.2
+
+Từ phân tích file `trellis2/trainers/vae/shape_vae.py` (dòng 162–216):
+
+```mermaid
+graph TD
+    subgraph ENCODER["Encoder"]
+        V_IN["vertices (GT O-Voxel dv)"] --> ENC["FlexiDualGridVaeEncoder"]
+        I_IN["intersected (GT delta flags)"] --> ENC
+        ENC --> Z["z ~ N(μ, σ²)"]
+    end
+
+    subgraph DECODER["Decoder"]
+        Z --> DEC["FlexiDualGridVaeDecoder"]
+        I_IN --> DEC
+        DEC --> MESH_PRED["Predicted Mesh<br/>(Dual Contouring train mode)"]
+        DEC --> PRED_V["pred_vertice logits"]
+        DEC --> PRED_I["pred_intersected logits"]
+    end
+
+    subgraph RENDER["nvdiffrast Rendering (1024px)"]
+        CAM["Random Camera<br/>radius=[2,100]<br/>FOV=2·arcsin(0.5/r)"] --> RENDER_GT
+        GT_MESH["GT Mesh (từ dataset)"] --> RENDER_GT["render(GT)"]
+        MESH_PRED --> RENDER_PRED["render(Predicted)"]
+        CAM --> RENDER_PRED
+    end
+
+    subgraph LOSS["Losses"]
+        RENDER_GT --> LOSS_MASK["L1(mask)×1"]
+        RENDER_PRED --> LOSS_MASK
+        RENDER_GT --> LOSS_DEPTH["L1(depth)×10"]
+        RENDER_PRED --> LOSS_DEPTH
+        RENDER_GT --> LOSS_NORMAL["L1(normal)×1<br/>+0.2·SSIM<br/>+0.2·LPIPS"]
+        RENDER_PRED --> LOSS_NORMAL
+        PRED_I --> LOSS_INTER["BCE(intersected)×0.1"]
+        I_IN --> LOSS_INTER
+        PRED_V --> LOSS_VERT["MSE(vertices)×0.01"]
+        V_IN --> LOSS_VERT
+    end
+
+    style ENCODER fill:#1a1a2e,stroke:#16213e,color:#e0e0e0
+    style DECODER fill:#0f3460,stroke:#533483,color:#e0e0e0
+    style RENDER fill:#16213e,stroke:#e94560,color:#e0e0e0
+    style LOSS fill:#533483,stroke:#e94560,color:#e0e0e0
+```
+
+**Đặc điểm quan trọng:**
+- GT Mesh đến trực tiếp từ dataset (mesh gốc), **không cần trích xuất lại** từ O-Voxel
+- Decoder sử dụng **teacher-forcing** topology: GT `intersected_flag` đưa vào decoder, chỉ vertex positions + gamma là predicted
+- Mesh rendering loss chiếm ~50% tổng loss: `mask(×1) + depth(×10) + normal(×1 + 0.2·SSIM + 0.2·LPIPS)`
+- Camera ngẫu nhiên mỗi step, perspective projection (không phải orthographic)
+
+### 10.3. So sánh FaceDiff vs TRELLIS.2 Render Loss
+
+| Tiêu chí | FaceDiff (hiện tại) | TRELLIS.2 |
+|---|---|---|
+| **Phương pháp** | Point Splatting (scatter_nd) | nvdiffrast Mesh Rasterization |
+| **Độ phân giải** | 64px | 1024px |
+| **Projection** | Orthographic (6 hướng cố định) | Perspective (camera ngẫu nhiên) |
+| **Render targets** | Mask + Depth + Pseudo-normal | Mask + Depth + True Normal |
+| **Perceptual loss** | LPIPS + SSIM (trên map 64px) | LPIPS + SSIM (trên map 1024px) |
+| **Differentiable mesh** | ❌ Không | ✅ Qua DC train mode |
+| **GPU dependency** | Không cần thêm | nvdiffrast 0.4.0 |
+| **VRAM overhead** | ~200MB | ~1–3GB (tuỳ resolution) |
+| **Bắt đầu từ** | Epoch 50 | Từ đầu |
+
+### 10.4. Khả thi trên RTX 4090 (24GB)
+
+#### ✅ Đã có sẵn
+- **nvdiffrast 0.4.0** — đã cài trong conda env `facediff`
+- **TRELLIS.2 MeshRenderer** — có tại `third_party/TRELLIS.2/trellis2/renderers/mesh_renderer.py`
+- **Dual Contouring train mode** — `flexible_dual_grid_to_mesh(..., train=True)` sinh mesh differentiable
+- **Loss utilities** — `l1_loss`, `ssim`, `lpips` từ TRELLIS.2
+
+#### ⚠️ Thách thức và Giải pháp
+
+| Thách thức | Mức độ | Giải pháp |
+|---|---|---|
+| **GT Mesh không có sẵn** | Nghiêm trọng | FaceDiff chỉ có O-Voxel, không có mesh gốc. → Trích xuất GT mesh từ GT O-Voxel features mỗi step (DC inference mode, ~0.5s) hoặc cache GT mesh ngoài training loop |
+| **VRAM tăng 1–3GB** | Trung bình | Giảm render resolution xuống 256px (thay vì 1024px). Ước tính overhead: ~500MB |
+| **DC chậm (hashmap trên GPU)** | Trung bình | Chỉ chạy DC 1 lần/batch thay vì mỗi micro-batch. Hoặc chạy mỗi N steps |
+| **Gradient qua mesh topology** | Thấp | Dùng teacher-forcing (GT delta flags) giống TRELLIS.2, chỉ dv + gamma là predicted |
+
+#### 📊 Ước tính VRAM Impact
+
+| Thành phần | VRAM hiện tại | VRAM thêm (mesh render) |
+|---|---|---|
+| SC-VAE model | ~136MB | 0 |
+| Forward pass (1 sample) | ~1.9GB | 0 |
+| Point splatting 64px | ~200MB | **Thay thế** |
+| **nvdiffrast raster 256px** | — | **+300MB** |
+| **DC train mode (1 mesh)** | — | **+200MB** |
+| **LPIPS net (Alex)** | ~30MB | 0 (đã có) |
+| **Tổng thêm** | — | **~500MB** |
+
+**Kết luận: HẾT SỨC KHẢ THI.** VRAM hiện tại peak ~5.5GB/24GB, headroom 18GB. Mesh rendering 256px chỉ thêm ~500MB.
+
+### 10.5. Kế hoạch Triển khai Mesh Rendering Loss
+
+#### Giai đoạn A — Chuẩn bị (không ảnh hưởng training)
+
+1. Copy `MeshRenderer` + `Mesh` representation từ TRELLIS.2 vào `src/scvae_train/mesh_render.py`
+2. Viết adapter: O-Voxel features → DC train mode → `Mesh` object
+3. Viết camera randomization (perspective, radius [2, 100])
+4. Test standalone: render GT mesh + predicted mesh → so sánh visual
+
+#### Giai đoạn B — Tích hợp Training Loop
+
+1. Thêm `--mesh-render-loss` flag vào `train_sc_vae.py`
+2. Thay thế `compute_stage2_render_perceptual_loss` bằng mesh rendering
+3. Loss weights (theo TRELLIS.2): `mask×1 + depth×10 + normal×(1 + 0.2·SSIM + 0.2·LPIPS)`
+4. Chỉ chạy mesh render loss mỗi N gradient accumulation steps (tiết kiệm compute)
+
+#### Giai đoạn C — Config đề xuất
+
+```bash
+python -u src/train_sc_vae.py \
+    --dataset both --feature-mode shape_mat --in-channels 10 \
+    --lmdb-only --checkpoint-dir checkpoints/sc_vae_shape \
+    --resume checkpoints/sc_vae_shape/epoch_500.pt \
+    --gradient-accumulation-steps 132 --batch-size 1 \
+    --mesh-render-loss \
+    --mesh-render-resolution 256 \
+    --mesh-render-every-n-steps 4 \
+    --no-torch-compile --lr 5e-6
+```
+
+### 10.6. Bug Fix: Dual Contouring Mesh Extraction (15/05)
+
+#### Bug phát hiện
+
+Từ quan sát của Người dùng: Point Cloud (`recon_raw_autonomous.ply`) trông đẹp nhưng Mesh (`recon_mesh_colored.ply`) bị lỗ hổng nghiêm trọng.
+
+#### 3 lỗi được xác định
+
+**Bug 1 — Sai dữ liệu đầu vào cho DC:**
+```diff
+- verts, faces, colors = extract_ovoxel_mesh(aligned_coords, recon_aligned, ...)
++ verts, faces, colors = extract_ovoxel_mesh(out_indices[:, 1:4], recon, ...)
+```
+Script cũ dùng `aligned_coords` (chỉ chứa điểm giao cắt GT∩Predicted, ~304K) thay vì toàn bộ output (~431K). Mesh thiếu 126K voxel.
+
+**Bug 2 — Sai activation cho dv (dual vertex offset):**
+```diff
+- dv = torch.clamp(feats[:, 0:3], 0.0, 1.0)           # Sai: range [0,1]
++ dv = (1 + 2*0.5) * torch.sigmoid(feats[:, 0:3]) - 0.5  # Đúng: range [-0.5, 1.5]
+```
+TRELLIS.2 `fdg_vae.py` dòng 87,100 dùng `(1+2m)·sigmoid(logits)-m` với `margin=0.5`. Vị trí dual vertex bị sai, mesh méo.
+
+**Bug 3 — Xoá mảnh rời quá mạnh (nghiêm trọng nhất):**
+```diff
+- if mesh.body_count > 1:
+-     components = mesh.split(only_watertight=False)
+-     mesh = max(components, key=lambda c: len(c.faces))  # Giữ CHỈ mảnh lớn nhất
++ components = mesh.split(only_watertight=False)
++ if len(components) > 1:
++     min_faces = max(100, int(total_faces * 0.01))
++     kept = [c for c in components if len(c.faces) >= min_faces]
++     mesh = trimesh.util.concatenate(kept)
+```
+DC tạo ra **30,667 mảnh rời** do delta flags dự đoán chưa chính xác. Code cũ giữ lại **duy nhất 1 mảnh** → mất bề mặt lớn.
+
+#### Giải pháp bổ sung: Poisson Surface Reconstruction
+
+Thêm hàm `extract_poisson_mesh()` sử dụng Open3D Poisson Surface Reconstruction (depth=9) tạo mesh **kín hoàn toàn (watertight)** trực tiếp từ point cloud. Kết quả:
+
+| Phương pháp | Vertices | Faces | Watertight | Ghi chú |
+|---|---:|---:|:---:|---|
+| DC (code cũ, buggy) | ~244K | ~398K | ❌ | Lỗ hổng khắp nơi |
+| DC (sau fix 3 bug) | 390K | 746K | ❌ | Tốt hơn nhiều, vẫn có lỗ nhỏ |
+| **Poisson (mới)** | **1,152K** | **2,301K** | **✅** | **Mesh kín hoàn toàn** |
+
+File output: `recon_poisson_colored.ply` được xuất song song với `recon_mesh_colored.ply` trong test script.
+
+---
+
+*(Hết báo cáo — Cập nhật: 15/05/2026 — Revision 11: Fix Dual Contouring bug, thêm Poisson mesh, phân tích khả thi mesh-based rendering loss.)*
+

@@ -133,7 +133,7 @@ class SCVAEConfig:
     save_every_epochs: int = 10
     save_every_steps: int = 1000       # Tăng từ 200 lên để tránh hiện tượng tắc nghẽn chặn do HDD (HDD blocking stalls)
     resume_from: Optional[str] = None
-    resume_model_only: bool = True     # Bật lên để chạy Robust run từ trọng số Epoch 360 mà không bị kẹt data signature
+    resume_model_only: bool = False    # False = load đầy đủ optimizer+scheduler để tránh KL bùng
     
     # Độ chính xác (Tối ưu cho RTX 4090)
     use_amp: bool = True               # Dùng bfloat16 để đạt tốc độ tự nhiên của chip Ada

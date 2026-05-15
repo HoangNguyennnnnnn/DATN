@@ -145,7 +145,198 @@ def export_colored_mesh_ply(verts: np.ndarray, faces: np.ndarray,
             f.write(f"3 {faces[i,0]} {faces[i,1]} {faces[i,2]}\n")
 
 
-def extract_ovoxel_mesh(coords: torch.Tensor, feats: torch.Tensor, aabb, res: int, 
+def extract_poisson_mesh(world_xyz: np.ndarray, world_rgb: np.ndarray,
+                          poisson_depth: int = 9, density_quantile: float = 0.01,
+                          smooth_iters: int = 3, target_faces: int = 0):
+    """
+    Tạo mesh kín (watertight) từ Point Cloud bằng Poisson Surface Reconstruction.
+    Đây là phương pháp thay thế cho Dual Contouring, phù hợp khi point cloud đẹp
+    nhưng DC bị lỗ do thiếu voxel hàng xóm.
+    
+    Args:
+        world_xyz: [N, 3] tọa độ world-space
+        world_rgb: [N, 3] màu sRGB [0,1]
+        poisson_depth: Độ sâu octree (cao hơn = chi tiết hơn, chậm hơn). 9-10 cho face mesh.
+        density_quantile: Loại bỏ vùng mật độ thấp (nhiễu). 0.01 = bỏ 1% thấp nhất.
+        smooth_iters: Số vòng Taubin smoothing sau khi tạo mesh.
+        target_faces: Nếu > 0, decimation xuống số mặt này.
+    Returns:
+        verts, faces, colors (hoặc None, None, None nếu thất bại)
+    """
+    try:
+        import open3d as o3d
+        import trimesh as _tm
+        
+        # 1. Tạo point cloud với normals ước lượng
+        pcd = o3d.geometry.PointCloud()
+        pcd.points = o3d.utility.Vector3dVector(world_xyz.astype(np.float64))
+        pcd.colors = o3d.utility.Vector3dVector(np.clip(world_rgb, 0, 1).astype(np.float64))
+        
+        # Ước lượng normals (quan trọng cho Poisson)
+        pcd.estimate_normals(
+            search_param=o3d.geometry.KDTreeSearchParamHybrid(radius=0.01, max_nn=30)
+        )
+        # Orient normals nhất quán (hướng ra ngoài)
+        pcd.orient_normals_consistent_tangent_plane(k=15)
+        
+        # 2. Poisson Surface Reconstruction
+        o3d_mesh, densities = o3d.geometry.TriangleMesh.create_from_point_cloud_poisson(
+            pcd, depth=poisson_depth, width=0, scale=1.1, linear_fit=False
+        )
+        
+        # 3. Loại bỏ vùng mật độ thấp (nhiễu bên ngoài bề mặt)
+        densities_np = np.asarray(densities)
+        density_threshold = np.quantile(densities_np, density_quantile)
+        vertices_to_remove = densities_np < density_threshold
+        o3d_mesh.remove_vertices_by_mask(vertices_to_remove)
+        
+        # 4. Chuyển màu từ point cloud sang mesh bằng kNN
+        from scipy.spatial import cKDTree
+        mesh_verts = np.asarray(o3d_mesh.vertices, dtype=np.float64)
+        tree = cKDTree(world_xyz)
+        dist, idx = tree.query(mesh_verts, k=8)
+        weights = 1.0 / np.maximum(dist, 1e-8)
+        weights /= weights.sum(axis=1, keepdims=True)
+        mesh_colors = (world_rgb[idx] * weights[..., None]).sum(axis=1)
+        mesh_colors = np.clip(mesh_colors, 0, 1)
+        o3d_mesh.vertex_colors = o3d.utility.Vector3dVector(mesh_colors)
+        
+        # 5. Smooth
+        if smooth_iters > 0:
+            o3d_mesh = o3d_mesh.filter_smooth_taubin(
+                number_of_iterations=smooth_iters,
+                lambda_filter=0.5, mu=-0.53
+            )
+        
+        # 6. Clean up
+        o3d_mesh.remove_degenerate_triangles()
+        o3d_mesh.remove_unreferenced_vertices()
+        o3d_mesh.remove_non_manifold_edges()
+        
+        verts_np = np.asarray(o3d_mesh.vertices, dtype=np.float32)
+        faces_np = np.asarray(o3d_mesh.triangles, dtype=np.int64)
+        colors_np = np.asarray(o3d_mesh.vertex_colors, dtype=np.float32)
+        
+        # 7. Decimation (nếu cần)
+        if target_faces > 0 and len(faces_np) > target_faces:
+            mesh_tm = _tm.Trimesh(vertices=verts_np, faces=faces_np,
+                                   vertex_colors=(colors_np * 255).astype(np.uint8),
+                                   process=False)
+            mesh_tm = mesh_tm.simplify_quadric_decimation(target_faces)
+            verts_np = np.asarray(mesh_tm.vertices, dtype=np.float32)
+            faces_np = np.asarray(mesh_tm.faces, dtype=np.int64)
+            if mesh_tm.visual and hasattr(mesh_tm.visual, 'vertex_colors'):
+                colors_np = np.asarray(mesh_tm.visual.vertex_colors[:, :3], dtype=np.float32) / 255.0
+            else:
+                # Fallback: re-color via kNN
+                tree2 = cKDTree(world_xyz)
+                d2, i2 = tree2.query(verts_np, k=8)
+                w2 = 1.0 / np.maximum(d2, 1e-8)
+                w2 /= w2.sum(axis=1, keepdims=True)
+                colors_np = np.clip((world_rgb[i2] * w2[..., None]).sum(axis=1), 0, 1).astype(np.float32)
+        
+        print(f"    Poisson: {len(verts_np):,} verts, {len(faces_np):,} faces (depth={poisson_depth})")
+        return verts_np, faces_np, colors_np
+        
+    except Exception as e:
+        print(f"[WARN] Poisson mesh extraction failed: {e}")
+        import traceback; traceback.print_exc()
+        return None, None, None
+
+
+def _prefill_boundary_voxels(coords, dv, flag, split_weight, grid_size):
+    """
+    Pre-fill missing boundary voxels so Dual Contouring can form complete quads.
+
+    DC requires all 4 neighbor voxels for each edge quad. Boundary voxels in sparse
+    grids often miss neighbors, causing dropped quads → holes. This adds synthetic
+    voxels at missing neighbor positions with default values (cell center, no edges).
+    """
+    device = coords.device
+    N = coords.shape[0]
+
+    # Edge neighbor offsets — same as flexible_dual_grid.py
+    edge_offsets = torch.tensor([
+        [[0, 0, 0], [0, 0, 1], [0, 1, 1], [0, 1, 0]],  # x-axis
+        [[0, 0, 0], [1, 0, 0], [1, 0, 1], [0, 0, 1]],  # y-axis
+        [[0, 0, 0], [0, 1, 0], [1, 1, 0], [1, 0, 0]],  # z-axis
+    ], dtype=coords.dtype, device=device)  # [3, 4, 3]
+
+    # Vectorized: compute all neighbor coords for intersected edges
+    # edge_neighbors[i, axis, corner] = coords[i] + offset[axis, corner]
+    edge_neighbors = coords.reshape(N, 1, 1, 3) + edge_offsets.unsqueeze(0)  # [N, 3, 4, 3]
+
+    # Select only edges where flag is True: flag is [N, 3] bool
+    # Expand flag to [N, 3, 4] and gather neighbor coords
+    needed_all = edge_neighbors[flag]  # [M, 4, 3] where M = number of active edges
+    if needed_all.numel() == 0:
+        return coords, dv, flag, split_weight
+
+    needed_flat = needed_all.reshape(-1, 3).long()  # [M*4, 3]
+
+    # Filter out-of-bounds
+    gs = int(grid_size)
+    in_bounds = (
+        (needed_flat[:, 0] >= 0) & (needed_flat[:, 0] < gs) &
+        (needed_flat[:, 1] >= 0) & (needed_flat[:, 1] < gs) &
+        (needed_flat[:, 2] >= 0) & (needed_flat[:, 2] < gs)
+    )
+    needed_flat = needed_flat[in_bounds]
+
+    # Deduplicate
+    needed_keys = needed_flat[:, 0] * (gs * gs) + needed_flat[:, 1] * gs + needed_flat[:, 2]
+    needed_keys_unique = torch.unique(needed_keys)
+
+    # Build existing coord keys
+    cx, cy, cz = coords[:, 0].long(), coords[:, 1].long(), coords[:, 2].long()
+    existing_keys = cx * (gs * gs) + cy * gs + cz
+
+    # Find missing: needed but not existing
+    # Use broadcasting comparison for GPU-friendly set difference
+    # For large tensors, use a hash set approach via sorting
+    all_keys = torch.cat([existing_keys, needed_keys_unique])
+    all_keys_sorted, sort_idx = torch.sort(all_keys)
+    # Mark duplicates (keys that appear in both existing and needed)
+    is_dup = torch.zeros(all_keys.shape[0], dtype=torch.bool, device=device)
+    is_dup[1:] = all_keys_sorted[1:] == all_keys_sorted[:-1]
+    # Also mark the first occurrence of duplicates
+    is_dup[:-1] |= all_keys_sorted[:-1] == all_keys_sorted[1:]
+    # Unsort
+    is_dup_unsorted = torch.zeros_like(is_dup)
+    is_dup_unsorted[sort_idx] = is_dup
+    # Missing = needed keys that are NOT duplicates (not in existing)
+    n_existing = existing_keys.shape[0]
+    missing_mask = ~is_dup_unsorted[n_existing:]
+    missing_keys = needed_keys_unique[missing_mask]
+
+    if missing_keys.numel() == 0:
+        return coords, dv, flag, split_weight
+
+    # Decode keys back to coords
+    new_x = missing_keys // (gs * gs)
+    new_y = (missing_keys % (gs * gs)) // gs
+    new_z = missing_keys % gs
+    new_coords = torch.stack([new_x, new_y, new_z], dim=1).to(coords.dtype)
+
+    n_new = new_coords.shape[0]
+    new_dv = torch.full((n_new, 3), 0.5, dtype=dv.dtype, device=device)
+    new_flag = torch.zeros(n_new, 3, dtype=flag.dtype, device=device)
+
+    coords_aug = torch.cat([coords, new_coords], dim=0)
+    dv_aug = torch.cat([dv, new_dv], dim=0)
+    flag_aug = torch.cat([flag, new_flag], dim=0)
+
+    if split_weight is not None:
+        new_sw = torch.ones(n_new, 1, dtype=split_weight.dtype, device=device)
+        split_weight_aug = torch.cat([split_weight, new_sw], dim=0)
+    else:
+        split_weight_aug = None
+
+    print(f"    Boundary pre-fill: added {n_new} synthetic voxels ({N} → {N + n_new})")
+    return coords_aug, dv_aug, flag_aug, split_weight_aug
+
+
+def extract_ovoxel_mesh(coords: torch.Tensor, feats: torch.Tensor, aabb, res: int,
                          is_logits: bool = False, threshold: float = 0.5, 
                          target_faces: int = 0, smooth_iters: int = 6, color_knn: int = 8):
     """
@@ -168,27 +359,39 @@ def extract_ovoxel_mesh(coords: torch.Tensor, feats: torch.Tensor, aabb, res: in
         aabb = aabb.clone().detach().to(dtype=torch.float32, device=device)
 
     # O-Voxel structure: [0:3]=dv, [3:6]=delta, [6:7]=gamma, [7:10]=rgb
+    # Following TRELLIS.2 fdg_vae.py protocol EXACTLY:
+    #   dv = (1 + 2*margin) * sigmoid(logits) - margin   (margin=0.5 → range [-0.5, 1.5])
+    #   flag = logits > 0                                 (threshold on raw logits, NOT sigmoid)
+    #   split_weight = softplus(gamma)                    (raw, no normalization)
+    VOXEL_MARGIN = 0.5
     if is_logits:
-        dv = torch.clamp(feats[:, 0:3], 0.0, 1.0)
-        delta = torch.sigmoid(feats[:, 3:6])
+        dv = (1 + 2 * VOXEL_MARGIN) * torch.sigmoid(feats[:, 0:3]) - VOXEL_MARGIN
+        # Delta flag: threshold on RAW LOGITS (>0 ↔ sigmoid > 0.5), matching fdg_vae.py line 101
+        flag = (feats[:, 3:6] > 0).bool()
         gamma = torch.nn.functional.softplus(feats[:, 6:7])
         rgb_linear_vox = torch.clamp(feats[:, 7:10], 0.0, 1.0)
     else:
         dv = feats[:, 0:3]
-        delta = feats[:, 3:6]
+        flag = feats[:, 3:6].bool()
         gamma = feats[:, 6:7]
         rgb_linear_vox = feats[:, 7:10]
 
-    flag = (delta > threshold).bool() 
-    
-    split_weight = None
-    if gamma.numel() > 0 and torch.isfinite(gamma).all():
-        g_min, g_max = gamma.min(), gamma.max()
-        if (g_max - g_min) > 1e-6:
-            split_weight = (gamma - g_min) / (g_max - g_min + 1e-6)
+    # split_weight: pass softplus(gamma) directly, NO min-max normalization
+    # (TRELLIS.2 fdg_vae.py line 89,102 passes raw softplus output)
+    split_weight = gamma if (gamma.numel() > 0 and torch.isfinite(gamma).all()) else None
+
+    # Pre-fill missing boundary voxels to prevent DC holes
+    n_orig = coords.shape[0]
+    coords, dv, flag, split_weight = _prefill_boundary_voxels(
+        coords, dv, flag, split_weight, grid_size=int(res)
+    )
+    if coords.shape[0] > n_orig:
+        n_synthetic = coords.shape[0] - n_orig
+        rgb_pad = torch.full((n_synthetic, 3), 0.5, dtype=rgb_linear_vox.dtype, device=device)
+        rgb_linear_vox = torch.cat([rgb_linear_vox, rgb_pad], dim=0)
 
     try:
-        # 1. Dual Contouring Extraction
+        # 1. Dual Contouring Extraction (TRELLIS.2 protocol)
         verts, faces = flexible_dual_grid_to_mesh(
             coords, dv, flag, split_weight=split_weight, aabb=aabb, grid_size=int(res), train=False
         )
@@ -197,8 +400,6 @@ def extract_ovoxel_mesh(coords: torch.Tensor, feats: torch.Tensor, aabb, res: in
         faces_np = faces.cpu().numpy()
         
         # 2. Geometry Post-processing (trimesh repair + Open3D smoothing)
-        #    Follows TRELLIS.2 postprocess.py pipeline:
-        #    fill_holes → cleanup → simplify → repair → unify orientations → smooth
         try:
             import trimesh as _tm
 
@@ -223,10 +424,22 @@ def extract_ovoxel_mesh(coords: torch.Tensor, feats: torch.Tensor, aabb, res: in
                 mesh.update_faces(mask_uniq)
             mesh.remove_unreferenced_vertices()
 
-            # Step 4: Remove small disconnected components (noise)
-            if mesh.body_count > 1:
+            # Step 4: Remove only TINY disconnected components (noise)
+            # BUG FIX: Trước đây giữ CHỈ mảnh lớn nhất → xoá mất nhiều bề mặt hợp lệ.
+            # Giờ chỉ xoá mảnh < 1% tổng số faces (nhiễu thực sự).
+            try:
                 components = mesh.split(only_watertight=False)
-                mesh = max(components, key=lambda c: len(c.faces))
+                if len(components) > 1:
+                    total_faces = sum(len(c.faces) for c in components)
+                    min_faces = max(100, int(total_faces * 0.01))  # 1% threshold
+                    kept = [c for c in components if len(c.faces) >= min_faces]
+                    if kept:
+                        mesh = _tm.util.concatenate(kept)
+                        n_removed = len(components) - len(kept)
+                        if n_removed > 0:
+                            print(f"    Removed {n_removed} tiny components (< {min_faces} faces)")
+            except Exception:
+                pass  # body_count can be slow/fail on large meshes
 
             # Step 5: Decimation (if target specified)
             if target_faces > 0 and len(mesh.faces) > target_faces:
@@ -481,7 +694,8 @@ def test_one_sample(
     # Export RAW autonomous geometry (including False Positives/Negatives)
     raw_coords_f = out_indices[:, 1:4].float().to(device)
     raw_recon_all = recon.detach()
-    raw_dv = torch.clamp(raw_recon_all[:, 0:3], 0.0, 1.0)
+    VOXEL_MARGIN = 0.5
+    raw_dv = (1 + 2 * VOXEL_MARGIN) * torch.sigmoid(raw_recon_all[:, 0:3]) - VOXEL_MARGIN
     raw_world = ((raw_coords_f + raw_dv) * voxel_size + aabb_t[0]).cpu().numpy()
     raw_rgb = np.clip(raw_recon_all[:, 7:10].cpu().numpy(), 0.0, 1.0)
     export_colored_ply(raw_world, raw_rgb, os.path.join(sample_dir, "recon_raw_autonomous.ply"))
@@ -535,7 +749,7 @@ def test_one_sample(
             pass
 
     verts, faces, colors = extract_ovoxel_mesh(
-        aligned_coords, recon_aligned, aabb, resolution, 
+        out_indices[:, 1:4], recon, aabb, resolution, 
         is_logits=True, threshold=mesh_level,
         target_faces=target_faces, 
         smooth_iters=smooth_iters, 
@@ -546,7 +760,17 @@ def test_one_sample(
         export_colored_mesh_ply(verts, faces, colors, mesh_path)
         print(f"  Exported: recon_mesh_colored.ply ({len(verts):,} verts, {len(faces):,} faces)")
     else:
-        print("  [WARN] Mesh extraction failed")
+        print("  [WARN] DC Mesh extraction failed")
+    
+    # Poisson Surface Reconstruction — watertight mesh từ point cloud
+    poisson_verts, poisson_faces, poisson_colors = extract_poisson_mesh(
+        raw_world, raw_rgb, poisson_depth=9, density_quantile=0.01,
+        smooth_iters=3, target_faces=target_faces
+    )
+    if poisson_verts is not None:
+        poisson_path = os.path.join(sample_dir, "recon_poisson_colored.ply")
+        export_colored_mesh_ply(poisson_verts, poisson_faces, poisson_colors, poisson_path)
+        print(f"  Exported: recon_poisson_colored.ply ({len(poisson_verts):,} verts, {len(poisson_faces):,} faces)")
 
     # Export GT mesh (intersection-aligned, for paired comparison)
     gt_verts, gt_faces, gt_colors = extract_ovoxel_mesh(
@@ -566,6 +790,41 @@ def test_one_sample(
         export_colored_mesh_ply(full_gt_verts, full_gt_faces, full_gt_colors, full_gt_mesh_path)
         print(f"  Exported: full_gt_mesh_colored.ply ({len(full_gt_verts):,} verts, {len(full_gt_faces):,} faces)")
 
+    # ---- TRELLIS.2 Metrics (Section D.1.1) ----
+    from src.scvae_train.metrics import (
+        compute_f_score,
+        compute_mesh_distance,
+        compute_normal_psnr_lpips,
+    )
+
+    # F-score (point cloud level, τ=1e-6 per TRELLIS.2)
+    recon_xyz_t = torch.from_numpy(recon_world).float()
+    target_xyz_t = torch.from_numpy(full_gt_world).float()
+    fscore_dict = compute_f_score(recon_xyz_t, target_xyz_t, tau=1e-6)
+    mse_dict["f_score"] = fscore_dict["f_score"]
+    mse_dict["f_precision"] = fscore_dict["precision"]
+    mse_dict["f_recall"] = fscore_dict["recall"]
+    print(f"  F-score: {fscore_dict['f_score']:.4f} (prec={fscore_dict['precision']:.4f}, rec={fscore_dict['recall']:.4f})")
+
+    # Mesh Distance + Normal PSNR/LPIPS (requires extracted meshes)
+    if verts is not None and full_gt_verts is not None:
+        # Mesh Distance (bidirectional point-to-mesh)
+        md = compute_mesh_distance(verts, faces, full_gt_verts, full_gt_faces, n_samples=100_000)
+        mse_dict["mesh_distance"] = md
+        print(f"  Mesh Distance: {md:.8f}")
+
+        # Normal PSNR + LPIPS (4 views, TRELLIS.2 protocol)
+        try:
+            npl = compute_normal_psnr_lpips(
+                verts, faces, full_gt_verts, full_gt_faces,
+                image_size=512, device=str(device),
+            )
+            mse_dict["normal_psnr"] = npl["normal_psnr"]
+            mse_dict["normal_lpips"] = npl["normal_lpips"]
+            print(f"  Normal PSNR: {npl['normal_psnr']:.2f} dB | Normal LPIPS: {npl['normal_lpips']:.4f}")
+        except Exception as e:
+            print(f"  [WARN] Normal PSNR/LPIPS computation failed: {e}")
+
     # Save comparison figure
     # Use FULL GT (all voxels) for the comparison figure instead of intersection-only
     save_comparison_figure(
@@ -581,7 +840,10 @@ def test_one_sample(
         f.write(f"n_target: {n_target}\n")
         f.write(f"n_recon: {n_recon}\n")
         for k, v in mse_dict.items():
-            f.write(f"{k}: {v:.6f}\n")
+            if isinstance(v, float):
+                f.write(f"{k}: {v:.6f}\n")
+            else:
+                f.write(f"{k}: {v}\n")
 
     return mse_dict
 
@@ -658,9 +920,16 @@ def main():
     print(f"\n{'='*60}")
     print(f"  SUMMARY ({n} samples)")
     print(f"{'='*60}")
-    for key in ["mse_all", "mse_xyz (v)", "mse_rgb (color)"]:
-        vals = [m[key] for m in all_metrics]
-        print(f"  {key}: mean={np.mean(vals):.6f}, std={np.std(vals):.6f}")
+    summary_keys = [
+        "mse_all", "mse_xyz (v)", "mse_rgb (color)",
+        "f_score", "f_precision", "f_recall",
+        "mesh_distance", "normal_psnr", "normal_lpips",
+        "topo_recall", "topo_precision",
+    ]
+    for key in summary_keys:
+        vals = [m[key] for m in all_metrics if key in m and isinstance(m[key], (int, float))]
+        if vals:
+            print(f"  {key}: mean={np.mean(vals):.6f}, std={np.std(vals):.6f}")
     print(f"\nResults saved to: {args.output_dir}/")
 
 

@@ -621,6 +621,7 @@ def train_sc_vae(
         kl_weight=vae_cfg.kl_weight,
         use_bce_for_geom=vae_cfg.use_bce_for_geom,
         rho_loss_weight=vae_cfg.rho_loss_weight,
+        rho_pos_weight=float(getattr(vae_cfg, "rho_pos_weight", 1.0)),
     )
     
     param_count = sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -1372,6 +1373,9 @@ def train_sc_vae(
                 val_cd_sum = 0.0
                 val_iou_sum = 0.0
                 val_nc_sum = 0.0
+                val_delta_tp = 0.0
+                val_delta_fp = 0.0
+                val_delta_fn = 0.0
                 val_batches = 0
                 val_oom_skips = 0
                 val_stage2_skips = 0
@@ -1462,7 +1466,15 @@ def train_sc_vae(
                                     # Tính nhất quán của Pháp tuyến (Normal Consistency)
                                     if val_target_aligned.shape[1] >= 6:
                                         val_nc_sum += compute_normal_consistency(val_recon_aligned[:, 3:6], val_target_aligned[:, 3:6])
-                                    
+
+                                    # Delta flag accuracy (intersection flags, ch 3:6)
+                                    if val_recon_aligned.shape[1] >= 6 and val_target_aligned.shape[1] >= 6:
+                                        _dp = (val_recon_aligned[:, 3:6] > 0.0).float()
+                                        _dt = (val_target_aligned[:, 3:6] > 0.5).float()
+                                        val_delta_tp += (_dp * _dt).sum().item()
+                                        val_delta_fp += (_dp * (1.0 - _dt)).sum().item()
+                                        val_delta_fn += ((1.0 - _dp) * _dt).sum().item()
+
                                     # Voxel IoU (nếu có đầu ra rho)
                                     if len(val_rho_logits) > 0 and len(val_rho_targets) > 0:
                                         # Sử dụng cấp độ chi tiết nhất (thường là cấp độ cuối cùng trong danh sách)
@@ -1538,9 +1550,13 @@ def train_sc_vae(
                     avg_cd = val_cd_sum / min(val_batches, 4)
                     avg_nc = val_nc_sum / val_batches
                     avg_iou = val_iou_sum / val_batches
+                    _d_prec = val_delta_tp / (val_delta_tp + val_delta_fp + 1e-8)
+                    _d_rec = val_delta_tp / (val_delta_tp + val_delta_fn + 1e-8)
+                    _d_f1 = 2.0 * _d_prec * _d_rec / (_d_prec + _d_rec + 1e-8)
                     print(
                         f"  Val {epoch+1}/{vae_cfg.num_epochs} | Loss: {val_avg_loss:.4f} | "
                         f"CD: {avg_cd:.6f} | NC: {avg_nc:.4f} | IoU: {avg_iou:.4f} | "
+                        f"Delta: P={_d_prec:.3f} R={_d_rec:.3f} F1={_d_f1:.3f} | "
                         f"OOM_skips: {val_oom_skips} | stage2_skips: {val_stage2_skips}"
                     )
 
@@ -1699,6 +1715,7 @@ def main():
     parser.add_argument("--stage2-render-image-size", type=int, default=None, help="Projection map size for stage-2 render loss")
     parser.add_argument("--rho-loss-weight", type=float, default=None, help="Weight for early-pruning rho BCE supervision")
     parser.add_argument("--rho-warmup-epochs", type=int, default=None, help="Warmup epochs for rho loss scale")
+    parser.add_argument("--rho-pos-weight", type=float, default=None, help="pos_weight for rho BCE (>1 penalizes FN more to improve recall)")
     parser.add_argument("--num-workers", type=int, default=None, help="Override DataLoader num_workers")
     parser.add_argument("--prefetch-factor", type=int, default=None, help="Override DataLoader prefetch_factor")
     parser.add_argument("--dataloader-timeout", type=int, default=None, help="DataLoader worker timeout in seconds (0 disables)")
@@ -1801,6 +1818,8 @@ def main():
         cfg.sc_vae.rho_loss_weight = max(0.0, float(args.rho_loss_weight))
     if args.rho_warmup_epochs is not None:
         cfg.sc_vae.rho_warmup_epochs = max(0, int(args.rho_warmup_epochs))
+    if args.rho_pos_weight is not None:
+        cfg.sc_vae.rho_pos_weight = max(0.1, float(args.rho_pos_weight))
     if args.num_workers is not None:
         cfg.data.num_workers = max(0, int(args.num_workers))
     if args.prefetch_factor is not None:
