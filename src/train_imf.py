@@ -119,7 +119,8 @@ class SlatDataset(Dataset):
     Bộ đệm (Caching): Slat tokens được lưu đệm vào các tệp .pt để tăng tốc độ.
     """
     CACHE_SCHEMA_VERSION = 3
-    
+    _lmdb_env_cache: dict[str, object] = {}  # class-level: share envs across instances
+
     def __init__(self, data_root: str, sc_vae: SC_VAE,
                  dataset_name: str,
                  mesh_renderer=None, arcface=None, flame=None, dinov2=None,
@@ -145,7 +146,8 @@ class SlatDataset(Dataset):
                  ovoxel_lmdb_dir: str | None = None,
                  ovoxel_lmdb_in_channels: int = 10,
                  ovoxel_lmdb_feature_mode: str = "shape_mat",
-                 ovoxel_lmdb_max_voxels: int = 350000):
+                 ovoxel_lmdb_max_voxels: int = 350000,
+                 slat_lmdb_dir: str | None = None):
         self.data_root = data_root
         self.sc_vae = sc_vae
         self.dataset_name = str(dataset_name)
@@ -183,14 +185,19 @@ class SlatDataset(Dataset):
 
         if self.context_lmdb_dir and os.path.isdir(self.context_lmdb_dir):
             import lmdb
-            self.context_lmdb_env = lmdb.open(
-                self.context_lmdb_dir,
-                readonly=True,
-                lock=False,
-                readahead=True,
-                meminit=False,
-                max_readers=512,
-            )
+            abs_dir = os.path.abspath(self.context_lmdb_dir)
+            if abs_dir in SlatDataset._lmdb_env_cache:
+                self.context_lmdb_env = SlatDataset._lmdb_env_cache[abs_dir]
+            else:
+                self.context_lmdb_env = lmdb.open(
+                    self.context_lmdb_dir,
+                    readonly=True,
+                    lock=False,
+                    readahead=True,
+                    meminit=False,
+                    max_readers=512,
+                )
+                SlatDataset._lmdb_env_cache[abs_dir] = self.context_lmdb_env
             self.context_lmdb_txn = self.context_lmdb_env.begin(write=False)
             print(f"[SlatDataset] Connected to Hybrid Context LMDB: {self.context_lmdb_dir}")
 
@@ -204,16 +211,44 @@ class SlatDataset(Dataset):
 
         if self.ovoxel_lmdb_dir and os.path.isdir(self.ovoxel_lmdb_dir):
             import lmdb
-            self.ovoxel_lmdb_env = lmdb.open(
-                self.ovoxel_lmdb_dir,
-                readonly=True,
-                lock=False,
-                readahead=True,
-                meminit=False,
-                max_readers=512,
-            )
+            abs_dir = os.path.abspath(self.ovoxel_lmdb_dir)
+            if abs_dir in SlatDataset._lmdb_env_cache:
+                self.ovoxel_lmdb_env = SlatDataset._lmdb_env_cache[abs_dir]
+            else:
+                self.ovoxel_lmdb_env = lmdb.open(
+                    self.ovoxel_lmdb_dir,
+                    readonly=True,
+                    lock=False,
+                    readahead=True,
+                    meminit=False,
+                    max_readers=512,
+                )
+                SlatDataset._lmdb_env_cache[abs_dir] = self.ovoxel_lmdb_env
             self.ovoxel_lmdb_txn = self.ovoxel_lmdb_env.begin(write=False)
             print(f"[SlatDataset] Connected to O-Voxel LMDB: {self.ovoxel_lmdb_dir}")
+
+        # LMDB cho merged slat+context (pack_slat_lmdb.py output)
+        self.slat_lmdb_dir = slat_lmdb_dir
+        self.slat_lmdb_env = None
+        self.slat_lmdb_txn = None
+
+        if self.slat_lmdb_dir and os.path.isdir(self.slat_lmdb_dir):
+            import lmdb as _lmdb
+            abs_dir = os.path.abspath(self.slat_lmdb_dir)
+            if abs_dir in SlatDataset._lmdb_env_cache:
+                self.slat_lmdb_env = SlatDataset._lmdb_env_cache[abs_dir]
+            else:
+                self.slat_lmdb_env = _lmdb.open(
+                    self.slat_lmdb_dir,
+                    readonly=True,
+                    lock=False,
+                    readahead=True,
+                    meminit=False,
+                    max_readers=512,
+                )
+                SlatDataset._lmdb_env_cache[abs_dir] = self.slat_lmdb_env
+            self.slat_lmdb_txn = self.slat_lmdb_env.begin(write=False)
+            print(f"[SlatDataset] Connected to Slat+Context LMDB: {self.slat_lmdb_dir}")
 
         needs_encoder = (self.sc_vae is not None or
                          (self.dual_branch and (self.shape_sc_vae is not None or self.material_sc_vae is not None)))
@@ -362,14 +397,23 @@ class SlatDataset(Dataset):
     @torch.no_grad()
     def __getitem__(self, idx: int):
         obj_path = self.samples[idx]
-        
+
         # Tạo tên bộ đệm chống trùng lặp (vd: id125_1_neutral.pt)
         rel_path = os.path.relpath(obj_path, self.data_root)
         suffix = '.dual.pt' if self.dual_branch else '.pt'
         base_name = rel_path.replace(os.path.sep, '_').replace('.obj', '')
         safe_name = f"{base_name}.{self.cache_tag}{suffix}"
         cache_path = os.path.join(self.cache_dir, safe_name)
-        
+
+        # Priority 0: Merged slat+context LMDB (fastest path)
+        if self.slat_lmdb_txn is not None:
+            lmdb_key = f"{self.dataset_name}/{safe_name}".encode("utf-8")
+            data = self.slat_lmdb_txn.get(lmdb_key)
+            if data is not None:
+                import io
+                payload = torch.load(io.BytesIO(data), map_location="cpu", weights_only=False)
+                return payload["slat"], payload["context"]
+
         # Thử tải bộ đệm (Tự chữa lành nếu file bị rỗng do Ctrl+C)
         if os.path.exists(cache_path):
             try:
@@ -837,6 +881,7 @@ def train_imf(
     disable_id_filters: bool = False,
     context_lmdb_dir: str | None = None,
     ovoxel_lmdb_dir: str | None = None,
+    slat_lmdb_dir: str | None = None,
     manifest_path: str | None = None,
 ):
     """Vòng lặp huấn luyện chính (Main training loop) cho iMF U-Net."""
@@ -1004,6 +1049,7 @@ def train_imf(
             allow_mesh_proxy_fallback=bool(getattr(imf_cfg, "allow_mesh_proxy_fallback", False)),
             context_lmdb_dir=context_lmdb_dir,
             ovoxel_lmdb_dir=ovoxel_lmdb_dir,
+            slat_lmdb_dir=slat_lmdb_dir,
             manifest_list=manifest_data.get("faceverse") if manifest_data else None,
         )
         if len(fv_dataset) > 0:
@@ -1041,6 +1087,7 @@ def train_imf(
             allow_mesh_proxy_fallback=bool(getattr(imf_cfg, "allow_mesh_proxy_fallback", False)),
             context_lmdb_dir=context_lmdb_dir,
             ovoxel_lmdb_dir=ovoxel_lmdb_dir,
+            slat_lmdb_dir=slat_lmdb_dir,
             manifest_list=manifest_data.get("facescape") if manifest_data else None,
         )
         if len(fs_dataset) > 0:
@@ -1461,6 +1508,7 @@ def main():
     parser.add_argument("--disable-id-filters", action="store_true", help="Disable train/test identity file filtering for custom datasets")
     parser.add_argument("--context-lmdb", type=str, default=None, help="Path to hybrid_context.lmdb for offline context loading")
     parser.add_argument("--ovoxel-lmdb", type=str, default=None, help="Path to ovoxel_cache_lmdb for reading O-Voxel data without mesh files")
+    parser.add_argument("--slat-lmdb", type=str, default=None, help="Path to slat_context.lmdb (merged slat+context, fastest loading)")
     parser.add_argument("--manifest", type=str, default=None, help="Path to mesh_manifest.json to avoid scanning .obj files")
     args = parser.parse_args()
     
@@ -1550,6 +1598,7 @@ def main():
         disable_id_filters=bool(args.disable_id_filters),
         context_lmdb_dir=args.context_lmdb,
         ovoxel_lmdb_dir=args.ovoxel_lmdb,
+        slat_lmdb_dir=args.slat_lmdb,
         manifest_path=args.manifest,
     )
 

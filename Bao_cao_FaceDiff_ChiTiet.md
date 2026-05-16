@@ -1,10 +1,10 @@
 # Báo cáo Nghiên cứu Chuyên sâu: FaceDiff — Hệ thống Tạo sinh Khuôn mặt 3D Một Bước trên Đơn GPU
 
-**Ngày cập nhật:** 15/05/2026 (revision 12 — RGB render loss fix, xác minh DC algorithm, phân tích mesh hole root cause)  
+**Ngày cập nhật:** 16/05/2026 (revision 14 — SC-VAE epoch 500 hoàn thành, slat cache precompute + LMDB pipeline, cleanup scripts)  
 **Tác giả:** Nhóm nghiên cứu FaceDiff  
 **Cấu hình Mục tiêu:** Đơn GPU RTX 4090 (24GB VRAM)  
 **Bộ dữ liệu:** FaceVerse_3D & FaceScape  
-**Trạng thái checkpoint:** SC-VAE epoch 393/700 đang chạy (Step 620,700, recon_loss=0.0266, Loss=0.1081). RGB render loss fix đã áp dụng. Thuật toán DC đã xác minh đúng 100% trên GT data.
+**Trạng thái checkpoint:** SC-VAE epoch 500 **hoàn thành** (recon=0.0213, KL=14.58, near-plateau). Slat cache precompute đang chạy (→ LMDB cho iMF). mamba-ssm 2.3.1 sẵn sàng. Tiếp theo: pack slat LMDB → train iMF VoxelMamba.
 
 ---
 
@@ -1034,17 +1034,19 @@ Số liệu thực tế đọc trực tiếp từ `data_signature` được hash
 | LMDB Sequential I/O | 30× throughput | HDD: $5 \to 150$ MB/s |
 | Gradient Accumulation | Effective batch 132 | 33 micro-batches |
 
-### 6.3. Kết quả SC-VAE (tính đến 10/05/2026, log gốc `logs/train_sc_vae_gamma_fixed.log`)
+### 6.3. Kết quả SC-VAE (tính đến 16/05/2026)
 
-| Epoch | Total Loss | Recon Loss | KL Loss (legacy norm) | Rho Loss | LR |
-|-------|-----------|------------|------------------------|----------|-----|
-| 200 | 0.0724 | 0.0546 | 0.8321 | — | $2.5 \times 10^{-5}$ |
-| 350 | 0.0547 | 0.0271 | 0.7826 | 0.057 | $1.00 \times 10^{-5}$ |
-| 384 | 0.0397 | 0.0271 | 0.7999 | 0.057 | $9.96 \times 10^{-6}$ |
-| 385 | 0.0397 | 0.0271 | 0.8011 | 0.0565 | $9.96 \times 10^{-6}$ |
-| **397** | **0.0365** | **0.0251** | **0.8321** | **0.0513** | $9.89 \times 10^{-6}$ |
-| 388 (`latest_step.pt`) | 0.0379 | — | — | — | $9.94 \times 10^{-6}$ |
-| 390 (`epoch_390.pt`) | 0.0381 | — | — | — | $9.94 \times 10^{-6}$ |
+| Epoch | Total Loss | Recon Loss | KL Loss | Rho Loss | LR | Ghi chú |
+|-------|-----------|------------|---------|----------|-----|---------|
+| 200 | 0.0724 | 0.0546 | 0.83 | — | $2.5 \times 10^{-5}$ | |
+| 350 | 0.0547 | 0.0271 | 0.78 | 0.057 | $1.00 \times 10^{-5}$ | |
+| 397 | 0.0365 | 0.0251 | 0.83 | 0.051 | $9.89 \times 10^{-6}$ | Best trước EMA |
+| 470 | 0.0880 | 0.0220 | 14.71 | 0.039 | $8.89 \times 10^{-6}$ | Resume sau fix RGB+EMA |
+| 480 | 0.0870 | 0.0217 | 14.67 | 0.039 | $8.70 \times 10^{-6}$ | |
+| 490 | 0.0863 | 0.0214 | 14.63 | 0.038 | $8.48 \times 10^{-6}$ | |
+| **500** | **0.0858** | **0.0213** | **14.58** | **0.038** | $8.26 \times 10^{-6}$ | **Near-plateau, final** |
+
+> **Ghi chú KL:** Từ epoch 390 trở đi, KL chuyển sang chuẩn hóa `/mu.numel()` (đúng spec TRELLIS.2), nên giá trị ~14.6 (thay vì ~0.83). KL contribution vào total loss vẫn rất nhỏ ($10^{-6} \times 14.6 \approx 1.5 \times 10^{-5}$). Recon loss gần hội tụ: $\Delta \approx 0.0002$/10 epoch từ e480→e500.
 
 > **Đính chính so với revision 1:** revision trước báo cáo Total=0.0480 và LR=$2.0\times 10^{-6}$ ở epoch 397. Hai số đều sai. Total Loss thực tế tại epoch 397 = **0.0365** (`logs/train_sc_vae_gamma_fixed.log` dòng `Epoch 397/500 | Loss: 0.0365`). LR thực tế = **9.89×10⁻⁶** (cosine từ base_lr=1e-5 chỉ giảm rất chậm vì $r_{\min} = 0.1$). VRAM peak quan sát thực tế = **16,961 MB** (không phải <22 GB như mục tiêu, có dư địa cho mở rộng kiến trúc). Bảng ở trên dùng "KL Loss (legacy norm)" để chỉ giá trị ghi log với normalisation cũ (chia cho `target_x.shape[0]`). Sau khi revision này chuyển sang chia `mu.numel()` (đúng spec), giá trị KL log mới sẽ là `legacy / 32 ≈ 0.026` — chỉ là thay đổi báo cáo, contribution vào tổng loss (~$10^{-6} \cdot 0.83 = 8\times 10^{-7}$) vẫn không đổi đáng kể.
 
@@ -1147,11 +1149,37 @@ Số liệu thực tế đọc trực tiếp từ `data_signature` được hash
 | Loss weights — Normal | $\lambda_{\text{normal}} = 1$ (TRELLIS.2 có) | $\lambda_{\text{normal}} = 1$ — **✅ 14/05** depth-to-normal via finite differences trên depth maps |
 | Optimizer | AdamW lr=1e-4, EMA 0.9999, AdaptiveGradClipper | AdamW lr=1e-5 (resume), **EMA 0.9999 ✅ 14/05**, AdaptiveGradClipper ✅ |
 
-**Khác biệt cốt lõi còn lại sau revision 3 (14/05/2026):**
-1. **Render loss**: TRELLIS.2 render actual mesh qua `nvdiffrast` differentiable rasterizer → depth/normals/PBR shading chính xác. FaceDiff project point features lên 2D maps → xấp xỉ. `nvdiffrast` 0.4.0 đã cài; tích hợp mesh rasterization thay thế point projection sẽ thực hiện ở lượt train tiếp theo.
-2. **Encoder/Decoder downsample**: TRELLIS.2 dùng `SparseSpatial2Channel/Channel2Spatial` zero-param (chỉ reshape & permute features), không tốn FLOPs. FaceDiff dùng strided sparse conv tốn thêm $C^2 \cdot k^3$ FLOPs/level nhưng dễ build với spconv 2.x.
-3. ~~**EMA weights**~~: ✅ **Đã triển khai** (14/05) — decay=0.9999, shadow VRAM ~134MB. Tích hợp vào training loop, checkpoint, resume.
-4. ~~**Normal loss**~~: ✅ **Đã triển khai** (14/05) — `_depth_to_normal()` tính pháp tuyến từ depth maps bằng sai phân hữu hạn. L1 + 0.2×SSIM + 0.2×LPIPS trên normal maps, khớp TRELLIS.2 spec.
+**Khác biệt cốt lõi còn lại sau revision 13 (15/05/2026) — Full Audit SC-VAE vs TRELLIS.2:**
+
+| Hạng mục | TRELLIS.2 (paper + code) | FaceDiff | Đánh giá |
+|----------|--------------------------|----------|----------|
+| **Model scale** | ~800M params, 5 pyramid levels [64,128,256,512,1024], blocks [0,4,8,16,4] | 35M params, 4 levels [64,128,256,512], 2 blocks/level | ⚠️ Nhỏ hơn 23×, OK cho face domain |
+| **Encoder input** | 6ch (dv+delta), **centered -0.5** (`fdg_vae.py:46-49`) | 10ch (dv+delta+gamma+rgb), **không center** | ⚠️ Centering cải thiện training stability |
+| **Decoder output** | 7ch (dv+delta+gamma). RGB → PBR VAE riêng | 10ch (dv+delta+gamma+rgb). Joint training | Thiết kế khác, hợp lý cho face |
+| **Render loss** | Mesh rendering qua `nvdiffrast` **mỗi step từ đầu**. λ_depth=10, λ_mask=1, λ_normal=1 (L1+0.2×SSIM+0.2×LPIPS). Resolution 1024px | Point cloud splatting, **từ epoch 50**, mỗi 2 batch. Resolution 64px | ⚠️ Yếu hơn đáng kể |
+| **Loss weights** | λ_dv=0.01, λ_delta=0.1, λ_kl=1e-6 | Khớp 100% | ✅ |
+| **KL formulation** | `0.5*mean(mu²+exp(logvar)-logvar-1)` | Equivalent (sum/N form) | ✅ |
+| **Optimizer** | AdamW, wd=0, AdaptiveGradClipper (norm=1.0, 95th pctile) | Khớp 100% | ✅ |
+| **EMA** | decay=0.9999 | Khớp 100% | ✅ |
+| **O-Voxel format** | 10ch library | Dùng cùng thư viện | ✅ |
+| **Feature activations** | dv: `(1+2×0.5)×sigmoid-0.5`, delta: `logit>0`, gamma: `softplus` | Khớp 100% (đã verify trong `extract_ovoxel_mesh`) | ✅ |
+| **Downsample** | SparseSpatial2Channel zero-param | Strided sparse conv (+FLOPs nhưng dễ build spconv 2.x) | OK |
+
+**Chi tiết encoder input centering (TRELLIS.2 `fdg_vae.py:46-49`):**
+```python
+# TRELLIS.2: center dv và delta về [-0.5, 0.5] trước khi đưa vào encoder
+x = vertices.replace(torch.cat([
+    vertices.feats - 0.5,           # dv [0,1] → [-0.5, 0.5]
+    intersected.feats.float() - 0.5 # delta {0,1} → {-0.5, 0.5}
+], dim=1))
+```
+FaceDiff không center → biases ≠ 0 at initialization → có thể chậm hội tụ nhưng không sai.
+
+**Render loss gap**: TRELLIS.2 dùng `flexible_dual_grid_to_mesh(train=True)` trong decoder → mesh differentiable → render bằng `nvdiffrast` → so sánh GT mesh vs predicted mesh. `nvdiffrast` 0.4.0 đã cài trong env; `utils3d` chưa cài (cần cho camera setup).
+
+**DC Boundary Pre-fill (15/05/2026):** Thêm `_prefill_boundary_voxels()` vào `test_sc_vae_recon_v2.py` — tự động thêm voxel giả tại biên để DC không bỏ quad thiếu hàng xóm → giảm lỗ mesh.
+
+**Bug fix (15/05/2026):** `recon_raw_autonomous.ply` dùng `clamp(0,1)` thay vì `sigmoid-margin` cho dv logits → vị trí point cloud sai nhẹ. Đã sửa.
 
 ### 7.4. Phân tích Thiết kế
 
@@ -1183,23 +1211,29 @@ Số liệu thực tế đọc trực tiếp từ `data_signature` được hash
 | **SC-VAE resume 397→497** | 100 epoch × ~30 min với `cosine_restart` từ 9.94e-6 → 1e-6 | ~50h | ✅ Hoàn thành epoch 441 |
 | **EMA + Depth-to-Normal + Cosine Restart** | Thêm EMA (0.9999), normal loss (λ=1), cosine restart +200ep | — | ✅ 14/05 (revision 3) |
 | **nvdiffrast** | Cài nvdiffrast 0.4.0 cho future mesh rasterization | — | ✅ 14/05 |
-| **SC-VAE resume 441→700** | +200 epoch, cosine restart với EMA + normal loss + render loss | ~75h | ⏳ Đang chạy (epoch 442) |
-| **Precompute Slat + context (iMF)** | `python scripts/precompute_slat_cache.py --sc-vae-ckpt … --dataset both --skip-existing` → đầy đủ hybrid context (đã sửa bug bản cũ) | ~3–8h tuỳ I/O/GPU | ✅ Công cụ + báo cáo Mục 4.4.0 (revision 3) |
-| **iMF train với `--offline-data`** | Tăng batch sau precompute; không nạp SC-VAE/DINO trên GPU train | song song SC-VAE nếu cần | ⏳ Sau khi cache đủ |
-| iMF Training (online, không offline) | 400 epochs, batch 48 | ~27h | ⏳ Tuỳ chọn nếu không precompute |
+| **SC-VAE resume 441→700** | +200 epoch, cosine restart với EMA + normal loss + render loss | ~75h | ❌ Dừng tại epoch 470 |
+| **Full Audit SC-VAE vs TRELLIS.2** | So sánh toàn bộ: architecture, loss, activations, data pipeline, mesh extraction | — | ✅ 15/05 (revision 13) |
+| **DC Boundary Pre-fill** | `_prefill_boundary_voxels()` thêm voxel giả tại biên → giảm lỗ mesh | — | ✅ 15/05 (revision 13) |
+| **Fix raw PLY dv activation** | `recon_raw_autonomous.ply` clamp→sigmoid-margin | — | ✅ 15/05 (revision 13) |
+| **SC-VAE resume e470→500** | 30 epoch, bs=4/accum=33, EMA+stage2, mục tiêu mesh đẹp nhất | ~15h | ✅ 16/05 (recon=0.0213) |
+| **Precompute Slat cache** | `precompute_slat_cache.py` → ~20K files `.pt` (slat+context) | ~6-8h | ⏳ Đang chạy (16/05) |
+| **Pack Slat LMDB** | `pack_slat_lmdb.py` → `data/slat_context.lmdb/` (merged slat+context) | ~10 phút | ⏳ Sau precompute |
+| **SlatDataset LMDB support** | `--slat-lmdb data/slat_context.lmdb` trong `train_imf.py` | — | ✅ 16/05 |
+| **iMF train với `--offline-data`** | `--slat-lmdb` + `--offline-data` → không nạp SC-VAE/DINO lên GPU | ~27h | ⏳ Sau LMDB |
 | E2E Test | Inference + mesh quality | ~0.5 day | ⏳ |
-| **Tổng** | | **~7 ngày** | **ETA: 18-19/05** |
+| **Tổng** | | **~8 ngày** | **ETA: 19-20/05** |
 
-**Dự báo hội tụ SC-VAE** (cập nhật theo loss thực tế của log gốc):
+**Tiến trình hội tụ SC-VAE** (hoàn thành 16/05/2026):
 
-| Epoch | total_loss | rho_loss | Topology Recall | Ghi chú |
-|-------|-----------|----------|-----------------|---------|
-| 397 | 0.0365 | 0.0513 | 86.7% | Mức hiện tại (đã verify trên 10 mẫu val). |
-| 430 | ~0.030 | ~0.040 | ~89% | Sau khi Bug 6/7 (activated dv) phát huy: gradient nhất quán hơn, recon dv giảm thêm 10–15 %. |
-| 470 | ~0.025 | ~0.020 | ~92% | Cosine restart kéo LR xuống ~3 × 10⁻⁶. |
-| 497 | ~0.022 | ~0.012 | ~94% | Mốc dừng — cosine_restart chạm `target_min_lr=1e-6`. |
+| Epoch | total_loss | recon_loss | KL | rho | Ghi chú |
+|-------|-----------|------------|-----|-----|---------|
+| 390 | 0.038 | 0.026 | 0.83→14.7 | — | Checkpoint giai đoạn cũ |
+| 470 | 0.0880 | 0.0220 | 14.71 | 0.039 | Resume sau fix RGB+EMA |
+| 480 | 0.0870 | 0.0217 | 14.67 | 0.039 | |
+| 490 | 0.0863 | 0.0214 | 14.63 | 0.038 | |
+| **500** | **0.0858** | **0.0213** | **14.58** | **0.038** | **Near-plateau, final** |
 
-> Ghi chú resume: dùng `bash scripts/resume_from_397.sh` (mặc định `EXTEND_EPOCHS=100, TARGET_MIN_LR=1e-6`). Script tự bật `--lmdb-only`, `--enable-stage2-render-loss`, `--gradient-accumulation-steps 33`, `--batch-size 4` để khớp với `resume_contract` đã hash trong checkpoint, tránh `RuntimeError: resume_contract mismatch`.
+> **Phân tích hội tụ:** Recon loss giảm rất chậm ($\Delta \approx 0.0002$/10 epoch). KL ổn định ~14.6. SC-VAE đã hội tụ đủ tốt cho giai đoạn 2 (iMF). Checkpoint: `checkpoints/sc_vae_shape/epoch_500.pt` (537MB).
 
 ### 8.2. Trung hạn (06–07/2026)
 
@@ -2084,5 +2118,103 @@ Tất cả activations trong pipeline inference **khớp hoàn toàn** với TRE
 
 ---
 
-*(Hết báo cáo — Cập nhật: 15/05/2026 — Revision 12: RGB render loss fix, xác minh DC algorithm 100% đúng, phân tích mesh hole root cause 1.6% dropped quads.)*
+## 12. Revision 14 — SC-VAE Hoàn thành, Slat Cache Pipeline & LMDB (16/05/2026)
+
+### 12.1. SC-VAE Epoch 500 — Kết quả Cuối cùng
+
+SC-VAE hoàn thành training tại epoch 500 (16/05/2026 10:24 AM). Loss near-plateau:
+
+| Metric | Epoch 470 | Epoch 500 | Delta |
+|--------|-----------|-----------|-------|
+| Total Loss | 0.0880 | 0.0858 | -0.0022 |
+| Recon Loss | 0.0220 | 0.0213 | -0.0007 |
+| KL | 14.71 | 14.58 | -0.13 |
+| Rho | 0.039 | 0.038 | -0.001 |
+| LR | 8.89e-6 | 8.26e-6 | cosine decay |
+| VRAM | 16,943 MB | 17,125 MB | +182 MB |
+
+**Kết luận:** Recon loss gần hội tụ ($\Delta \approx 0.0002$/10 epoch). SC-VAE đủ tốt cho giai đoạn 2 (iMF).
+
+### 12.2. Slat Cache Precompute Pipeline
+
+**Luồng dữ liệu cho iMF training:**
+
+```
+Mesh (.obj) → O-Voxel (10ch) → SC-VAE encode → Slat tokens [4096, 32]
+                                                + Hybrid Context [946]
+                                                ↓
+                                         .pt files (per-mesh)
+                                                ↓
+                                    pack_slat_lmdb.py
+                                                ↓
+                                    data/slat_context.lmdb/ (merged)
+                                                ↓
+                                    train_imf.py --slat-lmdb --offline-data
+```
+
+**Scripts pipeline:**
+
+1. `scripts/precompute_slat_cache.py` — encode tất cả mesh qua SC-VAE, lưu `{slat, context}` per `.pt` file
+   - Input: `--sc-vae-ckpt epoch_500.pt --context-lmdb data/hybrid_context.lmdb`
+   - Output: `data/slat_cache/` (FaceVerse ~2100) + `data/slat_cache_facescape/` (FaceScape ~18298)
+   - Mỗi file ~518KB: `slat=[4096, 32]` float32 + `context=[946]` float32
+
+2. `scripts/pack_slat_lmdb.py` — pack tất cả `.pt` → single LMDB
+   - Output: `data/slat_context.lmdb/`
+   - Key format: `{dataset_name}/{safe_name}` (vd: `faceverse/015_10_015_10.slatv3_e84bbca6cfe8.pt`)
+
+3. `train_imf.py --slat-lmdb data/slat_context.lmdb --offline-data`
+   - SlatDataset đọc slat+context trực tiếp từ LMDB (priority 0), fallback → `.pt` cache → on-the-fly encode
+   - Không cần nạp SC-VAE, ArcFace, FLAME, DINOv2 lên GPU → tiết kiệm ~4-8GB VRAM
+
+### 12.3. Code Changes (revision 14)
+
+| File | Thay đổi |
+|------|----------|
+| `src/train_imf.py` | Fix LMDB "already open" bug (`_lmdb_env_cache` class-level). Thêm `slat_lmdb_dir` param, `--slat-lmdb` CLI arg, LMDB read priority 0 trong `__getitem__` |
+| `scripts/pack_slat_lmdb.py` | **Mới** — convert `.pt` files → merged LMDB |
+| `scripts/precompute_slat_cache.py` | Không đổi |
+
+### 12.4. Cleanup Scripts
+
+Xóa 8 scripts one-off/obsolete:
+
+| Script | Lý do xóa |
+|--------|-----------|
+| `scripts/resume_e390_rgbfix.sh` | One-off experiment, đã chạy xong |
+| `scripts/resume_e470_rgbfix.sh` | One-off experiment, đã chạy xong |
+| `scripts/resume_train_390_rho.sh` | One-off experiment |
+| `scripts/resume_from_397.sh` | One-off experiment |
+| `scripts/resume_from_step4.sh` | One-off experiment |
+| `scripts/eval_e500.sh` | 11 dòng, redundant với `eval_checkpoints.sh` |
+| `scripts/train_scratch_v3.sh` | Obsolete — superseded bởi `eval_scvae_checkpoints.py` |
+| `scripts/scratch_ovoxel_to_mesh.py` | Temporary scratch file |
+
+### 12.5. Trạng thái Hiện tại & Bước Tiếp theo
+
+| Component | Trạng thái | Chi tiết |
+|-----------|-----------|----------|
+| SC-VAE epoch 500 | ✅ Hoàn thành | `checkpoints/sc_vae_shape/epoch_500.pt` (537MB) |
+| Hybrid Context LMDB | ✅ Sẵn sàng | `data/hybrid_context.lmdb/` (87GB, 20398 entries) |
+| Slat cache precompute | ⏳ Đang chạy | PID 3429067, ~82/20398 files done |
+| Slat LMDB pack | ⏳ Chờ precompute | `scripts/pack_slat_lmdb.py` |
+| mamba-ssm | ✅ Cài đặt | v2.3.1 trong conda facediff |
+| VoxelMamba | ✅ Code sẵn sàng | `src/models/voxel_mamba.py` (~21M params) |
+| iMF training | ⏳ Chờ LMDB | `python src/train_imf.py --offline-data --slat-lmdb data/slat_context.lmdb` |
+
+**Lệnh chạy tiếp:**
+```bash
+# 1. Chờ precompute xong (xem log)
+tail -f logs/precompute_slat_e500.log
+
+# 2. Pack thành LMDB
+python scripts/pack_slat_lmdb.py
+
+# 3. Train iMF
+python src/train_imf.py --offline-data --slat-lmdb data/slat_context.lmdb --batch-size 64
+```
+
+---
+
+*(Hết báo cáo — Cập nhật: 16/05/2026 — Revision 14: SC-VAE epoch 500 hoàn thành, slat cache pipeline + LMDB, cleanup 8 scripts, SlatDataset LMDB support.)*
 
