@@ -80,12 +80,20 @@ def main() -> None:
             slat = payload["slat"]
             context = payload["context"]
 
+            # Use dataset_name/relative_path as key (cache_tag-independent)
+            meta = payload.get("meta", {})
+            rel_path = meta.get("relative_path")
+            if rel_path:
+                stable_key = f"{dataset_name}/{rel_path}"
+            else:
+                stable_key = lmdb_key  # fallback to filename-based key
+
             # Serialize {slat, context} to bytes
             buf = io.BytesIO()
             torch.save({"slat": slat, "context": context}, buf)
             value = buf.getvalue()
 
-            txn.put(lmdb_key.encode("utf-8"), value)
+            txn.put(stable_key.encode("utf-8"), value)
             packed += 1
             total_bytes += len(value)
         except Exception as e:

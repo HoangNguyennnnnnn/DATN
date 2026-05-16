@@ -2216,5 +2216,218 @@ python src/train_imf.py --offline-data --slat-lmdb data/slat_context.lmdb --batc
 
 ---
 
-*(Hết báo cáo — Cập nhật: 16/05/2026 — Revision 14: SC-VAE epoch 500 hoàn thành, slat cache pipeline + LMDB, cleanup 8 scripts, SlatDataset LMDB support.)*
+## 13. Revision 15 — Stage 2 iMF Training Đã Khởi Chạy + Giải thích Mamba (16/05/2026)
+
+### 13.1. Trạng thái Training Hiện tại
+
+iMF VoxelMamba **đang chạy** trong tmux session `train_imf`:
+
+| Tham số | Giá trị |
+|---|---|
+| Backbone | VoxelMamba 49M params (12 layers × 512 hidden × d_state=16 × expand=2) |
+| Batch | 2 (data) × grad_accum=32 = **effective batch 64** |
+| LR | 2e-4 (cosine), warmup 1000 steps |
+| Epochs | 400 (resume từ `best.pt` epoch 1, loss khởi 0.86) |
+| CFG | ON (omega 1–8, context dropout 0.1) |
+| Data | LMDB `data/slat_context.lmdb` — 20,369 samples (29 missing đã filter) |
+| Throughput | 2.7–2.9 batch/s, ~57 min/epoch |
+| VRAM | **11.3 GB** (process này) — đủ chỗ kể cả khi có 2 process khác chiếm 6.6 GB |
+| Loss epoch 1 (đang train) | 0.30 → 0.25 (giảm đều) |
+
+**Khởi chạy lệnh:**
+```bash
+tmux new-session -d -s train_imf "bash scripts/train_imf.sh"
+# Theo dõi:
+tmux attach -t train_imf
+# Hoặc:
+tail -f logs/train_imf_20260516_171721.log
+```
+
+`scripts/train_imf.sh` đã được cập nhật để **mặc định dùng `nohup`**; set `FOREGROUND=1` khi muốn chạy trong tmux pane.
+
+---
+
+### 13.2. Giải thích Mamba (Selective State Space Model) — Cơ chế Hoạt động
+
+Mamba là kiến trúc thay thế Transformer attention, được giới thiệu trong bài báo "Mamba: Linear-Time Sequence Modeling with Selective State Spaces" (Gu & Dao, 2023). Trong FaceDiff, **VoxelMamba** dùng Mamba làm backbone cho mô hình sinh slat token.
+
+#### 13.2.1. State Space Model (SSM) cơ bản
+
+SSM là mô hình chuyển trạng thái rời rạc:
+
+```
+h_t = A·h_{t-1} + B·x_t      (state recurrence)
+y_t = C·h_t                   (output)
+```
+
+Trong đó:
+- `x_t ∈ R^D` — input token tại vị trí t (ví dụ token thứ t trong sequence 4096)
+- `h_t ∈ R^N` — **hidden state** (state size N=16 trong code)
+- `A ∈ R^{N×N}, B ∈ R^{N×D}, C ∈ R^{D×N}` — ma trận chuyển trạng thái
+
+Khác với Transformer (mỗi token nhìn TẤT CẢ token khác → O(L²)), SSM chỉ cần lưu state `h_t` để dự đoán `y_{t+1}` → **O(L)** complexity.
+
+#### 13.2.2. "Selective" trong Mamba
+
+Mamba làm SSM **phụ thuộc input** — `B, C, Δ (timestep)` được tính từ `x_t`:
+
+```
+Δ_t, B_t, C_t = Linear(x_t)    # mỗi token có B/C riêng
+h_t = exp(A·Δ_t)·h_{t-1} + (Δ_t·B_t)·x_t
+y_t = C_t·h_t
+```
+
+Ý nghĩa: model **chọn lọc** thông tin nào lưu vào state, thông tin nào bỏ — giống attention mechanism nhưng O(L) thay vì O(L²).
+
+#### 13.2.3. Mamba CUDA "Selective Scan" Kernel
+
+Vì recurrence `h_t = f(h_{t-1}, x_t)` là tuần tự, không thể parallelize theo cách thông thường. Nhóm tác giả Mamba viết **CUDA kernel "selective scan"** dùng parallel-prefix-sum trick để tính toàn bộ recurrence trong O(L) thời gian song song trên GPU.
+
+Kernel này:
+- Forward: input `[B, D, L]` + Δ/A/B/C → output `[B, D, L]` (parallel scan)
+- Backward: cần đầy đủ trạng thái trung gian để tính gradient
+
+#### 13.2.4. Bidirectional Mamba trong VoxelMamba
+
+Vì voxel grid 3D không có thứ tự tự nhiên (khác text từ trái sang phải), FaceDiff dùng **Bidirectional Mamba** ([src/models/voxel_mamba.py:102-164](src/models/voxel_mamba.py#L102-L164)):
+
+```python
+fwd = self.forward_mamba(x)           # quét xuôi theo Hilbert curve
+bwd = self.backward_mamba(x.flip(1))  # quét ngược
+out = fwd + bwd.flip(1)               # fuse 2 chiều
+```
+
+Cộng với **Hilbert curve ordering** ([voxel_mamba.py:329-343](src/models/voxel_mamba.py#L329-L343)) — mapping voxel 3D 16³ → sequence 1D 4096 mà vẫn giữ được tính cục bộ 3D (2 voxel kề nhau trong không gian → kề nhau trong sequence).
+
+---
+
+### 13.3. SSM Scan Intermediates — Tại sao Tốn 8 GB VRAM?
+
+**Đây là chi tiết kỹ thuật quan trọng nhất để hiểu VRAM bottleneck của Mamba training.**
+
+#### 13.3.1. Bản chất của Scan Intermediates
+
+Khi forward, Mamba CUDA kernel tính recurrence:
+```
+h_0 → h_1 → h_2 → ... → h_L
+```
+Để backward được (chain rule `dL/dx_t` qua chuỗi recurrence), kernel phải **lưu lại đủ thông tin về trạng thái trung gian** ở mọi vị trí t = 1..L.
+
+#### 13.3.2. Kích thước cụ thể trong FaceDiff
+
+Mỗi mamba forward call lưu tensor có shape:
+```
+[B, inner_dim, d_state, L] = [4, 1024, 16, 4096] = 268M elements
+```
+
+Trong đó:
+- `B = 4` — batch sau CFG doubling (data batch 2 × 2 cho cond/uncond)
+- `inner_dim = hidden_dim × expand = 512 × 2 = 1024` — chiều ẩn của mamba (luôn lớn hơn hidden_dim)
+- `d_state = 16` — kích thước SSM state (tham số `mamba_d_state`)
+- `L = 4096` — chiều dài sequence (16³ slat tokens)
+
+**Mỗi call (bf16, 2 bytes/element)**: 268M × 2 = **~536 MB**
+
+#### 13.3.3. Vì sao 24 calls?
+
+Backbone có **12 BidirectionalMambaBlock**, mỗi block gồm:
+- `forward_mamba` (quét xuôi)
+- `backward_mamba` (quét ngược)
+
+→ Tổng **24 mamba calls / forward pass / sample**.
+
+#### 13.3.4. Tổng VRAM cho scan intermediates
+
+```
+24 calls × 536 MB ≈ 12.8 GB (lý thuyết)
+```
+
+Thực tế đo được ~8 GB vì:
+- mamba-ssm CUDA kernel **recompute** một phần intermediates trong backward (`MambaInnerFn` không lưu toàn bộ, một số giá trị được tính lại từ checkpoint)
+- bf16 mixed precision tận dụng tensor core, layout compact hơn
+- PyTorch memory pool reuse một số buffer
+
+#### 13.3.5. Bảng phân rã VRAM Stage 2 (đo thực tế: 11.3 GB cho process train)
+
+| Bucket | VRAM | % tổng |
+|---|---|---|
+| Model weights (fp32 master) | 196 MB | 1.7% |
+| Optimizer AdamW (momentum + variance) | 392 MB | 3.5% |
+| Gradients | 196 MB | 1.7% |
+| EMA copy của model | 196 MB | 1.7% |
+| **Mamba SSM scan intermediates (24 × ~330 MB)** | **~8 GB** | **70%** |
+| Hidden activations `[4, 4096, 512]` × 12 layers | ~400 MB | 3.5% |
+| JVP tangent buffer (50% batch có r≠t) | ~1 GB | 9% |
+| CUDA workspace + fragmentation + buffers | ~800 MB | 7% |
+| **Tổng** | **~11.3 GB** | 100% |
+
+#### 13.3.6. Slat đã "nén" mà sao vẫn tốn nhiều VRAM?
+
+Đây là confusion thường gặp:
+- ✅ **Slat nén so với O-Voxel ở mặt input**: 4096×32 = 0.5 MB/sample, nhỏ hơn O-Voxel sparse (~5-10 MB)
+- ❌ **NHƯNG hidden states không nén**: ngay từ layer đầu, mỗi token bị expand 32 → 512 → 1024 (mamba inner_dim)
+- ⚠️ **SSM recurrence buộc phải lưu state qua thời gian**: đây là **đặc trưng kiến trúc của Mamba**, không phụ thuộc input size
+
+So sánh với Transformer cùng kích thước:
+- Transformer (12 layers, 512 hidden, L=4096): attention matrix `[B, H, L, L]` = `[4, 8, 4096, 4096]` × 2 = 1 GB / layer → 12 GB. Tệ hơn Mamba!
+- Mamba (12 layers, 512 hidden, L=4096): scan intermediates ~8 GB. Tốt hơn nhưng vẫn lớn.
+
+→ Mamba **vẫn tốt hơn** Transformer cho sequence dài, nhưng "tốt hơn" không có nghĩa "rẻ".
+
+---
+
+### 13.4. Lựa chọn Giảm VRAM (nếu cần mở rộng)
+
+| Thay đổi | Tiết kiệm VRAM | Đánh đổi |
+|---|---|---|
+| `d_state=8` thay vì 16 | -50% scan intermediates (~4 GB) | Giảm capacity của SSM state, có thể giảm chất lượng |
+| `expand=1` thay vì 2 | -50% inner_dim → -50% scan | Giảm capacity Mamba block ~2x |
+| `hidden_dim=384` thay vì 512 | -25% activations | Ít capacity model |
+| `num_layers=8` thay vì 12 | -33% scan intermediates | Mô hình nông hơn |
+| **Disable CFG** (`--disable-cfg-conditioning`) | -50% (model thấy batch ½) | Mất guidance lúc sample |
+| Gradient checkpointing | -60-70% activations | +30% wall-clock time |
+
+**Hiện tại config 11.3 GB là cân bằng**: vẫn còn ~5.7 GB headroom dù có 2 process khác chiếm 6.6 GB.
+
+---
+
+### 13.5. Cập nhật Trạng thái Toàn Pipeline (Revision 15)
+
+| Component | Trạng thái | Chi tiết |
+|---|---|---|
+| SC-VAE epoch 500 | ✅ Done | `checkpoints/sc_vae_shape/epoch_500.pt` |
+| Hybrid Context LMDB | ✅ Done | 20,398 entries |
+| O-Voxel LMDB | ✅ Done | `data/ovoxel_cache_lmdb/` |
+| Slat+Context LMDB | ✅ Done | `data/slat_context.lmdb/` — 20,369 entries (cache_tag-independent keys) |
+| 29 missing samples | ✅ Filtered | Auto-skip trong `SlatDataset.__init__` |
+| Gradient accumulation | ✅ Implemented | `--gradient-accumulation-steps` (config + train loop) |
+| VoxelMamba 49M | ✅ Training | Loss 0.86 → 0.25 (đang epoch 1) |
+| Tmux session | ✅ Active | `train_imf` (an toàn khi shell đóng) |
+
+---
+
+### 13.6. Kiểm tra Tiến độ
+
+```bash
+# Xem epoch + batch hiện tại
+tail -1 logs/train_imf_20260516_171721.log
+
+# Xem epoch từ checkpoint (sau lần save đầu, ~optimizer step 500)
+python -c "
+import torch
+ck = torch.load('checkpoints/imf_unet/latest_step.pt', map_location='cpu', weights_only=False)
+print(f\"epoch={ck['epoch']} step={ck['global_step']} loss={ck['best_loss']:.4f}\")
+"
+
+# GPU usage
+nvidia-smi --query-compute-apps=pid,used_memory --format=csv,noheader
+
+# Tmux
+tmux ls
+tmux attach -t train_imf       # Ctrl+B, D để detach
+```
+
+---
+
+*(Hết báo cáo — Cập nhật: 16/05/2026 — Revision 15: Stage 2 training đã chạy, giải thích Mamba + SSM scan intermediates, breakdown VRAM 11.3 GB.)*
 

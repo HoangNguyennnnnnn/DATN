@@ -100,8 +100,10 @@ class EMA:
     def state_dict(self):
         return {k: v.clone() for k, v in self.shadow.items()}
     
-    def load_state_dict(self, state_dict):
+    def load_state_dict(self, state_dict, device=None):
         self.shadow = {k: v.clone() for k, v in state_dict.items()}
+        if device is not None:
+            self.shadow = {k: v.to(device) for k, v in self.shadow.items()}
 
 
 # ============================================================
@@ -316,6 +318,38 @@ class SlatDataset(Dataset):
                 f"exclude_skip={skipped_by_exclude}"
             )
 
+        # Offline mode: filter out samples missing from slat LMDB
+        if self.slat_lmdb_txn is not None and self.sc_vae is None:
+            before = len(self.samples)
+            valid = []
+            for obj_path in self.samples:
+                rel_path = os.path.relpath(obj_path, self.data_root)
+                lmdb_key = f"{self.dataset_name}/{rel_path}".encode("utf-8")
+                if self.slat_lmdb_txn.get(lmdb_key) is not None:
+                    valid.append(obj_path)
+            self.samples = valid
+            dropped = before - len(self.samples)
+            if dropped > 0:
+                print(f"[SlatDataset] Dropped {dropped} samples missing from slat LMDB ({dropped/before*100:.2f}%)")
+
+        # Offline .pt cache: drop manifest entries with no precomputed slat file
+        elif self.sc_vae is None:
+            import glob as _glob
+            before = len(self.samples)
+            valid = []
+            for obj_path in self.samples:
+                rel_path = os.path.relpath(obj_path, self.data_root)
+                base_name = rel_path.replace(os.path.sep, "_").replace(".obj", "")
+                if _glob.glob(os.path.join(self.cache_dir, f"{base_name}.slatv3_*.pt")):
+                    valid.append(obj_path)
+            self.samples = valid
+            dropped = before - len(self.samples)
+            if dropped > 0:
+                print(
+                    f"[SlatDataset] Dropped {dropped} samples missing from .pt cache "
+                    f"({dropped/before*100:.2f}%)"
+                )
+
     def _checkpoint_signature(self, ckpt_path: str | None) -> str:
         if not ckpt_path:
             return "none"
@@ -405,9 +439,20 @@ class SlatDataset(Dataset):
         safe_name = f"{base_name}.{self.cache_tag}{suffix}"
         cache_path = os.path.join(self.cache_dir, safe_name)
 
-        # Priority 0: Merged slat+context LMDB (fastest path)
+        # Priority 0: Merged slat+context LMDB (fastest path, cache_tag-independent)
+        # Lazy re-open txn in forked DataLoader workers (LMDB txns don't survive fork)
+        if self.slat_lmdb_dir and self.slat_lmdb_txn is None:
+            import lmdb as _lmdb
+            abs_dir = os.path.abspath(self.slat_lmdb_dir)
+            if abs_dir not in SlatDataset._lmdb_env_cache:
+                SlatDataset._lmdb_env_cache[abs_dir] = _lmdb.open(
+                    self.slat_lmdb_dir, readonly=True, lock=False,
+                    readahead=True, meminit=False, max_readers=512,
+                )
+            self.slat_lmdb_env = SlatDataset._lmdb_env_cache[abs_dir]
+            self.slat_lmdb_txn = self.slat_lmdb_env.begin(write=False)
         if self.slat_lmdb_txn is not None:
-            lmdb_key = f"{self.dataset_name}/{safe_name}".encode("utf-8")
+            lmdb_key = f"{self.dataset_name}/{rel_path}".encode("utf-8")
             data = self.slat_lmdb_txn.get(lmdb_key)
             if data is not None:
                 import io
@@ -425,6 +470,19 @@ class SlatDataset(Dataset):
             except Exception as e:
                 print(f"\n[CẢNH BÁO] Cache hỏng (Corrupted): {safe_name}. Đang xoá và tái tạo lại...")
                 os.remove(cache_path)
+
+        # Offline fallback: SC-VAE checkpoint đổi → cache_tag khác nhưng cùng mesh stem
+        if self.sc_vae is None:
+            import glob as _glob
+            alt_pattern = os.path.join(self.cache_dir, f"{base_name}.slatv3_*.pt")
+            alt_matches = sorted(_glob.glob(alt_pattern), key=os.path.getmtime, reverse=True)
+            if alt_matches:
+                try:
+                    cache_payload = torch.load(alt_matches[0], map_location="cpu", weights_only=False)
+                    if "slat" in cache_payload and "context" in cache_payload:
+                        return cache_payload["slat"], cache_payload["context"]
+                except Exception:
+                    pass
         
         # Nếu bật --offline-data (sc_vae=None) mà không tìm thấy bộ đệm -> Báo lỗi
         if self.sc_vae is None:
@@ -835,7 +893,8 @@ def load_checkpoint(
             if scaler and ckpt.get('scaler_state_dict'):
                 scaler.load_state_dict(ckpt['scaler_state_dict'])
             if ema and 'ema_state_dict' in ckpt:
-                ema.load_state_dict(ckpt['ema_state_dict'])
+                ema_device = next(model.parameters()).device
+                ema.load_state_dict(ckpt['ema_state_dict'], device=ema_device)
         except (ValueError, RuntimeError) as exc:
             resumed_full = False
             downgrade_reasons.append(f"optimizer/scheduler state mismatch: {exc}")
@@ -1251,7 +1310,10 @@ def train_imf(
         optimizer = torch.optim.AdamW(all_params, **adamw_kwargs)
     scheduler = get_lr_scheduler(optimizer, imf_cfg, len(dataloader))
     scaler = torch.amp.GradScaler('cuda', enabled=imf_cfg.use_amp)
-    
+    grad_accum_steps = max(1, int(getattr(imf_cfg, "gradient_accumulation_steps", 1)))
+    effective_batch = imf_cfg.batch_size * grad_accum_steps
+    print(f"  Gradient accumulation: {grad_accum_steps} steps (effective batch = {effective_batch})")
+
     # ---- Resume ----
     start_epoch = 0
     best_loss = float('inf')
@@ -1292,18 +1354,17 @@ def train_imf(
         epoch_jvp_loss = 0.0
         epoch_cfg_context_keep = 0.0
         t_start = time.time()
-        
+        optimizer.zero_grad(set_to_none=True)
+
         for batch_idx, (slat_targets, contexts) in enumerate(dataloader):
             # slat_targets: [B, slat_length, latent_dim]
             # contexts: [B, 512]
             slat_targets = slat_targets.to(device, non_blocking=True)
             contexts = contexts.to(device, non_blocking=True)
-            
-            optimizer.zero_grad(set_to_none=True)
-            
+
+            is_accum_step = (batch_idx + 1) % grad_accum_steps != 0
+
             with torch.amp.autocast('cuda', dtype=torch.bfloat16, enabled=imf_cfg.use_amp):
-                # Using the comprehensive compute_loss from ImprovedMeanFlow framework
-                # This automatically handles JVP, CFG, dual-branch, and auxiliary v-head.
                 loss_out = imf.compute_loss(
                     model,
                     slat_targets,
@@ -1324,7 +1385,7 @@ def train_imf(
                     return_components=True,
                 )
 
-                loss = loss_out["loss"]
+                loss = loss_out["loss"] / grad_accum_steps
                 loss_shape_val = float(loss_out.get("loss_shape", 0.0))
                 loss_material_val = float(loss_out.get("loss_material", 0.0))
                 loss_boundary_val = float(loss_out.get("loss_boundary", 0.0))
@@ -1332,34 +1393,47 @@ def train_imf(
                 loss_v_head_val = float(loss_out.get("loss_v_head", 0.0))
                 material_keep_val = float(loss_out.get("material_supervision_keep_ratio", 1.0))
                 cfg_keep_val = float(loss_out.get("cfg_context_keep_ratio", 1.0))
-            
+
             scaler.scale(loss).backward()
-            
-            if imf_cfg.grad_clip > 0:
-                scaler.unscale_(optimizer)
-                # Clip toàn bộ trainable params (model + v_head) — trước đây chỉ
-                # clip `model.parameters()` nên gradient v-head không bị giới hạn,
-                # có thể gây bất ổn khi auxiliary FM loss bùng phát.
-                torch.nn.utils.clip_grad_norm_(all_params, imf_cfg.grad_clip)
-            
-            scaler.step(optimizer)
-            scaler.update()
-            scheduler.step()
-            
-            # EMA update
-            if ema:
-                ema.update(model)
-            
-            epoch_loss += loss.item()
+
+            # Only step optimizer after accumulating grad_accum_steps
+            if not is_accum_step or (batch_idx + 1) == len(dataloader):
+                if imf_cfg.grad_clip > 0:
+                    scaler.unscale_(optimizer)
+                    torch.nn.utils.clip_grad_norm_(all_params, imf_cfg.grad_clip)
+
+                scaler.step(optimizer)
+                scaler.update()
+                optimizer.zero_grad(set_to_none=True)
+                scheduler.step()
+
+                # EMA update
+                if ema:
+                    ema.update(model)
+
+                global_step += 1
+
+            batch_loss_val = loss.item() * grad_accum_steps
+            epoch_loss += batch_loss_val
             if loss_shape_val is not None:
                 epoch_shape_loss += loss_shape_val
                 epoch_material_loss += loss_material_val
                 epoch_boundary_loss += loss_boundary_val
                 epoch_jvp_loss += loss_jvp_val
                 epoch_cfg_context_keep += cfg_keep_val
-            global_step += 1
 
-            if imf_cfg.save_every_steps > 0 and global_step % int(imf_cfg.save_every_steps) == 0:
+            if (batch_idx + 1) % 200 == 0 or batch_idx == 0:
+                _total_batches = len(dataloader)
+                elapsed_batch = time.time() - t_start
+                batches_per_sec = (batch_idx + 1) / max(elapsed_batch, 1e-6)
+                eta_epoch = (_total_batches - batch_idx - 1) / max(batches_per_sec, 1e-6)
+                print(
+                    f"    [{batch_idx+1}/{_total_batches}] loss={batch_loss_val:.4f} | "
+                    f"{batches_per_sec:.1f} batch/s | ETA epoch: {eta_epoch/60:.1f}min",
+                    flush=True,
+                )
+
+            if imf_cfg.save_every_steps > 0 and global_step > 0 and global_step % int(imf_cfg.save_every_steps) == 0:
                 save_checkpoint(
                     model,
                     optimizer,
@@ -1367,18 +1441,18 @@ def train_imf(
                     scaler,
                     ema,
                     epoch + 1,
-                    loss.item(),
+                    loss.item() * grad_accum_steps,
                     os.path.join(imf_cfg.checkpoint_dir, "latest_step.pt"),
                     v_head=v_head,
                     stage2_model_config=stage2_model_config,
                     global_step=global_step,
-                    best_loss=min(float(best_loss), float(loss.item())),
+                    best_loss=min(float(best_loss), float(loss.item() * grad_accum_steps)),
                 )
-            
+
             # WandB step logging
-            if cfg.wandb.enabled and WANDB_AVAILABLE and global_step % cfg.wandb.log_every_steps == 0:
+            if cfg.wandb.enabled and WANDB_AVAILABLE and global_step > 0 and global_step % cfg.wandb.log_every_steps == 0:
                 step_payload = {
-                    "train/velocity_loss": loss.item(),
+                    "train/velocity_loss": loss.item() * grad_accum_steps,
                     "train/lr": optimizer.param_groups[0]['lr'],
                     "train/epoch": epoch,
                 }
@@ -1492,7 +1566,8 @@ def main():
     parser.add_argument("--cfg-context-dropout", type=float, default=None, help="Context dropout ratio for conditional branch during CFG-conditioning training.")
     parser.add_argument("--disable-cfg-interval-conditioning", action="store_true", help="Disable interval conditioning on [tmin, tmax].")
     parser.add_argument("--epochs", type=int, default=None, help="Override num_epochs")
-    parser.add_argument("--batch-size", type=int, default=None, help="Override batch_size")
+    parser.add_argument("--batch-size", type=int, default=None, help="Override batch_size (micro-batch per GPU)")
+    parser.add_argument("--gradient-accumulation-steps", type=int, default=None, help="Gradient accumulation steps (effective_batch = batch_size × this)")
     parser.add_argument("--lr", type=float, default=None, help="Override learning_rate")
     parser.add_argument("--checkpoint-dir", type=str, default=None, help="Override checkpoint output directory")
     parser.add_argument("--num-workers", type=int, default=0, help="Dataloader workers (0 to avoid EGL crash over caches)")
@@ -1571,6 +1646,8 @@ def main():
         cfg.imf.num_epochs = args.epochs
     if args.batch_size:
         cfg.imf.batch_size = args.batch_size
+    if args.gradient_accumulation_steps:
+        cfg.imf.gradient_accumulation_steps = args.gradient_accumulation_steps
     if args.lr:
         cfg.imf.learning_rate = args.lr
     if args.checkpoint_dir:

@@ -244,7 +244,8 @@ class IMFConfig:
     pin_memory: bool = True              # Tăng tốc GPU transfer
     
     # Huấn luyện (Tối ưu hóa cho kiến trúc được mở rộng quy mô)
-    batch_size: int = 48               # Giảm nhẹ để phù hợp [160,320,640] + 6 lớp (~70M tham số)
+    batch_size: int = 16               # Micro-batch trên GPU (giảm cho 17GB VRAM)
+    gradient_accumulation_steps: int = 4  # Effective batch = batch_size × grad_accum = 64
     num_epochs: int = 400              # Khuyên dùng Early stopping (giám sát mất mát trên tập xác thực)
     learning_rate: float = 2e-4        # Tăng LR lên 2e-4 bù đắp cho batch_size x2
     weight_decay: float = 1e-5
