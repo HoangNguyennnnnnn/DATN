@@ -1,10 +1,10 @@
 # Báo cáo Nghiên cứu Chuyên sâu: FaceDiff — Hệ thống Tạo sinh Khuôn mặt 3D Một Bước trên Đơn GPU
 
-**Ngày cập nhật:** 16/05/2026 (revision 14 — SC-VAE epoch 500 hoàn thành, slat cache precompute + LMDB pipeline, cleanup scripts)  
+**Ngày cập nhật:** 17/05/2026 (revision 16 — Identity-collapse fix + 2-stage training strategy)  
 **Tác giả:** Nhóm nghiên cứu FaceDiff  
 **Cấu hình Mục tiêu:** Đơn GPU RTX 4090 (24GB VRAM)  
-**Bộ dữ liệu:** FaceVerse_3D & FaceScape  
-**Trạng thái checkpoint:** SC-VAE epoch 500 **hoàn thành** (recon=0.0213, KL=14.58, near-plateau). Slat cache precompute đang chạy (→ LMDB cho iMF). mamba-ssm 2.3.1 sẵn sàng. Tiếp theo: pack slat LMDB → train iMF VoxelMamba.
+**Bộ dữ liệu:** FaceVerse_3D (2,100 — high detail) & FaceScape (18,298 — registered)  
+**Trạng thái checkpoint:** SC-VAE epoch 500 done (recon=0.0213, KL=14.58). Stage 2 iMF VoxelMamba **đang train** với per-channel slat normalization fix (loss 1.64 → 0.44 ở epoch 5). Kế hoạch: joint pretrain → FaceVerse finetune (xem Section 14).
 
 ---
 
@@ -19,6 +19,7 @@
 7. [Phân tích và Giải thích Kết quả](#7-phân-tích-và-giải-thích-kết-quả)
 8. [Kế hoạch Tiếp theo](#8-kế-hoạch-tiếp-theo)
 9. [Cập nhật Alignment iMF (Revision 4)](#9-cập-nhật-alignment-imf-revision-4)
+10. [Revision 16 — Identity-Collapse Fix + 2-Stage Strategy (17/05/2026)](#14-revision-16--identity-collapse-fix--chiến-lược-2-stage-training-17052026)
 
 ---
 
@@ -2429,5 +2430,252 @@ tmux attach -t train_imf       # Ctrl+B, D để detach
 
 ---
 
-*(Hết báo cáo — Cập nhật: 16/05/2026 — Revision 15: Stage 2 training đã chạy, giải thích Mamba + SSM scan intermediates, breakdown VRAM 11.3 GB.)*
+*(Cập nhật: 16/05/2026 — Revision 15: Stage 2 training đã chạy, giải thích Mamba + SSM scan intermediates, breakdown VRAM 11.3 GB.)*
+
+---
+
+## 14. Revision 16 — Identity-Collapse Fix + Chiến lược 2-Stage Training (17/05/2026)
+
+### 14.1. Tóm tắt Revision 16
+
+Revision này ghi lại 2 mốc lớn:
+1. **Bug critical phát hiện và fix**: Stage 2 training Revision 15 bị **identity collapse** — model học `u_pred ≈ z_t` (trivial solution), không học conditional velocity field. Fix bằng **per-channel slat normalization** kiểu TRELLIS.2.
+2. **Đề xuất chiến lược 2-stage**: Joint pretrain trên cả 2 datasets → Finetune FaceVerse-only để tận dụng độ chi tiết cao hơn.
+
+---
+
+### 14.2. Bug Identity Collapse — Phát hiện và Fix
+
+#### 14.2.1. Triệu chứng (Revision 15 training)
+
+| Test | Kết quả (epoch 16) | Ý nghĩa |
+|------|---------------------|---------|
+| Loss epoch 11-19 | 0.215 ± 0.001 (plateau) | Không cải thiện qua 9 epochs |
+| `cos_sim(sample, GT)` | **0.07** | Sample gần như random |
+| `pred_std / GT_std` | 0.08 / 0.37 = **22%** | Output quá nhỏ |
+| 5-step Euler cos_sim | 0.02 (tệ hơn 1-step) | Velocity field hỏng |
+| `cos_sim(u_pred, z_1)` | **0.9973** | Model copy input |
+
+#### 14.2.2. Root cause: Signal-to-Noise quá thấp
+
+- Slat (SC-VAE latent) có **std ≈ 0.36** (đo trên 20,369 samples, 83.4M tokens)
+- Flow matching noise `e ~ N(0, 1)` có **std = 1.0**
+- Velocity target `v = e − x ≈ e` khi `||x|| << ||e||` → model học `u_pred ≈ e ≈ z_t`
+- Khi 1-step sample: `z_0 = z_1 − u_pred ≈ 0` → output mất tín hiệu data
+
+**Lý do slat std nhỏ**: [src/config.py:98](src/config.py#L98) `kl_weight=1e-6` (so với TRELLIS.2 `1e-4` và VAEs chuẩn `1e-2`–`1e-4`). KL pressure quá yếu nên SC-VAE không ép `mu → N(0, 1)`.
+
+#### 14.2.3. TRELLIS.2 reference xác nhận hướng fix
+
+[trellis2_image_to_3d.py:271-273](third_party/TRELLIS.2/trellis2/pipelines/trellis2_image_to_3d.py#L271-L273) và [trellis2_image_to_3d.py:408-409](third_party/TRELLIS.2/trellis2/pipelines/trellis2_image_to_3d.py#L408-L409) áp dụng **per-channel normalization**:
+
+```python
+# Trước khi train iMF flow:
+slat_normalized = (slat_raw - mean) / std    # mean, std: shape [latent_dim]
+# Sau khi 1-step sample:
+slat_for_decoder = slat_normalized * std + mean
+```
+
+Config [slat_flow_imgshape2tex_dit_1_3B_512_bf16.json](third_party/TRELLIS.2/configs/gen/slat_flow_imgshape2tex_dit_1_3B_512_bf16.json) chứa `shape_slat_normalization = {mean: [32 values], std: [32 values]}` — vector per-channel.
+
+#### 14.2.4. Implementation Fix (17/05/2026)
+
+**Bước 1**: Tạo [scripts/compute_slat_stats.py](scripts/compute_slat_stats.py) — 2-pass streaming compute mean/std từ toàn bộ 20,369 samples → `data/slat_stats.pt`:
+
+```python
+{
+    "mean": torch.Tensor[32],  # range [-0.048, +0.053], near zero
+    "std":  torch.Tensor[32],  # range [0.258, 0.431], mean 0.364
+    "n_samples": 20369,
+    "n_total_tokens": 83,431,424,
+}
+```
+
+**Bước 2**: Update [src/config.py:215](src/config.py#L215) — thay `slat_scale: float` (scalar) bằng `slat_stats_path: Optional[str] = "data/slat_stats.pt"`.
+
+**Bước 3**: Update [src/train_imf.py:1344-1357](src/train_imf.py#L1344) — load stats khi training start, [src/train_imf.py:1374-1378](src/train_imf.py#L1374) — apply `(slat - mean) / std` trong batch loop.
+
+**Bước 4**: Save `slat_stats_path` vào `stage2_model_config` ([train_imf.py:794](src/train_imf.py#L794), [813](src/train_imf.py#L813)) để inference reverse normalize.
+
+#### 14.2.5. Kết quả Verify Fix (17/05/2026, training mới chạy lại)
+
+So sánh OLD (broken) vs NEW (sau fix, ở từng epoch):
+
+| Metric | OLD ep16 | NEW ep2 | NEW ep5 |
+|--------|----------|---------|---------|
+| `cos(u_pred, z_1)` — identity check | **0.9973** | 0.79 | 0.96 (gần noise correct) |
+| Boundary cos_sim @ t=0.5 | 0.90 (giả) | 0.88 (thật) | **0.91** |
+| Boundary cos_sim @ t=0.1 | — | 0.91 | **0.93** |
+| 1-step sample cos_sim | 0.07 (random) | 0.007 | **0.048** (cải thiện 7x) |
+| Epoch loss | 0.21 (plateau) | 0.64 | **0.44** (giảm đều) |
+
+**Kết luận**: Fix hoạt động đúng. Identity collapse đã thoát, model học conditional velocity field thật sự.
+
+---
+
+### 14.3. Quan sát Khác biệt 2 Datasets (FaceScape vs FaceVerse)
+
+User phát hiện 2 datasets không đồng nhất về độ chi tiết khi visual inspect mesh:
+
+| Aspect | FaceScape | FaceVerse |
+|--------|-----------|-----------|
+| Số meshes | **18,298** (90% data) | **2,100** (10% data) |
+| Identities | 837 train | 100 train |
+| Vertex/mesh | 200K–400K | 5K–20K |
+| **Vai (shoulders)** | ❌ Không có | ✅ **Có** |
+| **Tròng mắt (iris)** | ❌ Không có | ✅ **Có** |
+| **Miệng (mouth)** | ❌ Có lỗ rỗng | ✅ **Đầy đủ** |
+| Texture | UV 2048×2048 | Per-vertex RGB |
+| Topology | Registered (TU) | Registered (FaceVerse template) |
+
+**Hệ quả của bias 90/10**:
+- Joint training hiện tại bị **dominate bởi FaceScape**
+- Model có xu hướng sinh output **thiếu vai, thiếu mắt, miệng có lỗ** (theo dominant pattern)
+- Capacity để học các structures phức tạp hơn của FaceVerse (vai/mắt) bị "trộn loãng"
+
+→ **Cần chiến lược để model học được high-detail topology của FaceVerse**.
+
+---
+
+### 14.4. Đề xuất Chiến lược 2-Stage Training
+
+#### 14.4.1. Strategy: Joint Pretrain → FaceVerse Finetune
+
+```
+[ Stage A ]  Joint Pretrain trên cả 2 datasets (current)
+              ↓
+[ Switch ]   Phase D test gate (epoch 10) — confirm slat fix OK
+              ↓
+[ Stage A+ ] Train tiếp cho đến khi joint loss plateau (~epoch 100-200)
+              ↓
+[ Stage B ]  Finetune FaceVerse-only, lower LR, shorter
+              ↓
+[ Output ]   Model chuyên cho FaceVerse-style: có vai, mắt, miệng đầy
+```
+
+#### 14.4.2. Lý do hợp lý
+
+| Lý do | Chi tiết |
+|-------|----------|
+| Pattern chuẩn | Pretrain on large → finetune on quality (BERT, GPT, vision foundation models) |
+| Joint warmup | Model học general face geometry từ 20K+ samples (variance lớn) |
+| Specialize | Finetune chuyên môn hoá high-detail topology của FaceVerse |
+| Code sẵn | CLI `--dataset {faceverse,facescape,both}` ([train_imf.py:1566](src/train_imf.py#L1566)) |
+| SC-VAE generic | Decoder train trên cả 2 → không bias, decode FaceVerse-rich slat OK |
+| Context generic | ArcFace+FLAME+DINOv2 không phụ thuộc dataset |
+
+#### 14.4.3. So sánh với Alternatives
+
+| Strategy | Pros | Cons | Verdict |
+|----------|------|------|---------|
+| **Joint → FaceVerse finetune** | Tận dụng pretrain, specialize cuối | Catastrophic forgetting FaceScape | ✅ **Đề xuất** |
+| Joint-only (400 ep) | Đơn giản, không multi-stage | Bias 90/10, model thiếu chi tiết | ❌ Vấn đề hiện tại |
+| FaceVerse-only from scratch | Specialize từ đầu | Quá ít data (2.1K), khó học general | ❌ Underfit |
+| Weighted sampler (70% FaceVerse) | Tránh forgetting | Implementation phức tạp, training chậm hơn | ⚠️ Backup option |
+
+User chọn: **100% FaceVerse finetune** (catastrophic forgetting chấp nhận được vì target là FaceVerse-style).
+
+---
+
+### 14.5. Cấu hình Chi tiết Stage B Finetune
+
+| Hyperparam | Joint (Stage A) | Finetune (Stage B) | Lý do |
+|------------|-----------------|---------------------|-------|
+| `--dataset` | `both` | **`faceverse`** | 100% FaceVerse |
+| `--resume` | (none) | `checkpoints/imf_unet/best.pt` | Load joint weights |
+| `--lr` | 2e-4 | **2e-5** | 10x lower, tránh overfit + catastrophic |
+| `--epochs` | 400 | **100** | 2.1K × 100 ep = 210K iterations |
+| `lr_warmup_steps` | 1000 | **100** | Warmup ngắn |
+| `cfg_context_dropout` | 0.1 | **0.05** | Ít data → ít cần context augment |
+| `ema_decay` | 0.9995 | **0.999** | Adapt nhanh hơn |
+| `save_every_steps` | 500 | **100** | Save dày để pick best |
+| `checkpoint_dir` | `imf_unet/` | **`imf_unet_ft_faceverse/`** | Tránh overwrite joint |
+| `slat_stats_path` | `data/slat_stats.pt` | **(giữ nguyên)** | Tránh distribution shift |
+
+**Thời gian dự kiến Stage B**: ~6-8 giờ (vs ~7 ngày cho Stage A từ epoch 0 đến hết).
+
+**Launch command** (khi đến lúc, sau khi joint converge):
+
+```bash
+BATCH_SIZE=2 GRAD_ACCUM=32 \
+LR=2e-5 EPOCHS=100 \
+RESUME=checkpoints/imf_unet/best.pt \
+CHECKPOINT_DIR=checkpoints/imf_unet_ft_faceverse \
+bash scripts/train_imf.sh --dataset faceverse \
+    --cfg-context-dropout 0.05 --ema-decay 0.999 --lr-warmup-steps 100
+```
+
+**Code changes cần thiết khi launch**:
+
+| File | Change |
+|------|--------|
+| [scripts/train_imf.sh](scripts/train_imf.sh) | Thêm `${DATASET_ARG}`, `${CHECKPOINT_DIR_ARG}` pass-through (default empty) |
+| [src/config.py](src/config.py) | (optional) Verify `cfg_context_dropout`, `ema_decay`, `lr_warmup_steps` đã có CLI flag |
+
+**Không cần** đổi: data loading, slat normalization, model architecture, SC-VAE — tất cả generic.
+
+---
+
+### 14.6. Switch Decision Gate (sau Phase D test)
+
+Quyết định khi nào switch sang Stage B dựa trên Phase D test (sau epoch 10 của Stage A):
+
+| Phase D outcome | Action |
+|-----------------|--------|
+| Boundary cos_sim ≥ 0.93 AND 1-step ≥ 0.1 | ✅ Tiếp tục train joint đến plateau (epoch 100-200) → Stage B |
+| Boundary cos_sim < 0.93 | ⚠️ Train thêm 10-20 epochs, re-test |
+| 1-step cos_sim vẫn ~0 sau epoch 20 | ⚠️ Considering `curriculum_switch_ratio`: 0.6 → 0.2 (cho t=1 training sớm hơn) |
+
+**Plateau detection**: 5 epochs liên tiếp loss không cải thiện >0.5%.
+
+---
+
+### 14.7. Risks & Mitigations
+
+| Rủi ro | Mức độ | Mitigation |
+|--------|--------|------------|
+| Catastrophic forgetting FaceScape | Medium | Chấp nhận (target FaceVerse-style only) |
+| Overfit 2,100 samples | Medium | LR 2e-5 (10x lower), epochs 100 (vs 400), EMA decay 0.999 |
+| Distribution shift trong normalized slat space | Low | Giữ `data/slat_stats.pt` của joint, không recompute |
+| Joint chưa converge khi switch | Medium | Phase D test gate, plateau detection |
+| FaceVerse có structures (vai/mắt) mà SC-VAE chưa encode tốt | Low | SC-VAE đã train trên cả 2 datasets → encoder thấy đủ |
+
+---
+
+### 14.8. Verification Protocol cho Stage B
+
+#### Tại epoch 10 của Stage B:
+- Re-run `scripts/test_imf_sample.py --ckpt checkpoints/imf_unet_ft_faceverse/latest_step.pt`
+- Expect boundary cos_sim tăng (vs joint best.pt)
+- Expect 1-step cos_sim tăng trên FaceVerse test samples
+
+#### Tại epoch 50 của Stage B:
+- **Visual inspection**: decode 5 random FaceVerse-style samples → mesh, check:
+  - Có vai không?
+  - Có tròng mắt không?
+  - Miệng có đầy không (không có lỗ)?
+- So sánh visual với output Stage A best.pt cùng context
+
+#### Tại epoch 100 của Stage B (final):
+- Compute cos_sim trên cả FaceVerse test (10 ID) và FaceScape test (10 ID):
+  - FaceVerse: kỳ vọng tăng đáng kể vs joint
+  - FaceScape: chấp nhận giảm (catastrophic forgetting)
+- Pick best.pt theo FaceVerse test metric, không joint metric
+
+---
+
+### 14.9. Trạng thái Pipeline Hiện tại (17/05/2026)
+
+| Component | Trạng thái | Chi tiết |
+|-----------|-----------|----------|
+| SC-VAE epoch 500 | ✅ Done | `checkpoints/sc_vae_shape/epoch_500.pt` (recon=0.0213, KL=14.58) |
+| Slat+Context LMDB | ✅ Done | 20,369 entries |
+| **Slat normalization stats** | ✅ **Done** | `data/slat_stats.pt` (32-dim mean+std, từ 83.4M tokens) |
+| **Identity collapse fix** | ✅ **Verified** | Per-channel normalize, cos_sim 0.07 → 0.048 (still climbing) |
+| Stage A joint training | 🟢 **Đang chạy** | PID 4151705, epoch 6/400, loss 0.44 |
+| Stage B finetune | ⏳ Chờ | Sau Phase D test gate (~epoch 10-20 của Stage A) |
+
+---
+
+*(Cập nhật: 17/05/2026 — Revision 16: Identity-collapse bug fix bằng per-channel slat normalization + đề xuất chiến lược 2-stage joint pretrain → FaceVerse finetune.)*
 

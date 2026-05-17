@@ -67,10 +67,21 @@ def main():
             contexts.append(torch.as_tensor(blob["context"]).float())
             slats.append(torch.as_tensor(blob["slat"]).float())
     contexts = torch.stack(contexts).to(device)
-    x = torch.stack(slats).to(device)
-    b = x.shape[0]
+    x_raw = torch.stack(slats).to(device)
+    b = x_raw.shape[0]
 
-    print(f"\nSlat (x) std={x.std().item():.4f}, mean={x.mean().item():.4f}")
+    # Apply same per-channel normalization as training
+    stats_path = mcfg.get("slat_stats_path") or "data/slat_stats.pt"
+    if stats_path and os.path.exists(stats_path):
+        _stats = torch.load(stats_path, map_location="cpu", weights_only=False)
+        slat_mean = _stats["mean"].to(device).view(1, 1, -1)
+        slat_std = _stats["std"].to(device).view(1, 1, -1)
+        x = (x_raw - slat_mean) / slat_std
+        print(f"\n[Slat Norm] Applied: x_raw std={x_raw.std():.4f} → x_norm std={x.std():.4f}")
+    else:
+        x = x_raw
+        print(f"\n[WARNING] No slat stats found, using raw slat")
+    print(f"Slat (x_normalized) std={x.std().item():.4f}, mean={x.mean().item():.4f}")
 
     # Test 1: Boundary loss at training t distribution (t=r, logit_normal centered ~0.4)
     print("\n=== Test 1: Velocity prediction at boundary (r=t, t~training dist) ===")
