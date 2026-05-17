@@ -6,7 +6,6 @@ from unittest import mock
 import torch
 
 from src.inference.generator import FaceDiffGenerator
-from src.models.generative_unet import IMFUNet1D
 from src.models.imf_diffusion import ImprovedMeanFlow
 from src.models.voxel_mamba import VoxelMamba
 from src.train_imf import EMA, SlatDataset, load_checkpoint, save_checkpoint
@@ -140,42 +139,6 @@ class Stage2ContractTests(unittest.TestCase):
         self.assertFalse(info["resumed_full"])
         self.assertEqual(info["epoch"], 5)
 
-    def test_legacy_imfunet_supports_hidden_state_v_head_smoke(self):
-        torch.manual_seed(2)
-        model = IMFUNet1D(
-            input_dim=4,
-            hidden_dims=[8, 16, 32],
-            context_dim=6,
-            slat_length=64,
-            num_bottleneck_layers=1,
-            num_context_tokens=1,
-            num_time_tokens=1,
-            num_r_tokens=1,
-            num_guidance_tokens=1,
-            use_hilbert_ordering=False,
-        )
-        v_head = torch.nn.Sequential(
-            torch.nn.Linear(model.hidden_dim, 16),
-            torch.nn.SiLU(),
-            torch.nn.Linear(16, 4),
-        )
-        imf = ImprovedMeanFlow()
-        imf._sample_t_r = lambda batch_size, device: (
-            torch.full((batch_size,), 0.5, device=device),
-            torch.full((batch_size,), 0.5, device=device),
-        )
-        x = torch.randn(2, 64, 4)
-        context = torch.randn(2, 6)
-        out = imf.compute_loss(
-            model,
-            x,
-            context,
-            v_head=v_head,
-            return_components=True,
-            v_loss_weight=0.2,
-        )
-        self.assertTrue(torch.isfinite(out["loss"]).item())
-        self.assertIn("loss_v_head", out)
 
     def test_generator_infers_missing_optional_tokenizers_as_zero(self):
         model = VoxelMamba(

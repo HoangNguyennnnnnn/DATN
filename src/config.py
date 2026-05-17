@@ -205,21 +205,17 @@ class IMFConfig:
     - An toàn khi chạy trên RTX 4090 24GB
     """
     # Kiến trúc (Tối ưu cho 20K mẫu khuôn mặt, RTX 4090)
-    # VoxelMamba (default backbone): ~20.88M tham số đo thực tế (sum(p.numel())/1e6).
-    # Hybrid U-DiT legacy backbone: ~45M tham số. Có thể mở rộng lên ~80M nếu bị underfit.
+    # VoxelMamba backbone: ~49M tham số (12 layers × 512 hidden × d_state=16 × expand=2).
     input_dim: int = 32                # Số chiều Slat token - BẮT BUỘC KHỚP với SC-VAE latent_dim
     # Per-channel slat normalization (TRELLIS.2 style — CRITICAL):
     # SC-VAE latent std~0.36 vs noise std=1.0 → SNR thấp → identity collapse.
     # Apply (slat - mean) / std trước khi train, reverse khi decode.
     # Stats được tính 1 lần bằng scripts/compute_slat_stats.py, lưu shape [32] mean+std.
     slat_stats_path: Optional[str] = "data/slat_stats.pt"
-    hidden_dims: List[int] = field(default_factory=lambda: [160, 320, 640])  # Tỉ lệ cân đối
-    num_bottleneck_layers: int = 6      # Tăng từ 4 lên để tăng khả năng của khối attention
     context_dim: int = 946             # Ngữ cảnh Lai v4.1 (ArcFace 512 + FLAME 50 + DINOv2_Back 384)
     slat_length: int = 4096            # Số Slat tokens trên mỗi lưới
-    
-    # Kiến trúc Voxel Mamba (v5.0 - thay thế IMFUNet1D)
-    use_voxel_mamba: bool = True         # Dùng VoxelMamba thay vì IMFUNet1D
+
+    # Kiến trúc Voxel Mamba (v5.0 backbone)
     voxel_mamba_backend: str = "auto"    # auto|mamba|gru
     voxel_mamba_strict: bool = False     # Bằng True -> báo lỗi nếu yêu cầu mamba backend nhưng không khả dụng
     mamba_hidden_dim: int = 512          # Chiều ẩn cho các khối Mamba
@@ -263,7 +259,7 @@ class IMFConfig:
     t_sampler: str = "curriculum"      # Paper Tab.4: logit-normal(−0.4,1); curriculum = giai đoạn logit-normal + pha uniform
     t_loc: float = -0.4               # Trung bình logit-normal (Giai đoạn 1: thiên vị ở giữa)
     t_scale: float = 1.0              # Tỉ lệ logit-normal
-    curriculum_switch_ratio: float = 0.6   # Chuyển sang Giai đoạn 2 (Đồng đều) ở mức 60% tiến trình
+    curriculum_switch_ratio: float = 0.3   # Compromise 0.6→0.3 (17/05): switch ở 30% (epoch 120) — balance giữa boundary stability và 1-step learning
     curriculum_uniform_prob: float = 0.8   # Xác suất chọn giá trị đồng đều ở Giai đoạn 2 của tiến trình
     cfg_conditioning_enable: bool = True    # iMF Mục 4.2: học điều hướng linh hoạt dưới dạng điều kiện
     
@@ -272,18 +268,12 @@ class IMFConfig:
     use_auxiliary_v_head: bool = True    # Dùng khối v-head phụ trợ để dự đoán vận tốc cận biên
     v_head_dim: int = 512               # Chiều ẩn cho khối phụ trợ v-head
     v_loss_weight: float = 0.1           # Trọng số auxiliary v-head loss; khớp objective đang dùng trong iMF paper impl
-    boundary_condition_ratio: float = 0.5  # Deprecated: dùng ratio_r_neq_t để suy ra boundary ratio thực tế
     cfg_omega_min: float = 1.0              # Cận dưới thang điều hướng (1.0 = không điều hướng)
     cfg_omega_max: float = 8.0              # Cận trên thang điều hướng
     cfg_omega_power_beta: float = 1.0       # Giá trị beta hàm lũy thừa cho p(omega) ~ omega^-beta
     cfg_context_dropout: float = 0.1        # Loại bỏ các ngữ cảnh điều kiện để học nhánh vô điều kiện ổn định
     cfg_interval_conditioning: bool = True  # Điều kiện hóa trên đoạn [tmin, tmax] giống trong phụ lục iMF
     adaptive_loss_weighting: bool = True    # iMF Appendix A: per-bin EMA reweighting cho main + v-head loss
-    neg_guidance_enable: bool = False      # Deprecated: negative guidance training chưa được wire trong stage-2 runtime hiện tại
-    neg_guidance_scale: float = 0.0        # Deprecated: inference-only path có hỗ trợ, training path chưa dùng
-    neg_guidance_fallback: str = "random"  # Deprecated cùng neg_guidance_enable
-    far_neg_min_candidates: int = 32       # Deprecated cùng neg_guidance_enable
-    far_neg_pool_size: int = 1024          # Deprecated cùng neg_guidance_enable
     ema_decay: float = 0.9995          # Giảm xuống nhẹ để thích nghi tốt hơn với 20K mẫu
     use_ema: bool = True               # EMA cải thiện chất lượng lấy mẫu
     dropout: float = 0.05              # Bổ sung một chút dropout để tránh overfit đối với 20K mẫu
@@ -365,7 +355,7 @@ class TrainConfig:
         print(f"  [Struct] batch={self.structure.batch_size}, epochs={self.structure.num_epochs}, "
               f"lr={self.structure.learning_rate}, hidden={self.structure.hidden_dim}")
         print(f"  [iMF]    batch={self.imf.batch_size}, epochs={self.imf.num_epochs}, "
-              f"lr={self.imf.learning_rate}, hidden={self.imf.hidden_dims}")
+              f"lr={self.imf.learning_rate}, hidden={self.imf.mamba_hidden_dim}×{self.imf.mamba_num_layers}L")
         print(f"  [WandB]  enabled={self.wandb.enabled}, project={self.wandb.project}")
         print("=" * 60)
 

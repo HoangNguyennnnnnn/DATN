@@ -785,40 +785,25 @@ def _resolve_material_config(imf_cfg) -> None:
 
 
 def _build_stage2_model_config(model: nn.Module, imf_cfg, model_input_dim: int) -> dict:
-    if bool(getattr(imf_cfg, "use_voxel_mamba", True)):
-        return {
-            "arch": "voxel_mamba",
-            "input_dim": int(model_input_dim),
-            "context_dim": int(getattr(imf_cfg, "context_dim", 946)),
-            "slat_length": int(getattr(imf_cfg, "slat_length", 4096)),
-            "slat_stats_path": getattr(imf_cfg, "slat_stats_path", None),
-            "hidden_dim": int(getattr(model, "hidden_dim", getattr(imf_cfg, "mamba_hidden_dim", 512))),
-            "num_layers": int(getattr(imf_cfg, "mamba_num_layers", 12)),
-            "backend": str(getattr(model, "backend", getattr(imf_cfg, "voxel_mamba_backend", "auto"))),
-            "strict": bool(getattr(imf_cfg, "voxel_mamba_strict", False)),
-            "num_context_tokens": int(getattr(model, "num_context_tokens", getattr(imf_cfg, "mamba_num_context_tokens", 8))),
-            "num_time_tokens": int(getattr(model, "num_time_tokens", getattr(imf_cfg, "mamba_num_time_tokens", 4))),
-            "num_r_tokens": int(getattr(model, "num_r_tokens", getattr(imf_cfg, "mamba_num_r_tokens", 4))),
-            "num_interval_tokens": int(getattr(model, "num_interval_tokens", getattr(imf_cfg, "mamba_num_interval_tokens", 4))),
-            "num_guidance_tokens": int(getattr(model, "num_guidance_tokens", getattr(imf_cfg, "mamba_num_guidance_tokens", 4))),
-            "d_state": int(getattr(imf_cfg, "mamba_d_state", 16)),
-            "d_conv": int(getattr(imf_cfg, "mamba_d_conv", 4)),
-            "expand": int(getattr(imf_cfg, "mamba_expand", 2)),
-            "dropout": float(getattr(imf_cfg, "dropout", 0.0)),
-        }
-
     return {
-        "arch": "imf_unet",
+        "arch": "voxel_mamba",
         "input_dim": int(model_input_dim),
         "context_dim": int(getattr(imf_cfg, "context_dim", 946)),
         "slat_length": int(getattr(imf_cfg, "slat_length", 4096)),
         "slat_stats_path": getattr(imf_cfg, "slat_stats_path", None),
-        "hidden_dims": list(getattr(model, "hidden_dims", getattr(imf_cfg, "hidden_dims", [160, 320, 640]))),
-        "num_bottleneck_layers": int(getattr(model, "num_bottleneck_layers", getattr(imf_cfg, "num_bottleneck_layers", 6))),
-        "num_context_tokens": int(getattr(model, "num_context_tokens", 8)),
-        "num_time_tokens": int(getattr(model, "num_time_tokens", 4)),
-        "num_r_tokens": int(getattr(model, "num_r_tokens", 4)),
-        "num_guidance_tokens": int(getattr(model, "num_guidance_tokens", 4)),
+        "hidden_dim": int(getattr(model, "hidden_dim", getattr(imf_cfg, "mamba_hidden_dim", 512))),
+        "num_layers": int(getattr(imf_cfg, "mamba_num_layers", 12)),
+        "backend": str(getattr(model, "backend", getattr(imf_cfg, "voxel_mamba_backend", "auto"))),
+        "strict": bool(getattr(imf_cfg, "voxel_mamba_strict", False)),
+        "num_context_tokens": int(getattr(model, "num_context_tokens", getattr(imf_cfg, "mamba_num_context_tokens", 8))),
+        "num_time_tokens": int(getattr(model, "num_time_tokens", getattr(imf_cfg, "mamba_num_time_tokens", 4))),
+        "num_r_tokens": int(getattr(model, "num_r_tokens", getattr(imf_cfg, "mamba_num_r_tokens", 4))),
+        "num_interval_tokens": int(getattr(model, "num_interval_tokens", getattr(imf_cfg, "mamba_num_interval_tokens", 4))),
+        "num_guidance_tokens": int(getattr(model, "num_guidance_tokens", getattr(imf_cfg, "mamba_num_guidance_tokens", 4))),
+        "d_state": int(getattr(imf_cfg, "mamba_d_state", 16)),
+        "d_conv": int(getattr(imf_cfg, "mamba_d_conv", 4)),
+        "expand": int(getattr(imf_cfg, "mamba_expand", 2)),
+        "dropout": float(getattr(imf_cfg, "dropout", 0.0)),
     }
 
 
@@ -1180,61 +1165,42 @@ def train_imf(
     dataloader = DataLoader(**dataloader_kwargs)
     print(f"  Dataset: {len(dataset)} samples, {len(dataloader)} batches/epoch")
     
-    # ---- Model ----
+    # ---- Model: Voxel Mamba v5.0 (O(N) complexity, default backbone) ----
     model_input_dim = imf_cfg.input_dim * 2 if imf_cfg.dual_branch else imf_cfg.input_dim
-    
-    if getattr(imf_cfg, "use_voxel_mamba", True):
-        # Voxel Mamba v5.0 - O(N) complexity
-        print("\n[4/5] Building Voxel Mamba v5.0...")
-        from src.models.voxel_mamba import VoxelMamba
-        model = VoxelMamba(
-            input_dim=model_input_dim,
-            hidden_dim=imf_cfg.mamba_hidden_dim,
-            num_layers=imf_cfg.mamba_num_layers,
-            slat_length=imf_cfg.slat_length,
-            context_dim=imf_cfg.context_dim,
-            backend=str(getattr(imf_cfg, "voxel_mamba_backend", "auto")),
-            strict=bool(getattr(imf_cfg, "voxel_mamba_strict", False)),
-            num_context_tokens=int(getattr(imf_cfg, "mamba_num_context_tokens", 8)),
-            num_time_tokens=int(getattr(imf_cfg, "mamba_num_time_tokens", 4)),
-            num_r_tokens=int(getattr(imf_cfg, "mamba_num_r_tokens", 4)),
-            num_interval_tokens=int(getattr(imf_cfg, "mamba_num_interval_tokens", 4)),
-            num_guidance_tokens=int(getattr(imf_cfg, "mamba_num_guidance_tokens", 4)),
-            d_state=imf_cfg.mamba_d_state,
-            d_conv=imf_cfg.mamba_d_conv,
-            expand=imf_cfg.mamba_expand,
-            dropout=imf_cfg.dropout,
-        ).to(device)
-        print(f"  Architecture: Voxel Mamba [D={imf_cfg.mamba_hidden_dim}, L={imf_cfg.mamba_num_layers}]")
-        print(f"  Backend: {getattr(model, 'backend', 'unknown')}")
-        print(f"  Complexity: O(N) linear scan (vs O(N²) attention)")
-    else:
-        # Hybrid U-DiT backbone — chỉ khi `imf.use_voxel_mamba=False` (checkpoint cũ).
-        from src.models.generative_unet import IMFUNet1D
-
-        print("\n[4/5] Building iMF U-Net v4.1...")
-        model = IMFUNet1D(
-            input_dim=model_input_dim,
-            hidden_dims=imf_cfg.hidden_dims,
-            context_dim=imf_cfg.context_dim,
-            slat_length=imf_cfg.slat_length,
-            num_bottleneck_layers=imf_cfg.num_bottleneck_layers,
-        ).to(device)
-        print(f"  Architecture: Hybrid U-DiT {imf_cfg.hidden_dims}")
+    print("\n[4/5] Building Voxel Mamba v5.0...")
+    from src.models.voxel_mamba import VoxelMamba
+    model = VoxelMamba(
+        input_dim=model_input_dim,
+        hidden_dim=imf_cfg.mamba_hidden_dim,
+        num_layers=imf_cfg.mamba_num_layers,
+        slat_length=imf_cfg.slat_length,
+        context_dim=imf_cfg.context_dim,
+        backend=str(getattr(imf_cfg, "voxel_mamba_backend", "auto")),
+        strict=bool(getattr(imf_cfg, "voxel_mamba_strict", False)),
+        num_context_tokens=int(getattr(imf_cfg, "mamba_num_context_tokens", 8)),
+        num_time_tokens=int(getattr(imf_cfg, "mamba_num_time_tokens", 4)),
+        num_r_tokens=int(getattr(imf_cfg, "mamba_num_r_tokens", 4)),
+        num_interval_tokens=int(getattr(imf_cfg, "mamba_num_interval_tokens", 4)),
+        num_guidance_tokens=int(getattr(imf_cfg, "mamba_num_guidance_tokens", 4)),
+        d_state=imf_cfg.mamba_d_state,
+        d_conv=imf_cfg.mamba_d_conv,
+        expand=imf_cfg.mamba_expand,
+        dropout=imf_cfg.dropout,
+    ).to(device)
+    print(f"  Architecture: Voxel Mamba [D={imf_cfg.mamba_hidden_dim}, L={imf_cfg.mamba_num_layers}]")
+    print(f"  Backend: {getattr(model, 'backend', 'unknown')}")
+    print(f"  Complexity: O(N) linear scan (vs O(N²) attention)")
 
     stage2_model_config = _build_stage2_model_config(model, imf_cfg, model_input_dim)
 
     # ---- Compilation (RTX 4090 Optimization) ----
-    # torch.compile tương thích với IMFUNet1D và VoxelMamba (GRU fallback).
-    # Chỉ bỏ qua khi dùng mamba-ssm CUDA kernels (không tương thích).
+    # Bỏ qua torch.compile khi dùng mamba-ssm CUDA kernels (không tương thích).
     _can_compile = device.type == "cuda" and hasattr(torch, "compile")
-    if _can_compile:
-        _use_mamba_native = getattr(imf_cfg, "use_voxel_mamba", True) and getattr(model, "use_mamba", False)
-        if _use_mamba_native:
-            print("\n[4.5/5] Skipping torch.compile (mamba-ssm CUDA kernels không tương thích)")
-        else:
-            print("\n[4.5/5] Compiling model with torch.compile (reduce-overhead)...")
-            model = torch.compile(model, mode="reduce-overhead")
+    if _can_compile and not getattr(model, "use_mamba", False):
+        print("\n[4.5/5] Compiling model with torch.compile (reduce-overhead)...")
+        model = torch.compile(model, mode="reduce-overhead")
+    else:
+        print("\n[4.5/5] Skipping torch.compile (mamba-ssm CUDA kernels không tương thích)")
     
     imf = ImprovedMeanFlow(
         sigma_min=imf_cfg.sigma_min,

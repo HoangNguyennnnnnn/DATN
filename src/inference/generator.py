@@ -332,12 +332,10 @@ class FaceDiffGenerator:
     def _infer_stage2_model_config(self, ckpt_path: str | None, default_input_dim: int, default_context_dim: int) -> dict:
         train_cfg = TrainConfig().imf
         cfg = {
-            "arch": "voxel_mamba" if bool(getattr(train_cfg, "use_voxel_mamba", True)) else "imf_unet",
+            "arch": "voxel_mamba",
             "input_dim": int(default_input_dim),
             "context_dim": int(default_context_dim),
             "slat_length": int(self.slat_length),
-            "hidden_dims": list(getattr(train_cfg, "hidden_dims", [128, 256, 512])),
-            "num_bottleneck_layers": int(getattr(train_cfg, "num_bottleneck_layers", 4)),
             "num_context_tokens": int(getattr(train_cfg, "mamba_num_context_tokens", 8)),
             "num_time_tokens": int(getattr(train_cfg, "mamba_num_time_tokens", 4)),
             "num_r_tokens": int(getattr(train_cfg, "mamba_num_r_tokens", 4)),
@@ -359,130 +357,77 @@ class FaceDiffGenerator:
             return cfg
 
         sd = self._extract_imf_state_dict(ckpt_path)
-        if not isinstance(sd, dict):
+        if not isinstance(sd, dict) or "input_embed.weight" not in sd:
             return cfg
 
-        if "input_embed.weight" in sd:
-            cfg["arch"] = "voxel_mamba"
-            weight = sd["input_embed.weight"]
-            if isinstance(weight, torch.Tensor) and weight.ndim == 2:
-                cfg["hidden_dim"] = int(weight.shape[0])
-                cfg["input_dim"] = int(weight.shape[1])
+        weight = sd["input_embed.weight"]
+        if isinstance(weight, torch.Tensor) and weight.ndim == 2:
+            cfg["hidden_dim"] = int(weight.shape[0])
+            cfg["input_dim"] = int(weight.shape[1])
 
-            ctx_w = sd.get("context_tokenizer.0.weight", None)
-            if isinstance(ctx_w, torch.Tensor) and ctx_w.ndim == 2:
-                cfg["context_dim"] = int(ctx_w.shape[1])
-                if int(cfg["hidden_dim"]) > 0:
-                    cfg["num_context_tokens"] = max(1, int(ctx_w.shape[0] // int(cfg["hidden_dim"])))
+        ctx_w = sd.get("context_tokenizer.0.weight", None)
+        if isinstance(ctx_w, torch.Tensor) and ctx_w.ndim == 2:
+            cfg["context_dim"] = int(ctx_w.shape[1])
+            if int(cfg["hidden_dim"]) > 0:
+                cfg["num_context_tokens"] = max(1, int(ctx_w.shape[0] // int(cfg["hidden_dim"])))
 
-            time_w = sd.get("time_tokenizer.0.weight", None)
-            if isinstance(time_w, torch.Tensor) and time_w.ndim == 2 and int(cfg["hidden_dim"]) > 0:
-                cfg["num_time_tokens"] = max(1, int(time_w.shape[0] // int(cfg["hidden_dim"])))
+        time_w = sd.get("time_tokenizer.0.weight", None)
+        if isinstance(time_w, torch.Tensor) and time_w.ndim == 2 and int(cfg["hidden_dim"]) > 0:
+            cfg["num_time_tokens"] = max(1, int(time_w.shape[0] // int(cfg["hidden_dim"])))
 
-            r_w = sd.get("r_tokenizer.0.weight", None)
-            if isinstance(r_w, torch.Tensor) and r_w.ndim == 2 and int(cfg["hidden_dim"]) > 0:
-                cfg["num_r_tokens"] = max(1, int(r_w.shape[0] // int(cfg["hidden_dim"])))
-            else:
-                cfg["num_r_tokens"] = 0
-
-            interval_w = sd.get("interval_tokenizer.0.weight", None)
-            if isinstance(interval_w, torch.Tensor) and interval_w.ndim == 2 and int(cfg["hidden_dim"]) > 0:
-                cfg["num_interval_tokens"] = max(1, int(interval_w.shape[0] // int(cfg["hidden_dim"])))
-            else:
-                cfg["num_interval_tokens"] = 0
-
-            guide_w = sd.get("guidance_tokenizer.0.weight", None)
-            if isinstance(guide_w, torch.Tensor) and guide_w.ndim == 2 and int(cfg["hidden_dim"]) > 0:
-                cfg["num_guidance_tokens"] = max(1, int(guide_w.shape[0] // int(cfg["hidden_dim"])))
-            else:
-                cfg["num_guidance_tokens"] = 0
-
-            layer_ids = []
-            for key in sd.keys():
-                if key.startswith("layers."):
-                    parts = key.split(".")
-                    if len(parts) > 1 and parts[1].isdigit():
-                        layer_ids.append(int(parts[1]))
-            if layer_ids:
-                cfg["num_layers"] = max(layer_ids) + 1
-
-            if any(".gru." in key for key in sd.keys()):
-                cfg["backend"] = "gru"
-            elif any(".forward_mamba." in key or ".backward_mamba." in key for key in sd.keys()):
-                cfg["backend"] = "mamba"
-            return cfg
-
-        init_conv_w = sd.get("init_conv.weight", None)
-        if isinstance(init_conv_w, torch.Tensor) and init_conv_w.ndim == 3:
-            cfg["arch"] = "imf_unet"
-            cfg["input_dim"] = int(init_conv_w.shape[1])
-            cfg["hidden_dims"][0] = int(init_conv_w.shape[0])
-
-        context_proj = sd.get("context_tokens.0.weight", None)
-        if isinstance(context_proj, torch.Tensor) and context_proj.ndim == 2:
-            cfg["context_dim"] = int(context_proj.shape[1])
-
-        time_proj = sd.get("time_tokenizer.proj.0.weight", None)
-        if isinstance(time_proj, torch.Tensor) and time_proj.ndim == 2 and int(cfg["hidden_dims"][-1]) > 0:
-            cfg["num_time_tokens"] = max(1, int(time_proj.shape[0] // int(cfg["hidden_dims"][-1])))
-
-        r_proj = sd.get("r_tokenizer.proj.0.weight", None)
-        if isinstance(r_proj, torch.Tensor) and r_proj.ndim == 2 and int(cfg["hidden_dims"][-1]) > 0:
-            cfg["num_r_tokens"] = max(1, int(r_proj.shape[0] // int(cfg["hidden_dims"][-1])))
+        r_w = sd.get("r_tokenizer.0.weight", None)
+        if isinstance(r_w, torch.Tensor) and r_w.ndim == 2 and int(cfg["hidden_dim"]) > 0:
+            cfg["num_r_tokens"] = max(1, int(r_w.shape[0] // int(cfg["hidden_dim"])))
         else:
             cfg["num_r_tokens"] = 0
 
-        guide_proj = sd.get("guidance_tokenizer.proj.0.weight", None)
-        if isinstance(guide_proj, torch.Tensor) and guide_proj.ndim == 2 and int(cfg["hidden_dims"][-1]) > 0:
-            cfg["num_guidance_tokens"] = max(1, int(guide_proj.shape[0] // int(cfg["hidden_dims"][-1])))
+        interval_w = sd.get("interval_tokenizer.0.weight", None)
+        if isinstance(interval_w, torch.Tensor) and interval_w.ndim == 2 and int(cfg["hidden_dim"]) > 0:
+            cfg["num_interval_tokens"] = max(1, int(interval_w.shape[0] // int(cfg["hidden_dim"])))
+        else:
+            cfg["num_interval_tokens"] = 0
+
+        guide_w = sd.get("guidance_tokenizer.0.weight", None)
+        if isinstance(guide_w, torch.Tensor) and guide_w.ndim == 2 and int(cfg["hidden_dim"]) > 0:
+            cfg["num_guidance_tokens"] = max(1, int(guide_w.shape[0] // int(cfg["hidden_dim"])))
         else:
             cfg["num_guidance_tokens"] = 0
 
-        bottleneck_layers = []
+        layer_ids = []
         for key in sd.keys():
-            if key.startswith("bottleneck.") and ".attn." in key:
+            if key.startswith("layers."):
                 parts = key.split(".")
                 if len(parts) > 1 and parts[1].isdigit():
-                    bottleneck_layers.append(int(parts[1]))
-        if bottleneck_layers:
-            cfg["num_bottleneck_layers"] = max(bottleneck_layers) + 1
+                    layer_ids.append(int(parts[1]))
+        if layer_ids:
+            cfg["num_layers"] = max(layer_ids) + 1
+
+        if any(".gru." in key for key in sd.keys()):
+            cfg["backend"] = "gru"
+        elif any(".forward_mamba." in key or ".backward_mamba." in key for key in sd.keys()):
+            cfg["backend"] = "mamba"
         return cfg
 
     def _build_stage2_model(self, stage2_cfg: dict) -> nn.Module:
-        if stage2_cfg["arch"] == "voxel_mamba":
-            from src.models.voxel_mamba import VoxelMamba
+        from src.models.voxel_mamba import VoxelMamba
 
-            return VoxelMamba(
-                input_dim=int(stage2_cfg["input_dim"]),
-                hidden_dim=int(stage2_cfg["hidden_dim"]),
-                num_layers=int(stage2_cfg["num_layers"]),
-                slat_length=int(stage2_cfg["slat_length"]),
-                context_dim=int(stage2_cfg["context_dim"]),
-                backend=str(stage2_cfg["backend"]),
-                strict=bool(stage2_cfg["strict"]),
-                num_context_tokens=int(stage2_cfg["num_context_tokens"]),
-                num_time_tokens=int(stage2_cfg["num_time_tokens"]),
-                num_r_tokens=int(stage2_cfg["num_r_tokens"]),
-                num_interval_tokens=int(stage2_cfg["num_interval_tokens"]),
-                num_guidance_tokens=int(stage2_cfg["num_guidance_tokens"]),
-                dropout=float(stage2_cfg["dropout"]),
-                d_state=int(stage2_cfg["d_state"]),
-                d_conv=int(stage2_cfg["d_conv"]),
-                expand=int(stage2_cfg["expand"]),
-            )
-
-        from src.models.generative_unet import IMFUNet1D
-
-        return IMFUNet1D(
+        return VoxelMamba(
             input_dim=int(stage2_cfg["input_dim"]),
-            hidden_dims=list(stage2_cfg["hidden_dims"]),
-            context_dim=int(stage2_cfg["context_dim"]),
+            hidden_dim=int(stage2_cfg["hidden_dim"]),
+            num_layers=int(stage2_cfg["num_layers"]),
             slat_length=int(stage2_cfg["slat_length"]),
-            num_bottleneck_layers=int(stage2_cfg["num_bottleneck_layers"]),
+            context_dim=int(stage2_cfg["context_dim"]),
+            backend=str(stage2_cfg["backend"]),
+            strict=bool(stage2_cfg["strict"]),
             num_context_tokens=int(stage2_cfg["num_context_tokens"]),
             num_time_tokens=int(stage2_cfg["num_time_tokens"]),
-            num_r_tokens=int(stage2_cfg.get("num_r_tokens", 0)),
-            num_guidance_tokens=int(stage2_cfg.get("num_guidance_tokens", 0)),
+            num_r_tokens=int(stage2_cfg["num_r_tokens"]),
+            num_interval_tokens=int(stage2_cfg["num_interval_tokens"]),
+            num_guidance_tokens=int(stage2_cfg["num_guidance_tokens"]),
+            dropout=float(stage2_cfg["dropout"]),
+            d_state=int(stage2_cfg["d_state"]),
+            d_conv=int(stage2_cfg["d_conv"]),
+            expand=int(stage2_cfg["expand"]),
         )
 
     def _load_imf_checkpoint(self, model: nn.Module, ckpt_path: str):
