@@ -816,28 +816,18 @@ class FaceDiffGenerator:
             # RGB Sampling from Voxel features if available (channels 7-10)
             mesh_colors = None
             if feats.shape[1] >= 10 and len(verts_np) > 0 and coords.numel() > 0:
-                # Nearest-voxel colors create visible Voronoi striping on the exported mesh.
-                # Blend a small neighborhood in dual-vertex space for smoother appearance.
-                from scipy.spatial import cKDTree
+                # Nearest-voxel colors create visible Voronoi striping; dùng GPU IDW KNN blend.
+                from src.mesh_gpu import gpu_knn_idw_colors
 
                 voxel_size = (aabb_tensor[1] - aabb_tensor[0]) / float(max(int(grid_size), 1))
                 dual_vertices_world = (coords.to(torch.float32) + v) * voxel_size.unsqueeze(0) + aabb_tensor[0].unsqueeze(0)
-                support_points = dual_vertices_world.detach().cpu().numpy()
-                support_colors = feats[:, 7:10].detach().cpu().numpy()
-                k = int(max(1, min(8, len(support_points))))
-                tree = cKDTree(support_points)
-                dist, idx = tree.query(verts_np, k=k)
-                if k == 1:
-                    idx = np.asarray(idx).reshape(-1, 1)
-                    dist = np.asarray(dist).reshape(-1, 1)
-                weights = 1.0 / np.maximum(np.asarray(dist, dtype=np.float32), 1e-6)
-                weights /= weights.sum(axis=1, keepdims=True)
-                mesh_colors_linear = (support_colors[np.asarray(idx, dtype=np.int64)] * weights[..., None]).sum(axis=1)
-                mesh_colors_linear = np.clip(mesh_colors_linear, 0.0, 1.0)
-                
-                # LƯU Ý: O-Voxel converter đã trả về sRGB, KHÔNG cần gamma correction lần nữa.
-                # Áp dụng 1/2.2 ở đây sẽ gây hiệu ứng rửa trôi màu (washed-out).
-                mesh_colors = mesh_colors_linear
+                k = int(max(1, min(8, dual_vertices_world.shape[0])))
+                verts_t = torch.from_numpy(verts_np).to(dual_vertices_world.device)
+                colors_t = gpu_knn_idw_colors(
+                    verts_t, dual_vertices_world.detach(), feats[:, 7:10].detach(),
+                    k=k,
+                )
+                mesh_colors = colors_t.clamp(0.0, 1.0).cpu().numpy().astype(np.float32)
 
             if len(faces_np) > 0:
                 print(f"  [DualContouring] {len(verts_np)} verts, {len(faces_np)} faces")

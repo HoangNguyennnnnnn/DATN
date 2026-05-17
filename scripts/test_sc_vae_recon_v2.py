@@ -390,30 +390,64 @@ def extract_ovoxel_mesh(coords: torch.Tensor, feats: torch.Tensor, aabb, res: in
         rgb_pad = torch.full((n_synthetic, 3), 0.5, dtype=rgb_linear_vox.dtype, device=device)
         rgb_linear_vox = torch.cat([rgb_linear_vox, rgb_pad], dim=0)
 
+    import time as _time
+    # Mesh size guard: meshes > 1M verts chỉ xuất hiện khi model chưa train xong (garbage slat).
+    # Full trimesh.repair pipeline trên 5M+ faces tốn 10-15 phút mà mesh không có ý nghĩa.
+    # Skip heavy ops trên giant mesh để vẫn lưu được raw geometry để inspect.
+    GIANT_MESH_THRESHOLD = 1_000_000  # verts
+
     try:
         # 1. Dual Contouring Extraction (TRELLIS.2 protocol)
+        _t0 = _time.time()
         verts, faces = flexible_dual_grid_to_mesh(
             coords, dv, flag, split_weight=split_weight, aabb=aabb, grid_size=int(res), train=False
         )
-        
+        torch.cuda.synchronize() if device.type == "cuda" else None
+        _t_dc = _time.time() - _t0
+        print(f"    [TIMING] DC: {_t_dc:.2f}s ({verts.shape[0]} verts, {faces.shape[0]} faces)")
+
         verts_np = verts.cpu().numpy()
         faces_np = faces.cpu().numpy()
-        
+
+        # Fast path for giant meshes (untrained model output)
+        if verts.shape[0] > GIANT_MESH_THRESHOLD:
+            print(f"    [GIANT MESH] verts={verts.shape[0]} > {GIANT_MESH_THRESHOLD}: "
+                  f"skip trimesh.repair + CC + smoothing (return raw DC output)")
+            # Compute simple per-vertex color from nearest voxel (GPU, fast)
+            try:
+                from src.mesh_gpu import gpu_knn_idw_colors
+                voxel_size_g = (aabb[1] - aabb[0]) / float(res)
+                world_dv_g = (coords.float() + dv) * voxel_size_g + aabb[0]
+                # k=1 cho giant mesh — chỉ lấy màu voxel gần nhất, không IDW
+                colors_t = gpu_knn_idw_colors(
+                    verts.float(), world_dv_g, rgb_linear_vox, k=1, chunk=4096,
+                )
+                colors_srgb = colors_t.clamp(0.0, 1.0).cpu().numpy().astype(np.float32)
+            except Exception as e:
+                print(f"    [WARN] giant mesh color failed: {e}; using grey")
+                colors_srgb = np.full((verts_np.shape[0], 3), 0.5, dtype=np.float32)
+            return verts_np, faces_np, colors_srgb
+
         # 2. Geometry Post-processing (trimesh repair + Open3D smoothing)
         try:
             import trimesh as _tm
 
+            _t0 = _time.time()
             mesh = _tm.Trimesh(vertices=verts_np, faces=faces_np, process=False)
             n_before = len(mesh.faces)
 
             # Step 1: Fix normals & face orientations (KEY for correct shading)
             _tm.repair.fix_normals(mesh)
             _tm.repair.fix_winding(mesh)
+            print(f"    [TIMING] trimesh.fix_normals/winding: {_time.time()-_t0:.2f}s")
 
             # Step 2: Fill small holes
+            _t0 = _time.time()
             _tm.repair.fill_holes(mesh)
+            print(f"    [TIMING] trimesh.fill_holes: {_time.time()-_t0:.2f}s")
 
             # Step 3: Remove degenerate/duplicate faces
+            _t0 = _time.time()
             mask_nondeg = mesh.nondegenerate_faces()
             if not mask_nondeg.all():
                 mesh.update_faces(mask_nondeg)
@@ -423,10 +457,10 @@ def extract_ovoxel_mesh(coords: torch.Tensor, feats: torch.Tensor, aabb, res: in
                 mask_uniq[unique_idx] = True
                 mesh.update_faces(mask_uniq)
             mesh.remove_unreferenced_vertices()
+            print(f"    [TIMING] dedup faces: {_time.time()-_t0:.2f}s")
 
             # Step 4: Remove only TINY disconnected components (noise)
-            # BUG FIX: Trước đây giữ CHỈ mảnh lớn nhất → xoá mất nhiều bề mặt hợp lệ.
-            # Giờ chỉ xoá mảnh < 1% tổng số faces (nhiễu thực sự).
+            _t0 = _time.time()
             try:
                 components = mesh.split(only_watertight=False)
                 if len(components) > 1:
@@ -440,6 +474,7 @@ def extract_ovoxel_mesh(coords: torch.Tensor, feats: torch.Tensor, aabb, res: in
                             print(f"    Removed {n_removed} tiny components (< {min_faces} faces)")
             except Exception:
                 pass  # body_count can be slow/fail on large meshes
+            print(f"    [TIMING] mesh.split (CC): {_time.time()-_t0:.2f}s")
 
             # Step 5: Decimation (if target specified)
             if target_faces > 0 and len(mesh.faces) > target_faces:
@@ -447,22 +482,19 @@ def extract_ovoxel_mesh(coords: torch.Tensor, feats: torch.Tensor, aabb, res: in
                 # Re-fix normals after decimation
                 _tm.repair.fix_normals(mesh)
 
-            # Step 6: Taubin smoothing via Open3D
+            # Step 6: Taubin smoothing via GPU (thay Open3D filter_smooth_taubin)
             if smooth_iters > 0:
-                import open3d as o3d
-                o3d_mesh = o3d.geometry.TriangleMesh()
-                o3d_mesh.vertices = o3d.utility.Vector3dVector(
-                    np.asarray(mesh.vertices, dtype=np.float64))
-                o3d_mesh.triangles = o3d.utility.Vector3iVector(
-                    np.asarray(mesh.faces, dtype=np.int32))
-                o3d_mesh = o3d_mesh.filter_smooth_taubin(
-                    number_of_iterations=smooth_iters,
-                    lambda_filter=0.5, mu=-0.53
-                )
-                o3d_mesh.remove_degenerate_triangles()
-                o3d_mesh.remove_unreferenced_vertices()
-                verts_np = np.asarray(o3d_mesh.vertices, dtype=np.float32)
-                faces_np = np.asarray(o3d_mesh.triangles, dtype=np.int64)
+                _t0 = _time.time()
+                from src.mesh_gpu import gpu_taubin_smooth
+                verts_t = torch.from_numpy(np.asarray(mesh.vertices, dtype=np.float32)).to(device)
+                faces_t = torch.from_numpy(np.asarray(mesh.faces, dtype=np.int64)).to(device)
+                smoothed = gpu_taubin_smooth(verts_t, faces_t,
+                                             iters=int(smooth_iters),
+                                             lam=0.5, mu=-0.53)
+                torch.cuda.synchronize() if device.type == "cuda" else None
+                verts_np = smoothed.cpu().numpy().astype(np.float32)
+                faces_np = faces_t.cpu().numpy().astype(np.int64)
+                print(f"    [TIMING] GPU Taubin: {_time.time()-_t0:.2f}s")
             else:
                 verts_np = np.asarray(mesh.vertices, dtype=np.float32)
                 faces_np = np.asarray(mesh.faces, dtype=np.int64)
@@ -473,28 +505,22 @@ def extract_ovoxel_mesh(coords: torch.Tensor, feats: torch.Tensor, aabb, res: in
         except Exception as e:
             print(f"[WARN] Mesh post-processing failed: {e}")
 
-        # 3. IDW k-NN Color Mapping
-        from scipy.spatial import cKDTree
+        # 3. IDW k-NN Color Mapping (GPU thay scipy.cKDTree)
+        _t0 = _time.time()
+        from src.mesh_gpu import gpu_knn_idw_colors
         voxel_size = (aabb[1] - aabb[0]) / float(res)
-        world_dv_np = ((coords.float() + dv) * voxel_size + aabb[0]).cpu().numpy()
-        
-        tree = cKDTree(world_dv_np)
-        dist, idx = tree.query(verts_np, k=int(color_knn))
-        
-        if int(color_knn) == 1:
-            idx = idx.reshape(-1, 1)
-            dist = dist.reshape(-1, 1)
-            
-        weights = 1.0 / np.maximum(dist, 1e-6)
-        weights /= weights.sum(axis=1, keepdims=True)
-        
-        rgb_vox_np = rgb_linear_vox.cpu().numpy()
-        colors_linear = (rgb_vox_np[idx] * weights[..., None]).sum(axis=1)
-        
-        # LƯU Ý: O-Voxel converter đã trả về sRGB, KHÔNG cần gamma correction lần nữa.
-        # Áp dụng 1/2.2 ở đây sẽ gây hiệu ứng rửa trôi màu (washed-out).
-        colors_srgb = np.clip(colors_linear, 0.0, 1.0)
-        
+        world_dv = (coords.float() + dv) * voxel_size + aabb[0]  # giữ GPU
+        verts_t = torch.from_numpy(verts_np).to(device)
+
+        colors_t = gpu_knn_idw_colors(
+            verts_t, world_dv.to(device), rgb_linear_vox.to(device),
+            k=int(color_knn),
+        )
+        torch.cuda.synchronize() if device.type == "cuda" else None
+        # Note: SC-VAE đã output sRGB; clamp [0,1] và trả numpy float32
+        colors_srgb = colors_t.clamp(0.0, 1.0).cpu().numpy().astype(np.float32)
+        print(f"    [TIMING] GPU KNN+IDW color: {_time.time()-_t0:.2f}s")
+
         return verts_np, faces_np, colors_srgb
     except Exception as e:
         print(f"[WARN] extract_ovoxel_mesh failed: {e}")

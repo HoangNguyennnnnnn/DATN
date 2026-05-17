@@ -16,7 +16,7 @@ BATCH_SIZE="${BATCH_SIZE:-2}"
 GRAD_ACCUM="${GRAD_ACCUM:-32}"
 LR="${LR:-2e-4}"
 EPOCHS="${EPOCHS:-400}"
-NUM_WORKERS="${NUM_WORKERS:-0}"
+NUM_WORKERS="${NUM_WORKERS:-4}"   # Parallel LMDB I/O — GPU không phải đợi (SlatDataset lazy re-open trong worker)
 RESUME="${RESUME:-checkpoints/imf_unet/best.pt}"
 SC_VAE_CKPT="${SC_VAE_CKPT:-checkpoints/sc_vae_shape/epoch_500.pt}"
 

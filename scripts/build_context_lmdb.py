@@ -9,11 +9,15 @@ Ghép lại thành vector [946] và lưu vào LMDB với key là đường dẫn
 """
 
 import os
+import sys
 import io
 import argparse
 from tqdm import tqdm
 import torch
 import lmdb
+
+# Allow running from anywhere
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 
 from src.data.mesh_renderer import MeshRenderer
 from src.data.arcface_extractor import ArcFaceExtractor

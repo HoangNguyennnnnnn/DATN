@@ -1,11 +1,25 @@
 # ============================================================
-# FaceDiff .gitignore
+# FaceDiff .gitignore — Comprehensive (2026-05-17)
 # ============================================================
 
-# ── Datasets & Caches (CRITICAL: never upload) ──
-/data/
-*.lmdb
+# ── Data: Caches, LMDBs, Backups (CRITICAL: never push) ──
+data/
+data/slat_cache/
+data/slat_cache_facescape/
+data/ovoxel_cache_lmdb/
+data/ovoxel_cache_recached/
+data/backup_*/
+data/*.lmdb/
+*.lmdb/
 *.mdb
+*.lmdb-lock
+
+# ── Data: Large binaries in data/ ──
+data/mediapipe_models/
+data/*.pt
+
+# ── Data: Keep manifest + small configs ──
+!data/mesh_manifest.json
 
 # ── Model Checkpoints ──
 checkpoints/
@@ -14,9 +28,11 @@ checkpoints/
 *.bin
 *.safetensors
 *.ckpt
+*.onnx
 
 # ── Training Outputs ──
 outputs/
+outputs_context_viz/
 val_samples/
 test_dc_diagnostic/
 logs/
@@ -50,8 +66,10 @@ wheels/
 *.egg-info/
 .installed.cfg
 *.egg
+pip-log.txt
+pip-delete-this-directory.txt
 
-# ── Third-party (vendored separately) ──
+# ── Third-party (vendored, tracked separately or via submodule) ──
 third_party/
 
 # ── IDEs & Editors ──
@@ -61,11 +79,15 @@ third_party/
 .cursor/
 .cursor-server/
 .windsurf-server/
+*.swp
+*.swo
+*~
 
 # ── AI Agents & Tools ──
 .gemini/
 .claude/
 .claude.json
+CLAUDE.md
 .cline/
 .codeium/
 .codex/
@@ -74,7 +96,8 @@ third_party/
 
 # ── System & Dotfiles ──
 .DS_Store
-.ipynb_checkpoints
+Thumbs.db
+.ipynb_checkpoints/
 .env
 .netrc
 .ssh/
@@ -95,5 +118,12 @@ third_party/
 .profile
 .wget-hsts
 
-# ── Keep .gitignore itself ──
+# ── Temp / Scratch ──
+*.tmp
+*.bak
+*.orig
+
+# ── Keep these ──
 !.gitignore
+!requirements.txt
+!requirements-mamba.txt
