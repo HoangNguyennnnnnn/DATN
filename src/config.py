@@ -208,6 +208,11 @@ class IMFConfig:
     # VoxelMamba (default backbone): ~20.88M tham số đo thực tế (sum(p.numel())/1e6).
     # Hybrid U-DiT legacy backbone: ~45M tham số. Có thể mở rộng lên ~80M nếu bị underfit.
     input_dim: int = 32                # Số chiều Slat token - BẮT BUỘC KHỚP với SC-VAE latent_dim
+    # Per-channel slat normalization (TRELLIS.2 style — CRITICAL):
+    # SC-VAE latent std~0.36 vs noise std=1.0 → SNR thấp → identity collapse.
+    # Apply (slat - mean) / std trước khi train, reverse khi decode.
+    # Stats được tính 1 lần bằng scripts/compute_slat_stats.py, lưu shape [32] mean+std.
+    slat_stats_path: Optional[str] = "data/slat_stats.pt"
     hidden_dims: List[int] = field(default_factory=lambda: [160, 320, 640])  # Tỉ lệ cân đối
     num_bottleneck_layers: int = 6      # Tăng từ 4 lên để tăng khả năng của khối attention
     context_dim: int = 946             # Ngữ cảnh Lai v4.1 (ArcFace 512 + FLAME 50 + DINOv2_Back 384)

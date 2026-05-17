@@ -791,6 +791,7 @@ def _build_stage2_model_config(model: nn.Module, imf_cfg, model_input_dim: int) 
             "input_dim": int(model_input_dim),
             "context_dim": int(getattr(imf_cfg, "context_dim", 946)),
             "slat_length": int(getattr(imf_cfg, "slat_length", 4096)),
+            "slat_stats_path": getattr(imf_cfg, "slat_stats_path", None),
             "hidden_dim": int(getattr(model, "hidden_dim", getattr(imf_cfg, "mamba_hidden_dim", 512))),
             "num_layers": int(getattr(imf_cfg, "mamba_num_layers", 12)),
             "backend": str(getattr(model, "backend", getattr(imf_cfg, "voxel_mamba_backend", "auto"))),
@@ -811,6 +812,7 @@ def _build_stage2_model_config(model: nn.Module, imf_cfg, model_input_dim: int) 
         "input_dim": int(model_input_dim),
         "context_dim": int(getattr(imf_cfg, "context_dim", 946)),
         "slat_length": int(getattr(imf_cfg, "slat_length", 4096)),
+        "slat_stats_path": getattr(imf_cfg, "slat_stats_path", None),
         "hidden_dims": list(getattr(model, "hidden_dims", getattr(imf_cfg, "hidden_dims", [160, 320, 640]))),
         "num_bottleneck_layers": int(getattr(model, "num_bottleneck_layers", getattr(imf_cfg, "num_bottleneck_layers", 6))),
         "num_context_tokens": int(getattr(model, "num_context_tokens", 8)),
@@ -1339,6 +1341,21 @@ def train_imf(
     else:
         global_step = start_epoch * len(dataloader)
     
+    # ---- Slat normalization stats (per-channel mean/std, TRELLIS.2-style) ----
+    slat_norm_mean = None
+    slat_norm_std = None
+    slat_stats_path = getattr(imf_cfg, "slat_stats_path", None)
+    if slat_stats_path and os.path.exists(slat_stats_path):
+        _stats = torch.load(slat_stats_path, map_location="cpu", weights_only=False)
+        slat_norm_mean = _stats["mean"].to(device).view(1, 1, -1).contiguous()  # [1, 1, 32]
+        slat_norm_std = _stats["std"].to(device).view(1, 1, -1).contiguous()    # [1, 1, 32]
+        print(f"[Slat Norm] Loaded {slat_stats_path}: "
+              f"mean range [{slat_norm_mean.min().item():.4f}, {slat_norm_mean.max().item():.4f}], "
+              f"std range [{slat_norm_std.min().item():.4f}, {slat_norm_std.max().item():.4f}]")
+    else:
+        print(f"[Slat Norm] DISABLED: slat_stats_path={slat_stats_path} not found. "
+              f"Training without slat normalization (risk of identity collapse).")
+
     # ---- Training ----
     print(f"\n[4/5] Training for {imf_cfg.num_epochs} epochs...")
     os.makedirs(imf_cfg.checkpoint_dir, exist_ok=True)
@@ -1361,6 +1378,11 @@ def train_imf(
             # contexts: [B, 512]
             slat_targets = slat_targets.to(device, non_blocking=True)
             contexts = contexts.to(device, non_blocking=True)
+
+            # Per-channel normalize (TRELLIS.2-style): (slat - mean) / std → tránh
+            # identity collapse khi raw slat std=0.36 << noise std=1.0.
+            if slat_norm_mean is not None and slat_norm_std is not None:
+                slat_targets = (slat_targets - slat_norm_mean) / slat_norm_std
 
             is_accum_step = (batch_idx + 1) % grad_accum_steps != 0
 
@@ -1433,7 +1455,7 @@ def train_imf(
                     flush=True,
                 )
 
-            if imf_cfg.save_every_steps > 0 and global_step > 0 and global_step % int(imf_cfg.save_every_steps) == 0:
+            if (not is_accum_step or (batch_idx + 1) == len(dataloader)) and imf_cfg.save_every_steps > 0 and global_step > 0 and global_step % int(imf_cfg.save_every_steps) == 0:
                 save_checkpoint(
                     model,
                     optimizer,
@@ -1449,8 +1471,8 @@ def train_imf(
                     best_loss=min(float(best_loss), float(loss.item() * grad_accum_steps)),
                 )
 
-            # WandB step logging
-            if cfg.wandb.enabled and WANDB_AVAILABLE and global_step > 0 and global_step % cfg.wandb.log_every_steps == 0:
+            # WandB step logging (also guard behind optimizer step)
+            if (not is_accum_step or (batch_idx + 1) == len(dataloader)) and cfg.wandb.enabled and WANDB_AVAILABLE and global_step > 0 and global_step % cfg.wandb.log_every_steps == 0:
                 step_payload = {
                     "train/velocity_loss": loss.item() * grad_accum_steps,
                     "train/lr": optimizer.param_groups[0]['lr'],
