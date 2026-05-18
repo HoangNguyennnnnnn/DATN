@@ -123,8 +123,8 @@ Thumbs.db
 *.bak
 *.orig
 
-# ── Papers / Docs binaries (large reference PDFs, không push) ──
-docs/papers/
+# ── Papers / Docs (reference PDFs + thesis drafts, không push) ──
+docs/
 *.pdf
 
 # ── Keep these ──
