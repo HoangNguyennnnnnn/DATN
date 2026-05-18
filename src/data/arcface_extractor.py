@@ -148,6 +148,32 @@ class ArcFaceExtractor:
         
         return embedding
     
+    @torch.no_grad()
+    def detect_face(self, img_rgb_np: np.ndarray) -> Optional[dict]:
+        """Detect khuôn mặt lớn nhất trong ảnh, trả bbox + landmarks + embedding.
+
+        Args:
+            img_rgb_np: ảnh numpy RGB uint8 shape [H, W, 3].
+
+        Returns:
+            {bbox: [x1, y1, x2, y2], kps: [[x, y]×5], embedding: tensor[512]} hoặc None
+            nếu không detect được face (hoặc đang ở chế độ fallback).
+        """
+        if self.mode != "insightface":
+            return None
+        img_bgr = img_rgb_np[..., ::-1].copy()
+        faces = self.app.get(img_bgr)
+        if not faces:
+            return None
+        face = max(faces, key=lambda f: (f.bbox[2] - f.bbox[0]) * (f.bbox[3] - f.bbox[1]))
+        emb = torch.tensor(face.embedding, dtype=torch.float32, device=self.device)
+        emb = F.normalize(emb.unsqueeze(0), p=2, dim=-1).squeeze(0)
+        return {
+            "bbox": [float(x) for x in face.bbox],
+            "kps": [[float(p[0]), float(p[1])] for p in face.kps],
+            "embedding": emb,
+        }
+
     def _extract_insightface(self, img_tensor: torch.Tensor) -> torch.Tensor:
         """
         Sử dụng thời gian chạy ONNX (ONNX runtime) của InsightFace để trích xuất embedding.
