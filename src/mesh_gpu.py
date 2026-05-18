@@ -98,7 +98,14 @@ def gpu_taubin_smooth(
     assert verts.ndim == 2 and verts.shape[-1] == 3
     assert faces.ndim == 2 and faces.shape[-1] == 3
     device = verts.device
+    orig_dtype = verts.dtype
     V = verts.shape[0]
+
+    # Edge case: empty mesh — không có gì để smooth
+    if V == 0 or faces.shape[0] == 0:
+        return verts.clone()
+
+    # Force FP32 cho sparse mm (sparse ops không robust với fp16/bf16 trên CUDA)
     faces = faces.long().to(device)
 
     # Build symmetric edge list từ 3 cạnh của mỗi face
@@ -113,12 +120,12 @@ def gpu_taubin_smooth(
     dst_u = key_unique % V
 
     indices = torch.stack([src_u, dst_u], dim=0)
-    values = torch.ones(indices.shape[1], device=device, dtype=verts.dtype)
+    values = torch.ones(indices.shape[1], device=device, dtype=torch.float32)
     adj = torch.sparse_coo_tensor(indices, values, (V, V)).coalesce()
 
     deg = torch.sparse.sum(adj, dim=1).to_dense().clamp_min(1.0).unsqueeze(-1)
 
-    out = verts.clone().contiguous()
+    out = verts.float().clone().contiguous()  # force FP32 for sparse mm
     for _ in range(iters):
         # λ shrink: out += lam * (avg_neighbor - out)
         neigh = torch.sparse.mm(adj, out) / deg
@@ -126,7 +133,7 @@ def gpu_taubin_smooth(
         # μ inflate: out += mu * (avg_neighbor - out)
         neigh = torch.sparse.mm(adj, out) / deg
         out = out + mu * (neigh - out)
-    return out
+    return out.to(orig_dtype)
 
 
 @torch.no_grad()
@@ -143,6 +150,8 @@ def gpu_dedup_faces(faces: torch.Tensor) -> torch.Tensor:
     """
     assert faces.ndim == 2 and faces.shape[-1] == 3
     device = faces.device
+    if faces.numel() == 0:
+        return faces  # empty input → return as-is
     f = faces.long()
     f_sorted, _ = f.sort(dim=1)
 

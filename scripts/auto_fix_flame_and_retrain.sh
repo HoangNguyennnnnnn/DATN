@@ -42,6 +42,16 @@ mkdir -p checkpoints/imf_unet
 echo "  Backed up to: ${BACKUP_DIR}"
 du -sh "${BACKUP_DIR}"/* 2>/dev/null | head -5
 
+# Nếu BACKUP_DIR/slat_context.lmdb không tồn tại (re-run sau khi đã backup từ trước),
+# tìm backup folder cũ nhất có slat_context.lmdb → dùng cho step 4 remix
+if [ ! -d "${BACKUP_DIR}/slat_context.lmdb" ]; then
+    PREV_BACKUP=$(ls -td data/backup_broken_flame_*/slat_context.lmdb 2>/dev/null | head -1 | xargs dirname 2>/dev/null)
+    if [ -n "${PREV_BACKUP}" ] && [ -d "${PREV_BACKUP}/slat_context.lmdb" ]; then
+        echo "  [INFO] No fresh slat backup in ${BACKUP_DIR}; using previous: ${PREV_BACKUP}"
+        BACKUP_DIR="${PREV_BACKUP}"
+    fi
+fi
+
 # === Step 2: Smoke test new FLAME ===
 echo ""
 echo "[2/5] Smoke testing new MediaPipe FLAME adapter..."

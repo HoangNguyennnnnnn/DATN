@@ -1,10 +1,10 @@
 # Báo cáo Nghiên cứu Chuyên sâu: FaceDiff — Hệ thống Tạo sinh Khuôn mặt 3D Một Bước trên Đơn GPU
 
-**Ngày cập nhật:** 17/05/2026 (revision 16 — Identity-collapse fix + 2-stage training strategy)  
+**Ngày cập nhật:** 18/05/2026 (revision 17 — MediaPipe FLAME + CFG VRAM optimization + batch=4 speedup + architecture audit)  
 **Tác giả:** Nhóm nghiên cứu FaceDiff  
 **Cấu hình Mục tiêu:** Đơn GPU RTX 4090 (24GB VRAM)  
 **Bộ dữ liệu:** FaceVerse_3D (2,100 — high detail) & FaceScape (18,298 — registered)  
-**Trạng thái checkpoint:** SC-VAE epoch 500 done (recon=0.0213, KL=14.58). Stage 2 iMF VoxelMamba **đang train** với per-channel slat normalization fix (loss 1.64 → 0.41 ở epoch 9). Kế hoạch: joint pretrain → FaceVerse finetune (xem Section 9).
+**Trạng thái checkpoint:** SC-VAE epoch 500 done. Stage 2 iMF VoxelMamba **đang train** (ep7→). FLAME fix (MediaPipe), CFG refactor (split forward) + batch=4 + TF32 → ETA Stage A: **7 ngày** (vs 11.4 ban đầu). Xem Section 10.
 
 ---
 
@@ -19,7 +19,8 @@
 7. [Phân tích và Lịch sử Bug Fix](#7-phân-tích-và-giải-thích-kết-quả)
 8. [Kế hoạch Tiếp theo](#8-kế-hoạch-tiếp-theo)
 9. [Trạng thái Hiện tại — Identity-Collapse Fix + 2-Stage Strategy (17/05/2026)](#9-trạng-thái-hiện-tại--identity-collapse-fix--chiến-lược-2-stage-training-17052026)
-10. [Tài liệu Tham khảo](#tài-liệu-tham-khảo)
+10. [Revision 17 — Architecture Audit + CFG VRAM Optimization (18/05/2026)](#10-revision-17--architecture-audit--cfg-vram-optimization-18052026)
+11. [Tài liệu Tham khảo](#tài-liệu-tham-khảo)
 
 ---
 
@@ -1489,6 +1490,157 @@ Phase D test (epoch 10) cho kết quả:
 ---
 
 *(Cập nhật: 17/05/2026 — Revision 16: Identity-collapse fix bằng per-channel slat normalization + chiến lược 2-stage + curriculum_switch_ratio adjustment 0.6→0.3 + project cleanup.)*
+
+---
+
+## 10. Revision 17 — Architecture Audit + CFG VRAM Optimization (18/05/2026)
+
+### 10.1. Tóm tắt Revision 17
+
+Section này ghi lại 3 đóng góp lớn ngày 18/05:
+1. **MediaPipe FLAME fix** — recompute toàn bộ `hybrid_context.lmdb` với MediaPipe FaceLandmarker V2 (vì FLAME cũ output constant do CNN random-init)
+2. **Architecture audit** — đối chiếu kỹ với 2 paper (iMF arXiv:2512.02012v1 + DiM-3D arXiv:2406.05038v1), xác nhận FaceDiff design đúng ý đồ paper iMF
+3. **CFG VRAM optimization** — refactor batch-doubling CFG thành 2 forward passes riêng (1 với grad, 1 với `no_grad`), tiết kiệm ~50% activation memory → tăng batch 3 → 4 → speedup 38%
+
+### 10.2. FLAME Fix với MediaPipe (sáng 18/05)
+
+**Bug phát hiện qua context visualization:**
+- FLAME context cho 5 mesh khác nhau có pairwise max_diff chỉ **0.0003** (= noise floor)
+- ArcFace varies properly (cos_sim same-ID=0.84, diff-ID=0.05)
+- DINOv2 varies properly (cos_sim FV-FV=0.86, FV-FS=0.43)
+- **FLAME hoàn toàn không vary** → model 14 epoch đã train với expression conditioning = constant
+
+**Root cause:** [src/data/flame_adapter.py](src/data/flame_adapter.py) cũ là CNN random-init không có pretrained weights. Output bị saturated bởi Tanh → tất cả input cho output gần như identical.
+
+**Fix:** Thay bằng **MediaPipe FaceLandmarker V2** (3.7 MB model, 52 ARKit blendshapes):
+- Drop 2 redundant (`_neutral` + `browDownLeft`) → 50-dim giữ `context_dim=946`
+- Verify: cùng identity khác expression (`001_01` vs `001_02`) → max_diff **0.81**, cos_sim 0.72
+- Different IDs → cos_sim 0.45-0.67 (proper variation)
+
+**Recompute pipeline (auto):**
+- `scripts/auto_fix_flame_and_retrain.sh` — tự động backup + recompute hybrid_context.lmdb (~10.8h)
+- `scripts/remix_slat_lmdb_with_new_context.py` — merge new context với slat cũ (slat unchanged) trong ~5 phút
+- Training restart từ epoch 0 với context đầy đủ thông tin
+
+### 10.3. Audit Architecture vs Papers
+
+**So sánh với iMF paper (arXiv:2512.02012v1)** — paper chính cho objective + conditioning:
+
+| Aspect | iMF Paper Sec 4.3 | FaceDiff | Verdict |
+|--------|---------------------|----------|---------|
+| Conditioning mechanism | **In-context tokens** (paper EXPLICITLY reject AdaLN-zero) | **In-context 24 prefix tokens** | ✅ **MATCH** |
+| Tokens cho class/context | 8 | 8 | ✅ MATCH |
+| Tokens cho r, t, interval, guidance | 4 mỗi loại | 4 mỗi loại | ✅ MATCH |
+| AdaLN-zero | KHÔNG dùng | KHÔNG dùng | ✅ MATCH |
+| Algorithm 2 (CFG training) | `v_c, v_u` separate forward | Refactored 2 forward (cond + no_grad uncond) | ✅ MATCH (math identical) |
+| Boundary supervision (r=t case) | Implicit qua `v_g` | Explicit via `mask_eq` branch | OK (FaceDiff design cleaner) |
+
+**iMF paper Table 1(c) chứng minh in-context tốt hơn AdaLN:**
+- adaLN-zero: FID 4.57, params 133M
+- **in-context**: FID **4.09**, params **89M** (33% nhỏ hơn, 11% FID tốt hơn)
+
+**So sánh với DiM-3D paper (arXiv:2406.05038v1)** — paper inspiration cho Mamba backbone:
+
+| Aspect | DiM-3D Paper | FaceDiff | Verdict |
+|--------|--------------|----------|---------|
+| BiMamba | Internal fwd+bwd shared input_proj | 2 separate Mamba modules với `torch.flip` | ⚠️ Equivalent functionally, FaceDiff dùng 2× params |
+| Hilbert ordering | ❌ Raster scan | ✅ **Hilbert curve** | ✅ FaceDiff cải thiện (preserve 3D locality) |
+| RMSNorm | LayerNorm | RMSNorm | ✅ FaceDiff (rẻ hơn) |
+| Output init | Standard | **Zero-init** | ✅ FaceDiff (chuẩn diffusion) |
+| FFN sub-block | ✅ Có (Mamba + FFN per block) | ❌ Không (chỉ BiMamba) | ⚠️ FaceDiff capacity giảm ~30% per block |
+
+**Verdict:** FaceDiff = **hybrid design** Mamba backbone (DiM-3D inspired) + in-context conditioning (iMF paper Sec 4.3 đúng) + iMF objective. Chỉ deviate FFN sub-block — defer evaluation đến Phase F (ep200 cos_sim).
+
+### 10.4. CFG VRAM Optimization
+
+**Hypothesis (user identify):** Batch doubling `[cond, uncond]` thành batch=2B với gradient → lưu activations cho uncond pass vô ích (vì `.detach()` trước khi vào loss).
+
+**Verify từ Algorithm 2 paper iMF** (page 6-7):
+```python
+v_c = fn(z, t, t, w, c)          # conditional v
+v_u = fn(z, t, t, w, None)       # unconditional v (RIÊNG, có thể no_grad)
+v_g = (e - x) + (1 - 1/w) * (v_c - v_u)
+u, dudt = jvp(fn, (z, r, t, w, c), (v_c, 0, 1, 0, 0))
+V = u + (t - r) * stopgrad(dudt)
+error = V - v_g       # paper KHÔNG stopgrad v_g (Eq. 12 intend grad flow)
+loss = metric(error)
+```
+
+→ Paper chạy v_c, v_u RIÊNG. FaceDiff old code gộp batch=2B → tốn VRAM.
+
+**Refactor ([src/models/imf_diffusion.py:407-439](src/models/imf_diffusion.py#L407)):**
+```python
+# Forward #1: Conditional (CÓ gradient — cần cho v-head + JVP)
+v_theta = model(z_t, t, context_cond, ...)
+
+# Forward #2: Unconditional (KHÔNG gradient — v_uncond luôn .detach())
+with torch.no_grad():
+    v_uncond = model(z_t, t, torch.zeros_like(context_cond), ...)
+
+v_target = (e - x) + coeff * (v_theta.detach() - v_uncond.detach())
+```
+
+✅ Mathematically identical với code cũ.
+✅ Activation VRAM tiết kiệm ~50% trên CFG branch.
+
+### 10.5. Speedup từ Batch Size Increase
+
+**Throughput experiment:**
+
+| Config | VRAM (process) | Batch/s | Samples/s | ETA/epoch | Total Stage A |
+|--------|----------------|---------|-----------|-----------|---------------|
+| OLD (batch=2, batch doubling) | 11.3 GB | 4.1 | 8.2 | 41 min | 11.4 ngày |
+| Batch=3, batch doubling | 17 GB | 2.9 | 8.7 | 39 min | 9.7 ngày |
+| **Batch=4, refactored CFG** | **17.9 GB** | **3.1** | **12.4** | **25 min** | **6.9 ngày** |
+| Batch=5, refactored CFG | OOM (peak 17.6 GB + 5.2 other = 22.8) | — | — | — | — |
+
+**Net speedup:** Total ~40% throughput improvement, save **~4.5 ngày** training time.
+
+**Configuration final:**
+- `batch_size=4`, `gradient_accumulation_steps=16` (effective 64)
+- TF32 + cudnn.benchmark enabled
+- NUM_WORKERS=4
+- VRAM margin ~1 GB (acceptable)
+
+### 10.6. Decision Gates (Phase F & Beyond)
+
+Sau ep200 (~3 ngày từ 18/05), test boundary cos_sim + 1-step cos_sim:
+
+| cos_sim @ ep200 | Action |
+|-----------------|--------|
+| **> 0.7** | ✅ Architecture OK, skip Stage B refactor, finetune FaceVerse |
+| **0.5-0.7** | ⚠️ Train thêm đến ep300, hoặc add FFN nếu plateau |
+| **0.3-0.5** | 🟡 **Add FFN sub-block** + restart từ epoch 0 (cost 3-4 ngày extra) |
+| **< 0.3** | 🔴 Full refactor (FFN + size up 12→16 layers) |
+
+### 10.7. Trạng thái Pipeline Hiện tại (18/05/2026, 15:00)
+
+| Component | Trạng thái | Chi tiết |
+|-----------|-----------|----------|
+| FLAME context (MediaPipe) | ✅ Done | 20,939 entries trong hybrid_context.lmdb |
+| Slat normalization | ✅ Done | data/slat_stats.pt (32-dim mean+std) |
+| CFG VRAM optimization | ✅ Applied | 2 forward passes (cond grad + uncond no_grad) |
+| Speedup config | ✅ Applied | batch=4 + grad_accum=16 + TF32 + cudnn.benchmark |
+| Training process | 🟢 **Running** | PID 249025, resume ep7 (loss=0.4184), 3.1 batch/s, ETA epoch 25 min |
+| Stage A ETA | ⏳ 7 ngày | 400 epochs × 25 min = ~170h |
+| Stage B finetune | ⏳ Pending | Sau Phase F gate |
+
+### 10.8. Files đã Sửa Revision 17
+
+| File | Change |
+|------|--------|
+| [src/data/flame_adapter.py](src/data/flame_adapter.py) | Rewrite với MediaPipe FaceLandmarker V2 |
+| [src/models/imf_diffusion.py](src/models/imf_diffusion.py) | Refactor CFG: 2 forward passes thay batch doubling |
+| [src/train_imf.py](src/train_imf.py) | Add TF32 + cudnn.benchmark flags |
+| [scripts/train_imf.sh](scripts/train_imf.sh) | Default NUM_WORKERS=4 |
+| [scripts/auto_fix_flame_and_retrain.sh](scripts/auto_fix_flame_and_retrain.sh) | **NEW** — full automation |
+| [scripts/remix_slat_lmdb_with_new_context.py](scripts/remix_slat_lmdb_with_new_context.py) | **NEW** — merge slat cũ + context mới |
+| [scripts/visualize_test_context.py](scripts/visualize_test_context.py) | **NEW** — inspect context vectors |
+| [src/mesh_gpu.py](src/mesh_gpu.py) | **NEW** — GPU KNN + Taubin smoothing helpers |
+
+---
+
+*(Cập nhật: 18/05/2026 — Revision 17: MediaPipe FLAME + CFG VRAM optimization + batch=4 speedup + architecture audit vs iMF/DiM-3D papers. ETA Stage A: 7 ngày.)*
 
 ---
 

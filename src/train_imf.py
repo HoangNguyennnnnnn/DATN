@@ -32,6 +32,13 @@ import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, Dataset
 
+# Speedup flags (zero quality impact với bf16 autocast workflow):
+# - TF32: ép fp32 matmul dùng tensor cores (chỉ ảnh hưởng fp32 ops ngoài autocast)
+# - cudnn.benchmark: auto-tune kernel cho input shapes ổn định
+torch.backends.cuda.matmul.allow_tf32 = True
+torch.backends.cudnn.allow_tf32 = True
+torch.backends.cudnn.benchmark = True
+
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from src.config import TrainConfig

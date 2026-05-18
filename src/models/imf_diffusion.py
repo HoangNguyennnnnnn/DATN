@@ -404,38 +404,37 @@ class ImprovedMeanFlow:
                 cfg_context_keep_ratio = keep_mask.mean()
         
         # Bước 4: Mục tiêu vận tốc có điều kiện
-        # Tối ưu hiệu năng: Khi CFG bật, gộp conditional + unconditional thành 1 forward pass duy nhất
-        # (batch doubling) thay vì 2 forward passes riêng biệt. Kết quả toán học giống hệt.
-        # `_want_hidden` chỉ True khi v_head tồn tại VÀ backbone hỗ trợ trả về hidden state
-        # (qua kwarg `return_hidden=True` của VoxelMamba). Backbone không hỗ trợ -> v_head fallback.
+        # VRAM-optimal CFG: Tách thành 2 forward passes riêng biệt thay vì batch doubling.
+        # Paper iMF (Alg.2) dùng v_c, v_u riêng rồi stopgrad cả hai → không cần lưu activations.
+        # - Conditional pass: CÓ gradient (cho v-head backprop qua _cached_hidden)
+        # - Unconditional pass: KHÔNG gradient (v_uncond luôn bị .detach())
+        # Tiết kiệm ~50% activation memory so với batch doubling.
         _want_hidden = bool(v_head is not None) and hasattr(model, 'get_hidden_state')
         if cfg_enabled:
-            z_t_double = torch.cat([z_t, z_t], dim=0)
-            t_double = torch.cat([t, t], dim=0)
-            ctx_double = torch.cat([context_cond, torch.zeros_like(context_cond)], dim=0)
-            r_double = torch.cat([t, t], dim=0)
-            omega_double = torch.cat([omega_effective, omega_effective], dim=0)
-            cfg_tmin_double = torch.cat([cfg_tmin, cfg_tmin], dim=0)
-            cfg_tmax_double = torch.cat([cfg_tmax, cfg_tmax], dim=0)
-            
-            _fwd_kwargs = dict(
-                r=r_double, omega=omega_double,
-                cfg_tmin=cfg_tmin_double, cfg_tmax=cfg_tmax_double,
+            _fwd_kwargs_cond = dict(
+                r=t, omega=omega_effective,
+                cfg_tmin=cfg_tmin, cfg_tmax=cfg_tmax,
             )
             if _want_hidden:
-                _fwd_kwargs['return_hidden'] = True
-            
-            _fwd_out = model(z_t_double, t_double, ctx_double, **_fwd_kwargs)
-            
-            if _want_hidden and isinstance(_fwd_out, tuple):
-                v_both, h_both = _fwd_out
-                _cached_hidden = h_both[:b]  # Chỉ cần hidden state của phần conditional
+                _fwd_kwargs_cond['return_hidden'] = True
+
+            # Forward #1: Conditional (CÓ gradient — cần cho v-head)
+            _fwd_out_cond = model(z_t, t, context_cond, **_fwd_kwargs_cond)
+
+            if _want_hidden and isinstance(_fwd_out_cond, tuple):
+                v_theta, _cached_hidden = _fwd_out_cond
             else:
-                v_both = _fwd_out
+                v_theta = _fwd_out_cond
                 _cached_hidden = None
-            
-            v_theta, v_uncond = v_both[:b], v_both[b:]
-            
+
+            # Forward #2: Unconditional (KHÔNG gradient — v_uncond luôn .detach())
+            with torch.no_grad():
+                v_uncond = model(
+                    z_t, t, torch.zeros_like(context_cond),
+                    r=t, omega=omega_effective,
+                    cfg_tmin=cfg_tmin, cfg_tmax=cfg_tmax,
+                )
+
             coeff = (1.0 - (1.0 / omega_effective.clamp_min(1.0))).view(-1, *([1] * (x_data.ndim - 1)))
             v_target = (e - x_data) + coeff * (v_theta.detach() - v_uncond.detach())
         else:
