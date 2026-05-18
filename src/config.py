@@ -248,15 +248,15 @@ class IMFConfig:
     batch_size: int = 16               # Micro-batch trên GPU (giảm cho 17GB VRAM)
     gradient_accumulation_steps: int = 4  # Effective batch = batch_size × grad_accum = 64
     num_epochs: int = 400              # Khuyên dùng Early stopping (giám sát mất mát trên tập xác thực)
-    learning_rate: float = 2e-4        # Tăng LR lên 2e-4 bù đắp cho batch_size x2
-    weight_decay: float = 1e-5
+    learning_rate: float = 1e-4        # Paper iMF Table 4: lr=1e-4
+    weight_decay: float = 0.0          # Paper Table 4: weight_decay=0
     lr_warmup_steps: int = 1000
-    lr_scheduler: str = "cosine"
+    lr_scheduler: str = "constant"     # Paper Table 4: lr schedule = constant
     
     # Đặc tả iMF (arXiv:2512.02012v1 — Geng et al., Improved Mean Flows)
     sigma_min: float = 1e-4            # Biên độ nhiễu tối thiểu
     ratio_r_neq_t: float = 0.5        # 50% mẫu dùng JVP (r≠t), 50% dùng điều kiện biên (r=t)
-    t_sampler: str = "curriculum"      # Paper Tab.4: logit-normal(−0.4,1); curriculum = giai đoạn logit-normal + pha uniform
+    t_sampler: str = "logit_normal"    # Paper Table 4: logit-normal(−0.4, 1.0) — KHÔNG dùng curriculum
     t_loc: float = -0.4               # Trung bình logit-normal (Giai đoạn 1: thiên vị ở giữa)
     t_scale: float = 1.0              # Tỉ lệ logit-normal
     curriculum_switch_ratio: float = 0.3   # Compromise 0.6→0.3 (17/05): switch ở 30% (epoch 120) — balance giữa boundary stability và 1-step learning
@@ -267,6 +267,8 @@ class IMFConfig:
     use_v_loss: bool = True              # Dùng v-loss thay vì u-loss (huấn luyện ổn định hơn)
     use_auxiliary_v_head: bool = True    # Dùng khối v-head phụ trợ để dự đoán vận tốc cận biên
     v_head_dim: int = 512               # Chiều ẩn cho khối phụ trợ v-head
+    v_head_depth: int = 8                # Paper Table 4: aux-head depth = 8 (cũ: 2-layer MLP)
+    v_head_mlp_ratio: int = 4            # MLP expansion ratio trong v-head block
     v_loss_weight: float = 0.1           # Trọng số auxiliary v-head loss; khớp objective đang dùng trong iMF paper impl
     cfg_omega_min: float = 1.0              # Cận dưới thang điều hướng (1.0 = không điều hướng)
     cfg_omega_max: float = 8.0              # Cận trên thang điều hướng
@@ -274,9 +276,9 @@ class IMFConfig:
     cfg_context_dropout: float = 0.1        # Loại bỏ các ngữ cảnh điều kiện để học nhánh vô điều kiện ổn định
     cfg_interval_conditioning: bool = True  # Điều kiện hóa trên đoạn [tmin, tmax] giống trong phụ lục iMF
     adaptive_loss_weighting: bool = True    # iMF Appendix A: per-bin EMA reweighting cho main + v-head loss
-    ema_decay: float = 0.9995          # Giảm xuống nhẹ để thích nghi tốt hơn với 20K mẫu
+    ema_decay: float = 0.9999          # Paper Table 4: ema_decay = 0.9999
     use_ema: bool = True               # EMA cải thiện chất lượng lấy mẫu
-    dropout: float = 0.05              # Bổ sung một chút dropout để tránh overfit đối với 20K mẫu
+    dropout: float = 0.0               # Paper Table 4: dropout = 0
     
     # Điểm kiểm tra
     checkpoint_dir: str = "checkpoints/imf_unet"

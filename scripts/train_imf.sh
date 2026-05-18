@@ -14,10 +14,11 @@ conda activate facediff
 
 BATCH_SIZE="${BATCH_SIZE:-2}"
 GRAD_ACCUM="${GRAD_ACCUM:-32}"
-LR="${LR:-2e-4}"
+LR="${LR:-1e-4}"  # Paper iMF Table 4
 EPOCHS="${EPOCHS:-400}"
 NUM_WORKERS="${NUM_WORKERS:-4}"   # Parallel LMDB I/O — GPU không phải đợi (SlatDataset lazy re-open trong worker)
 RESUME="${RESUME:-checkpoints/imf_unet/best.pt}"
+RESUME_MODEL_ONLY="${RESUME_MODEL_ONLY:-0}"  # 1 = skip optimizer/scheduler/scaler/EMA state (paper-aligned restart)
 SC_VAE_CKPT="${SC_VAE_CKPT:-checkpoints/sc_vae_shape/epoch_500.pt}"
 
 # Use LMDB only when pack finished (avoid partial/corrupt DB during pack_slat_lmdb.py)
@@ -58,6 +59,10 @@ export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 RESUME_ARGS=()
 if [ -n "${RESUME}" ] && [ -f "${RESUME}" ]; then
   RESUME_ARGS=(--resume "${RESUME}")
+  if [ "${RESUME_MODEL_ONLY}" = "1" ]; then
+    RESUME_ARGS+=(--resume-model-only)
+    echo "  Resume mode: model-only (reset optimizer/scheduler/EMA)"
+  fi
 fi
 
 # Default: backgrounded via nohup so the process survives shell close / SIGHUP.

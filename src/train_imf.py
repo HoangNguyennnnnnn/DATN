@@ -869,7 +869,12 @@ def load_checkpoint(
     ckpt_v_head_state = ckpt.get('v_head_state_dict')
     if v_head is not None:
         if isinstance(ckpt_v_head_state, dict):
-            v_head.load_state_dict(ckpt_v_head_state)
+            try:
+                v_head.load_state_dict(ckpt_v_head_state, strict=True)
+            except (RuntimeError, ValueError) as e:
+                # Architecture changed (e.g., depth 2 → 8) → re-init fresh
+                print(f"  [Resume] v-head shape mismatch → re-init fresh: {e}")
+                downgrade_reasons.append("v-head architecture changed; re-init")
         else:
             downgrade_reasons.append("checkpoint missing v_head_state_dict")
     elif isinstance(ckpt_v_head_state, dict):
@@ -913,13 +918,18 @@ def load_checkpoint(
 
 
 def get_lr_scheduler(optimizer, cfg, steps_per_epoch: int = 100):
-    from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
+    from torch.optim.lr_scheduler import (
+        CosineAnnealingLR, LinearLR, SequentialLR, ConstantLR,
+    )
     warmup = LinearLR(optimizer, start_factor=0.01, total_iters=cfg.lr_warmup_steps)
-    # T_max is the remaining steps after warmup
-    total_steps = cfg.num_epochs * steps_per_epoch
-    t_max = max(1, total_steps - cfg.lr_warmup_steps)
-    cosine = CosineAnnealingLR(optimizer, T_max=t_max, eta_min=1e-7)
-    return SequentialLR(optimizer, [warmup, cosine], milestones=[cfg.lr_warmup_steps])
+    if str(getattr(cfg, "lr_scheduler", "cosine")).lower() == "constant":
+        # Paper iMF Table 4: lr schedule = constant (LR giữ base_lr sau warmup)
+        main = ConstantLR(optimizer, factor=1.0, total_iters=10**9)
+    else:
+        total_steps = cfg.num_epochs * steps_per_epoch
+        t_max = max(1, total_steps - cfg.lr_warmup_steps)
+        main = CosineAnnealingLR(optimizer, T_max=t_max, eta_min=1e-7)
+    return SequentialLR(optimizer, [warmup, main], milestones=[cfg.lr_warmup_steps])
 
 
 # ============================================================
@@ -1224,24 +1234,27 @@ def train_imf(
         adaptive_loss_weighting=bool(getattr(imf_cfg, "adaptive_loss_weighting", True)),
     )
     
-    # ---- Auxiliary v-head (for v-loss) ----
+    # ---- Auxiliary v-head (for v-loss) — Paper iMF Table 4: depth=8 ----
     v_head = None
     if getattr(imf_cfg, "use_v_loss", True) and getattr(imf_cfg, "use_auxiliary_v_head", True):
         print("  [v-loss] Adding auxiliary v-head...")
-        v_head_dim = getattr(imf_cfg, "v_head_dim", 512)
         if stage2_model_config["arch"] == "voxel_mamba":
             model_hidden_dim = int(stage2_model_config["hidden_dim"])
         else:
             model_hidden_dim = int(stage2_model_config["hidden_dims"][0])
-        v_head = nn.Sequential(
-            nn.Linear(model_hidden_dim, v_head_dim),
-            nn.SiLU(),
-            nn.Linear(v_head_dim, model_input_dim)
+        v_head_depth = int(getattr(imf_cfg, "v_head_depth", 8))
+        v_head_mlp_ratio = int(getattr(imf_cfg, "v_head_mlp_ratio", 4))
+        from src.models.v_head import VHead
+        v_head = VHead(
+            hidden_dim=model_hidden_dim,
+            out_dim=model_input_dim,
+            depth=v_head_depth,
+            mlp_ratio=v_head_mlp_ratio,
         ).to(device)
-        # Khởi tạo bằng không (Zero initialization)
-        nn.init.zeros_(v_head[-1].weight)
-        nn.init.zeros_(v_head[-1].bias)
-        print(f"  [v-head] Hidden dim: {v_head_dim}, Output: {model_input_dim}")
+        v_head_params = sum(p.numel() for p in v_head.parameters())
+        print(f"  [v-head] depth={v_head_depth}, hidden={model_hidden_dim}, "
+              f"mlp_ratio={v_head_mlp_ratio}, out={model_input_dim}, "
+              f"params={v_head_params/1e6:.1f}M")
     
     param_count = sum(p.numel() for p in model.parameters() if p.requires_grad)
     if v_head is not None:
@@ -1266,7 +1279,9 @@ def train_imf(
     adamw_kwargs = {
         "lr": imf_cfg.learning_rate,
         "weight_decay": imf_cfg.weight_decay,
-        "betas": (0.9, 0.999),
+        # Paper iMF Table 4: Adam β=(0.9, 0.95). β2=0.95 phù hợp gradient noise
+        # cao của diffusion-style training (varying t → varying loss scale).
+        "betas": (0.9, 0.95),
     }
     
     # Thu thập tất cả các tham số (Collect all parameters)
