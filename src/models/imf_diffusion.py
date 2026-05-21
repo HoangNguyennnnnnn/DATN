@@ -145,21 +145,53 @@ class ImprovedMeanFlow:
     def _sample_t_r(self, batch_size: int, device: torch.device) -> Tuple[torch.Tensor, torch.Tensor]:
         """Sample (t, r) pairs theo paper convention r ≤ t.
 
-        Paper Geng et al. 2512.02012v1 — Tab. 4 ratio of r≠t = 50%; trong các
-        triển khai chính thống của MeanFlow / iMF (ví dụ Gsunshine/meanflow) hai
-        biến được sắp xếp sao cho ``r ≤ t`` để (t-r) ≥ 0 và mean velocity được
-        định hướng từ data → noise giống flow matching tuyến tính.
+        Paper Geng et al. 2512.02012v1 — Tab. 4 ratio of r≠t = 50%.
+
+        2026-05-21 v3 FIX: Two injection strategies for t≈1 coverage:
+
+        Strategy A — "near-boundary" (15%): Force t = 1-σ with r = t (boundary).
+        Teaches model velocity v(z_t, t≈1) = e-x via simple stable MSE.
+        For linear flow matching: v = e-x is constant, so this also teaches the
+        correct mean velocity u(z, 0, 1) = v = e-x.
+        Avoids JVP instability from (t-r)≈1.
+
+        Strategy B — "endpoint JVP" (5%): Force r=0, t=1-σ for JVP branch.
+        Teaches u(z, 0, 1) directly via compound function. Small percentage
+        limits exposure to JVP noise early in training.
+
+        Total: 50% boundary | 25% random JVP | 15% t≈1 boundary | 5% r=0,t≈1 | 5% r→0 JVP
         """
-        # Lấy mẫu t (logit-normal hoặc uniform), kẹp (clamp) tránh biên 0/1.
         t = self._sample_t(batch_size, device).clamp(self.sigma_min, 1.0 - self.sigma_min)
 
-        # Sample r ~ U[0, t] để bảo đảm r ≤ t (interval (t-r) ≥ 0 — paper convention).
+        # r candidates for JVP: r ~ U[0, t]
         u = torch.rand(batch_size, device=device)
         r_candidate = (u * t).clamp(0.0, 1.0 - self.sigma_min)
 
-        # 50% mẫu nhận r = t (boundary case, JVP coefficient triệt tiêu); còn lại r < t.
-        mask_neq = torch.rand(batch_size, device=device) < self.ratio_r_neq_t
-        r = torch.where(mask_neq, r_candidate, t)
+        # Multi-way split with dice roll
+        dice = torch.rand(batch_size, device=device)
+        # 0.00-0.15: near-boundary (r=t=1-σ, stable MSE at t≈1)
+        # 0.15-0.20: endpoint JVP (r=0, t=1-σ, direct mean-velocity learning)
+        # 0.20-0.50: random JVP (r<t, standard iMF)
+        # 0.50-1.00: boundary (r=t, standard v-loss)
+        near_boundary_mask = dice < 0.15
+        endpoint_jvp_mask = (dice >= 0.15) & (dice < 0.20)
+        random_jvp_mask = (dice >= 0.20) & (dice < self.ratio_r_neq_t)
+        boundary_mask = dice >= self.ratio_r_neq_t
+
+        # Default: random JVP
+        r = r_candidate.clone()
+
+        # Boundary: r = t
+        r = torch.where(boundary_mask, t, r)
+
+        # Near-boundary: force t=1-σ AND r=t (enters boundary branch → stable MSE)
+        t_near_one = torch.full_like(t, 1.0 - self.sigma_min)
+        t = torch.where(near_boundary_mask, t_near_one, t)
+        r = torch.where(near_boundary_mask, t_near_one, r)
+
+        # Endpoint JVP: r=0, t=1-σ (enters JVP branch — small % to limit instability)
+        r = torch.where(endpoint_jvp_mask, torch.zeros_like(r), r)
+        t = torch.where(endpoint_jvp_mask, t_near_one, t)
 
         return t, r
     
@@ -173,26 +205,35 @@ class ImprovedMeanFlow:
         t_exp = t.view(-1, *([1] * (x.ndim - 1)))
         return (1.0 - t_exp) * x + t_exp * e
 
+    def _slat_position_weights(self, x_data: torch.Tensor) -> torch.Tensor:
+        """Upweight non-zero slat rows (real voxels); mean weight = 1 per sample."""
+        occ = (x_data.norm(dim=-1) > 1e-6).to(dtype=x_data.dtype)
+        return occ / occ.mean(dim=-1, keepdim=True).clamp(min=1e-6)
+
     def _weighted_mse(
         self,
         pred: torch.Tensor,
         target: torch.Tensor,
         channel_weights: Optional[torch.Tensor],
+        position_weights: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        """MSE được đánh trọng số theo kênh trên chiều cuối cùng khi các trọng số được cung cấp."""
-        if channel_weights is None:
-            return F.mse_loss(pred, target)
-
-        w = channel_weights.view(*([1] * (pred.ndim - 1)), -1)
-        return ((pred - target) ** 2 * w).mean()
+        """MSE được đánh trọng số theo kênh và/hoặc vị trí token (slat occupancy)."""
+        diff2 = (pred - target) ** 2
+        if channel_weights is not None:
+            w = channel_weights.view(*([1] * (pred.ndim - 1)), -1)
+            diff2 = diff2 * w
+        if position_weights is not None:
+            diff2 = diff2 * position_weights.unsqueeze(-1)
+        return diff2.mean()
 
     def _per_sample_weighted_mse(
         self,
         pred: torch.Tensor,
         target: torch.Tensor,
         channel_weights: Optional[torch.Tensor],
+        position_weights: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        """Per-sample MSE with optional channel weighting.
+        """Per-sample MSE with optional channel and position weighting.
 
         Returns a tensor shaped [B] so adaptive weighting can be applied
         per sample/timestep instead of collapsing into a single scalar.
@@ -201,6 +242,8 @@ class ImprovedMeanFlow:
         if channel_weights is not None:
             w = channel_weights.view(*([1] * (pred.ndim - 1)), -1)
             diff2 = diff2 * w
+        if position_weights is not None:
+            diff2 = diff2 * position_weights.unsqueeze(-1)
         reduce_dims = tuple(range(1, pred.ndim))
         return diff2.mean(dim=reduce_dims)
 
@@ -321,6 +364,10 @@ class ImprovedMeanFlow:
         cfg_interval_conditioning: Optional[bool] = None,
         cfg_context_dropout: float = 0.1,
         v_loss_weight: float = 0.1,
+        ctx_classifier: Optional[nn.Module] = None,
+        contrastive_loss_weight: float = 0.0,
+        contrastive_temperature: float = 0.1,
+        occupancy_mask: Optional[torch.Tensor] = None,
         return_components: bool = False,
     ):
         """
@@ -361,6 +408,21 @@ class ImprovedMeanFlow:
                 channel_weights[shape_ch:] = float(max(0.0, material_loss_weight))
                 shape_slice = slice(0, shape_ch)
                 material_slice = slice(shape_ch, total_dim)
+
+        # FIX 2026-05-21 (Finding #2): x_data is NORMALIZED slat in training (zero rows
+        # become -mean/std, no longer ~0). Use external occupancy_mask computed BEFORE
+        # normalization. Fallback to legacy detection if mask not provided.
+        if occupancy_mask is not None:
+            position_weights = occupancy_mask.to(device=device, dtype=x_data.dtype)
+            if position_weights.ndim == 3 and position_weights.shape[-1] == 1:
+                position_weights = position_weights.squeeze(-1)
+            if position_weights.shape != x_data.shape[:2]:
+                raise ValueError(
+                    f"occupancy_mask shape {tuple(position_weights.shape)} must match x_data[:2] {tuple(x_data.shape[:2])}"
+                )
+            position_weights = position_weights / position_weights.mean(dim=-1, keepdim=True).clamp(min=1e-6)
+        else:
+            position_weights = self._slat_position_weights(x_data)
         
         # Bước 1: Lấy mẫu nhiễu
         e = torch.randn_like(x_data)
@@ -409,7 +471,10 @@ class ImprovedMeanFlow:
         # - Conditional pass: CÓ gradient (cho v-head backprop qua _cached_hidden)
         # - Unconditional pass: KHÔNG gradient (v_uncond luôn bị .detach())
         # Tiết kiệm ~50% activation memory so với batch doubling.
-        _want_hidden = bool(v_head is not None) and hasattr(model, 'get_hidden_state')
+        _want_hidden = (
+            (v_head is not None or (ctx_classifier is not None and float(contrastive_loss_weight) > 0.0))
+            and hasattr(model, 'get_hidden_state')
+        )
         if cfg_enabled:
             _fwd_kwargs_cond = dict(
                 r=t, omega=omega_effective,
@@ -505,7 +570,8 @@ class ImprovedMeanFlow:
             if _cached_hidden is not None:
                 # Tái sử dụng hidden state đã tính từ forward pass #1 (cùng input z_t, t, ctx, r=t)
                 v_head_pred = v_head(_cached_hidden)
-                per_sample_v_head = ((v_head_pred - raw_v_target) ** 2).mean(dim=tuple(range(1, v_head_pred.ndim)))
+                vh_diff2 = (v_head_pred - raw_v_target) ** 2 * position_weights.unsqueeze(-1)
+                per_sample_v_head = vh_diff2.mean(dim=tuple(range(1, v_head_pred.ndim)))
                 loss_v_head = per_sample_v_head.mean()
             elif hasattr(model, 'get_hidden_state'):
                 # Fallback: gọi get_hidden_state() nếu model không hỗ trợ return_hidden
@@ -517,7 +583,8 @@ class ImprovedMeanFlow:
                     cfg_tmax=cfg_tmax,
                 )
                 v_head_pred = v_head(h)
-                per_sample_v_head = ((v_head_pred - raw_v_target) ** 2).mean(dim=tuple(range(1, v_head_pred.ndim)))
+                vh_diff2 = (v_head_pred - raw_v_target) ** 2 * position_weights.unsqueeze(-1)
+                per_sample_v_head = vh_diff2.mean(dim=tuple(range(1, v_head_pred.ndim)))
                 loss_v_head = per_sample_v_head.mean()
             else:
                 raise RuntimeError(
@@ -525,15 +592,36 @@ class ImprovedMeanFlow:
                     "Implement get_hidden_state() or forward(..., return_hidden=True) on the backbone."
                 )
 
+        # Contrastive auxiliary loss (2026-05-20): force backbone hidden state ENCODE context.
+        # Diagnostic v8 ep14 phát hiện model degenerate "predict average magnitude" — loss giảm
+        # nhưng identity differentiation = 0. Standard MSE loss không pressure context conditioning.
+        # Solution: InfoNCE on (pooled_hidden → predicted_ctx) vs (true context). Force model
+        # backbone phải encode discriminative context info trong hidden state.
+        loss_contrastive = torch.zeros((), device=device)
+        if ctx_classifier is not None and contrastive_loss_weight > 0.0 and _cached_hidden is not None and b >= 2:
+            hidden_pooled = _cached_hidden.mean(dim=1)  # [B, hidden_dim]
+            pred_ctx = ctx_classifier(hidden_pooled)  # [B, context_dim]
+            pred_norm = F.normalize(pred_ctx, dim=-1)
+            target_norm = F.normalize(context.detach(), dim=-1)
+            # Similarity matrix: each pred vs all targets in batch
+            sim_matrix = pred_norm @ target_norm.t()  # [B, B]
+            sim_matrix = sim_matrix / max(contrastive_temperature, 1e-4)
+            labels = torch.arange(b, device=device)
+            loss_contrastive = F.cross_entropy(sim_matrix, labels)
+
         if mask_eq_all:
             # Tất cả đều là biên → hàm mất mát khớp luồng đơn giản
-            per_sample_boundary = self._per_sample_weighted_mse(v_theta, v_target_loss, channel_weights)
+            per_sample_boundary = self._per_sample_weighted_mse(
+                v_theta, v_target_loss, channel_weights, position_weights
+            )
             with torch.no_grad():
                 self._update_adaptive_ema(t, per_sample_boundary.detach())
             adaptive_w = self._get_adaptive_weights(t).detach()
             loss = (per_sample_boundary * adaptive_w).mean()
             if v_head is not None and per_sample_v_head is not None:
                 loss = loss + float(v_loss_weight) * (per_sample_v_head * adaptive_w).mean()
+            if contrastive_loss_weight > 0.0:
+                loss = loss + float(contrastive_loss_weight) * loss_contrastive
             loss_boundary = per_sample_boundary.mean()
             if return_components:
                 return {
@@ -543,6 +631,7 @@ class ImprovedMeanFlow:
                     "loss_shape": loss_shape.detach(),
                     "loss_material": loss_material.detach(),
                     "loss_v_head": loss_v_head.detach(),
+                    "loss_contrastive": loss_contrastive.detach(),
                     "material_supervision_keep_ratio": material_keep_ratio.detach(),
                     "cfg_context_keep_ratio": cfg_context_keep_ratio.detach(),
                     "adaptive_weight_scale": adaptive_w.mean().detach(),
@@ -614,27 +703,35 @@ class ImprovedMeanFlow:
         V = u_pred + t_minus_r * dudt.detach()  # dừng lan truyền ngược (stop_grad) trên dudt
         
         # Hàm mất mát JVP: ||V - v_target||²
-        loss_jvp = self._weighted_mse(V, v_target_jvp, channel_weights)
-        per_sample_jvp = self._per_sample_weighted_mse(V, v_target_jvp, channel_weights)
+        pos_jvp = position_weights[~mask_eq]
+        loss_jvp = self._weighted_mse(V, v_target_jvp, channel_weights, pos_jvp)
+        per_sample_jvp = self._per_sample_weighted_mse(V, v_target_jvp, channel_weights, pos_jvp)
         
         # Hàm mất mát biên (Boundary loss): ||v_theta - v_target||² (chỉ dành cho các mẫu có r=t)
         if mask_eq_any:
-            loss_boundary = self._weighted_mse(v_theta[mask_eq], v_target_loss[mask_eq], channel_weights)
-            per_sample_boundary = self._per_sample_weighted_mse(v_theta[mask_eq], v_target_loss[mask_eq], channel_weights)
+            pos_eq = position_weights[mask_eq]
+            loss_boundary = self._weighted_mse(
+                v_theta[mask_eq], v_target_loss[mask_eq], channel_weights, pos_eq
+            )
+            per_sample_boundary = self._per_sample_weighted_mse(
+                v_theta[mask_eq], v_target_loss[mask_eq], channel_weights, pos_eq
+            )
         else:
             loss_boundary = torch.tensor(0.0, device=device)
             per_sample_boundary = torch.zeros((0,), device=device)
         
         # --- Adaptive loss weighting (MeanFlow paper, iMF Appendix A) ---
-        # Compute per-sample loss for EMA update, then apply per-sample adaptive
-        # weighting to the actual optimization objective.
+        # CRITICAL FIX 2026-05-21: per_sample_raw MUST NOT be allocated inside torch.no_grad()
+        # — that detaches main boundary/JVP loss from gradient graph. EMA update uses detached
+        # copy explicitly to avoid contaminating model gradient.
+        per_sample_raw = torch.zeros(b, device=device, dtype=per_sample_jvp.dtype)
+        if mask_eq_any:
+            per_sample_raw[mask_eq] = per_sample_boundary
+        if (~mask_eq).any():
+            per_sample_raw[~mask_eq] = per_sample_jvp
+
         with torch.no_grad():
-            per_sample_raw = torch.zeros(b, device=device)
-            if mask_eq_any:
-                per_sample_raw[mask_eq] = per_sample_boundary
-            if (~mask_eq).any():
-                per_sample_raw[~mask_eq] = per_sample_jvp
-            self._update_adaptive_ema(t, per_sample_raw)
+            self._update_adaptive_ema(t, per_sample_raw.detach())
 
         adaptive_w = self._get_adaptive_weights(t).detach()
         loss = (per_sample_raw * adaptive_w).mean()
@@ -642,6 +739,8 @@ class ImprovedMeanFlow:
         
         if v_head is not None and per_sample_v_head is not None:
             loss = loss + float(v_loss_weight) * (per_sample_v_head * adaptive_w).mean()
+        if contrastive_loss_weight > 0.0:
+            loss = loss + float(contrastive_loss_weight) * loss_contrastive
 
         if return_components:
             return {
@@ -651,6 +750,7 @@ class ImprovedMeanFlow:
                 "loss_shape": loss_shape.detach(),
                 "loss_material": loss_material.detach(),
                 "loss_v_head": loss_v_head.detach(),
+                "loss_contrastive": loss_contrastive.detach(),
                 "material_supervision_keep_ratio": material_keep_ratio.detach(),
                 "cfg_context_keep_ratio": cfg_context_keep_ratio.detach(),
                 "adaptive_weight_scale": adaptive_scale.detach(),
@@ -692,9 +792,12 @@ class ImprovedMeanFlow:
                 return out.reshape(-1)[0].expand(b)
             return out
 
-        omega_b = _ensure_batch_scalar(omega, 4.0).clamp_min(1.0)  # Áp dụng CFG (mặc định 4.0)
-        cfg_tmin_b = _ensure_batch_scalar(cfg_tmin, 0.2)  # Tắt CFG ở khoảng tinh chỉnh vi mô (t < 0.2)
-        cfg_tmax_b = _ensure_batch_scalar(cfg_tmax, 0.8)  # Tắt CFG ở khoảng nhiễu lớn (t > 0.8)
+        # 2026-05-21 FIX: Defaults must match training when cfg_conditioning=False.
+        # Training: omega=1.0, cfg_tmin=0.0, cfg_tmax=1.0
+        # Old defaults: omega=4.0, cfg_tmin=0.2, cfg_tmax=0.8 ← CAUSED OOD!
+        omega_b = _ensure_batch_scalar(omega, 1.0).clamp_min(1.0)
+        cfg_tmin_b = _ensure_batch_scalar(cfg_tmin, 0.0)
+        cfg_tmax_b = _ensure_batch_scalar(cfg_tmax, 1.0)
         
         # Bắt đầu từ nhiễu thuần túy (pure noise)
         z_1 = torch.randn(shape, device=device)

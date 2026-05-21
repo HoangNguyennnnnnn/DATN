@@ -336,15 +336,16 @@ class FaceDiffGenerator:
             "input_dim": int(default_input_dim),
             "context_dim": int(default_context_dim),
             "slat_length": int(self.slat_length),
-            "num_context_tokens": int(getattr(train_cfg, "mamba_num_context_tokens", 8)),
-            "num_time_tokens": int(getattr(train_cfg, "mamba_num_time_tokens", 4)),
-            "num_r_tokens": int(getattr(train_cfg, "mamba_num_r_tokens", 4)),
-            "num_interval_tokens": int(getattr(train_cfg, "mamba_num_interval_tokens", 4)),
+            "num_context_tokens": int(getattr(train_cfg, "mamba_num_context_tokens", 0)),
+            "num_time_tokens": int(getattr(train_cfg, "mamba_num_time_tokens", 0)),
+            "num_r_tokens": int(getattr(train_cfg, "mamba_num_r_tokens", 0)),
+            "num_interval_tokens": int(getattr(train_cfg, "mamba_num_interval_tokens", 0)),
+            "conditioning": str(getattr(train_cfg, "mamba_conditioning", "adaln_additive")),
             "hidden_dim": int(getattr(train_cfg, "mamba_hidden_dim", 512)),
             "num_layers": int(getattr(train_cfg, "mamba_num_layers", 12)),
             "backend": str(getattr(train_cfg, "voxel_mamba_backend", "auto")),
             "strict": bool(getattr(train_cfg, "voxel_mamba_strict", False)),
-            "num_guidance_tokens": int(getattr(train_cfg, "mamba_num_guidance_tokens", 4)),
+            "num_guidance_tokens": int(getattr(train_cfg, "mamba_num_guidance_tokens", 0)),
             "d_state": int(getattr(train_cfg, "mamba_d_state", 16)),
             "d_conv": int(getattr(train_cfg, "mamba_d_conv", 4)),
             "expand": int(getattr(train_cfg, "mamba_expand", 2)),
@@ -365,11 +366,29 @@ class FaceDiffGenerator:
             cfg["hidden_dim"] = int(weight.shape[0])
             cfg["input_dim"] = int(weight.shape[1])
 
+        if sd.get("time_guidance_mlp.0.weight") is not None:
+            cfg["conditioning"] = "adaln_additive"
+            cfg["num_context_tokens"] = 0
+            cfg["num_time_tokens"] = 0
+            cfg["num_r_tokens"] = 0
+            cfg["num_interval_tokens"] = 0
+            cfg["num_guidance_tokens"] = 0
+            cc_w = sd.get("context_cond_mlp.0.weight", None)
+            if isinstance(cc_w, torch.Tensor) and cc_w.ndim == 2:
+                cfg["context_dim"] = int(cc_w.shape[1])
+
         ctx_w = sd.get("context_tokenizer.0.weight", None)
         if isinstance(ctx_w, torch.Tensor) and ctx_w.ndim == 2:
             cfg["context_dim"] = int(ctx_w.shape[1])
-            if int(cfg["hidden_dim"]) > 0:
-                cfg["num_context_tokens"] = max(1, int(ctx_w.shape[0] // int(cfg["hidden_dim"])))
+
+        # New VoxelMamba uses a 2-layer context tokenizer:
+        # context_tokenizer.0: context_dim -> hidden*2, context_tokenizer.2: hidden*2 -> hidden*num_tokens.
+        # Legacy checkpoints used context_tokenizer.0 as the output projection.
+        ctx_out_w = sd.get("context_tokenizer.2.weight", None)
+        if not isinstance(ctx_out_w, torch.Tensor):
+            ctx_out_w = ctx_w
+        if isinstance(ctx_out_w, torch.Tensor) and ctx_out_w.ndim == 2 and int(cfg["hidden_dim"]) > 0:
+            cfg["num_context_tokens"] = max(1, int(ctx_out_w.shape[0] // int(cfg["hidden_dim"])))
 
         time_w = sd.get("time_tokenizer.0.weight", None)
         if isinstance(time_w, torch.Tensor) and time_w.ndim == 2 and int(cfg["hidden_dim"]) > 0:

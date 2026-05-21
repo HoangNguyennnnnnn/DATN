@@ -806,7 +806,8 @@ def _build_stage2_model_config(model: nn.Module, imf_cfg, model_input_dim: int) 
         "num_time_tokens": int(getattr(model, "num_time_tokens", getattr(imf_cfg, "mamba_num_time_tokens", 4))),
         "num_r_tokens": int(getattr(model, "num_r_tokens", getattr(imf_cfg, "mamba_num_r_tokens", 4))),
         "num_interval_tokens": int(getattr(model, "num_interval_tokens", getattr(imf_cfg, "mamba_num_interval_tokens", 4))),
-        "num_guidance_tokens": int(getattr(model, "num_guidance_tokens", getattr(imf_cfg, "mamba_num_guidance_tokens", 4))),
+        "num_guidance_tokens": int(getattr(model, "num_guidance_tokens", getattr(imf_cfg, "mamba_num_guidance_tokens", 0))),
+        "conditioning": "adaln_additive",
         "d_state": int(getattr(imf_cfg, "mamba_d_state", 16)),
         "d_conv": int(getattr(imf_cfg, "mamba_d_conv", 4)),
         "expand": int(getattr(imf_cfg, "mamba_expand", 2)),
@@ -828,6 +829,7 @@ def save_checkpoint(
     path,
     *,
     v_head=None,
+    ctx_classifier=None,
     stage2_model_config: dict | None = None,
     global_step: int | None = None,
     best_loss: float | None = None,
@@ -847,6 +849,9 @@ def save_checkpoint(
         state['ema_state_dict'] = ema.state_dict()
     if v_head is not None:
         state['v_head_state_dict'] = v_head.state_dict()
+    if ctx_classifier is not None:
+        # FIX 2026-05-21 (Finding #3): save ctx_classifier for full-state resume
+        state['ctx_classifier_state_dict'] = ctx_classifier.state_dict()
     if stage2_model_config is not None:
         state['stage2_model_config'] = dict(stage2_model_config)
     torch.save(state, path)
@@ -861,6 +866,7 @@ def load_checkpoint(
     scaler=None,
     ema=None,
     v_head=None,
+    ctx_classifier=None,
 ):
     ckpt = torch.load(path, map_location="cpu", weights_only=False)
     model.load_state_dict(ckpt['model_state_dict'])
@@ -872,13 +878,26 @@ def load_checkpoint(
             try:
                 v_head.load_state_dict(ckpt_v_head_state, strict=True)
             except (RuntimeError, ValueError) as e:
-                # Architecture changed (e.g., depth 2 → 8) → re-init fresh
                 print(f"  [Resume] v-head shape mismatch → re-init fresh: {e}")
                 downgrade_reasons.append("v-head architecture changed; re-init")
         else:
             downgrade_reasons.append("checkpoint missing v_head_state_dict")
     elif isinstance(ckpt_v_head_state, dict):
         downgrade_reasons.append("checkpoint contains v_head_state_dict but current run has no v_head")
+
+    # FIX 2026-05-21 (Finding #3): load ctx_classifier
+    ckpt_ctx_cls = ckpt.get('ctx_classifier_state_dict')
+    if ctx_classifier is not None:
+        if isinstance(ckpt_ctx_cls, dict):
+            try:
+                ctx_classifier.load_state_dict(ckpt_ctx_cls, strict=True)
+            except (RuntimeError, ValueError) as e:
+                print(f"  [Resume] ctx_classifier shape mismatch → re-init fresh: {e}")
+                downgrade_reasons.append("ctx_classifier architecture changed; re-init")
+        else:
+            downgrade_reasons.append("checkpoint missing ctx_classifier_state_dict")
+    elif isinstance(ckpt_ctx_cls, dict):
+        downgrade_reasons.append("checkpoint contains ctx_classifier_state_dict but current run has no classifier")
 
     resumed_full = True
     if downgrade_reasons:
@@ -1255,10 +1274,31 @@ def train_imf(
         print(f"  [v-head] depth={v_head_depth}, hidden={model_hidden_dim}, "
               f"mlp_ratio={v_head_mlp_ratio}, out={model_input_dim}, "
               f"params={v_head_params/1e6:.1f}M")
-    
+
+    # Contrastive context classifier (2026-05-20): Linear(hidden, context_dim)
+    # Pools backbone hidden state across sequence → predicts context vector → InfoNCE loss.
+    # Forces hidden state to encode discriminative identity info.
+    ctx_classifier = None
+    contrastive_weight = float(getattr(imf_cfg, "contrastive_loss_weight", 0.0))
+    if contrastive_weight > 0.0:
+        if stage2_model_config["arch"] == "voxel_mamba":
+            model_hidden_dim = int(stage2_model_config["hidden_dim"])
+        else:
+            model_hidden_dim = int(stage2_model_config["hidden_dims"][0])
+        ctx_classifier = nn.Sequential(
+            nn.Linear(model_hidden_dim, model_hidden_dim),
+            nn.SiLU(),
+            nn.Linear(model_hidden_dim, int(imf_cfg.context_dim)),
+        ).to(device)
+        n_ctx = sum(p.numel() for p in ctx_classifier.parameters())
+        print(f"  [contrastive] ctx_classifier params={n_ctx/1e6:.2f}M, "
+              f"weight={contrastive_weight:.2f}, temp={float(getattr(imf_cfg, 'contrastive_temperature', 0.1)):.2f}")
+
     param_count = sum(p.numel() for p in model.parameters() if p.requires_grad)
     if v_head is not None:
         param_count += sum(p.numel() for p in v_head.parameters() if p.requires_grad)
+    if ctx_classifier is not None:
+        param_count += sum(p.numel() for p in ctx_classifier.parameters() if p.requires_grad)
     print(f"  Parameters: {param_count:,} ({param_count/1e6:.1f}M)")
     if imf_cfg.dual_branch:
         print(
@@ -1288,6 +1328,8 @@ def train_imf(
     all_params = list(model.parameters())
     if v_head is not None:
         all_params.extend(list(v_head.parameters()))
+    if ctx_classifier is not None:
+        all_params.extend(list(ctx_classifier.parameters()))
     
     if device.type == "cuda":
         try:
@@ -1319,6 +1361,7 @@ def train_imf(
             scaler=None if imf_cfg.resume_model_only else scaler,
             ema=None if imf_cfg.resume_model_only else ema,
             v_head=v_head,
+            ctx_classifier=ctx_classifier,
         )
         start_epoch = int(ckpt_info["epoch"])
         best_loss = float(ckpt_info["best_loss"])
@@ -1367,6 +1410,11 @@ def train_imf(
             slat_targets = slat_targets.to(device, non_blocking=True)
             contexts = contexts.to(device, non_blocking=True)
 
+            # FIX 2026-05-21 (Finding #2): compute occupancy mask BEFORE normalization.
+            # After normalize, zero rows become (-mean/std), no longer ~0 → can't detect
+            # padding. Mask must be extracted from raw slat where zero is truly zero.
+            occupancy_mask = (slat_targets.norm(dim=-1) > 1e-6).float()  # [B, L]
+
             # Per-channel normalize (TRELLIS.2-style): (slat - mean) / std → tránh
             # identity collapse khi raw slat std=0.36 << noise std=1.0.
             if slat_norm_mean is not None and slat_norm_std is not None:
@@ -1392,6 +1440,10 @@ def train_imf(
                     cfg_interval_conditioning=bool(getattr(imf_cfg, "cfg_interval_conditioning", True)),
                     cfg_context_dropout=float(getattr(imf_cfg, "cfg_context_dropout", 0.1)),
                     v_loss_weight=float(getattr(imf_cfg, "v_loss_weight", 0.1)),
+                    ctx_classifier=ctx_classifier,
+                    contrastive_loss_weight=float(getattr(imf_cfg, "contrastive_loss_weight", 0.0)),
+                    contrastive_temperature=float(getattr(imf_cfg, "contrastive_temperature", 0.1)),
+                    occupancy_mask=occupancy_mask,
                     return_components=True,
                 )
 
@@ -1454,6 +1506,7 @@ def train_imf(
                     loss.item() * grad_accum_steps,
                     os.path.join(imf_cfg.checkpoint_dir, "latest_step.pt"),
                     v_head=v_head,
+                    ctx_classifier=ctx_classifier,
                     stage2_model_config=stage2_model_config,
                     global_step=global_step,
                     best_loss=min(float(best_loss), float(loss.item() * grad_accum_steps)),
@@ -1519,6 +1572,7 @@ def train_imf(
                 model, optimizer, scheduler, scaler, ema, epoch + 1, avg_loss,
                 os.path.join(imf_cfg.checkpoint_dir, f"epoch_{epoch+1}.pt"),
                 v_head=v_head,
+                ctx_classifier=ctx_classifier,
                 stage2_model_config=stage2_model_config,
                 global_step=global_step,
                 best_loss=best_loss,
@@ -1531,6 +1585,7 @@ def train_imf(
                 model, optimizer, scheduler, scaler, ema, epoch + 1, avg_loss,
                 os.path.join(imf_cfg.checkpoint_dir, "best.pt"),
                 v_head=v_head,
+                ctx_classifier=ctx_classifier,
                 stage2_model_config=stage2_model_config,
                 global_step=global_step,
                 best_loss=best_loss,

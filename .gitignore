@@ -1,27 +1,16 @@
 # ============================================================
-# FaceDiff .gitignore — Comprehensive (2026-05-17)
+# FaceDiff .gitignore — Comprehensive (Updated 2026-05-20)
 # ============================================================
 
-# ── Data: Caches, LMDBs, Backups (CRITICAL: never push) ──
-data/
-data/slat_cache/
-data/slat_cache_facescape/
-data/ovoxel_cache_lmdb/
-data/ovoxel_cache_recached/
-data/backup_*/
-data/*.lmdb/
+# ── Data: LMDB, caches, large binaries (never push) ──
+# Use data/* (not data/) to allow traversal so !data/mesh_manifest.json works
+data/*
+!data/mesh_manifest.json
 *.lmdb/
 *.mdb
 *.lmdb-lock
 
-# ── Data: Large binaries in data/ ──
-data/mediapipe_models/
-data/*.pt
-
-# ── Data: Keep manifest + small configs ──
-!data/mesh_manifest.json
-
-# ── Model Checkpoints ──
+# ── Model checkpoints & weights ──
 checkpoints/
 *.pt
 *.pth
@@ -30,27 +19,29 @@ checkpoints/
 *.ckpt
 *.onnx
 
-# ── Training Outputs ──
+# ── Training outputs & logs ──
 outputs/
-outputs_context_viz/
+outputs_*/
 val_samples/
 test_dc_diagnostic/
 logs/
 *.log
 wandb/
 
-# ── Conda / Python Environment ──
+# ── Python / Conda environments ──
 miniconda3/
 snap/
+env/
+venv/
+.venv/
+.conda/
+.anaconda/
 __pycache__/
 *.py[cod]
 *$py.class
 *.so
 *.o
 .Python
-env/
-venv/
-.venv/
 build/
 develop-eggs/
 dist/
@@ -69,7 +60,7 @@ wheels/
 pip-log.txt
 pip-delete-this-directory.txt
 
-# ── Third-party (vendored, tracked separately or via submodule) ──
+# ── Third-party (vendored libraries, submodules) ──
 third_party/
 
 # ── IDEs & Editors ──
@@ -79,22 +70,27 @@ third_party/
 .cursor/
 .cursor-server/
 .windsurf-server/
+.antigravity-server/
+.antigravity-ide-server/
+.antigravity-*/
 *.swp
 *.swo
 *~
 
-# ── AI Agents & Tools ──
+# ── AI agents & tools ──
 .gemini/
 .claude/
 .claude.json
-CLAUDE.md
 .cline/
 .codeium/
 .codex/
 .copilot/
-.antigravity-server/
 
-# ── System & Dotfiles ──
+# Keep .claude/skills/, .claude/plans/ ignored too (under .claude/)
+# CLAUDE.md is a per-user instructions file
+CLAUDE.md
+
+# ── System & dotfiles ──
 .DS_Store
 Thumbs.db
 .ipynb_checkpoints/
@@ -104,8 +100,6 @@ Thumbs.db
 .cache/
 .config/
 .local/
-.conda/
-.anaconda/
 .dotnet/
 .java/
 .nv/
@@ -118,16 +112,18 @@ Thumbs.db
 .profile
 .wget-hsts
 
-# ── Temp / Scratch ──
+# ── Temp / scratch / backup ──
 *.tmp
 *.bak
 *.orig
+/tmp/
+nohup.out
 
-# ── Papers / Docs (reference PDFs + thesis drafts, không push) ──
+# ── Documentation binaries (PDFs, thesis drafts — not pushed) ──
 docs/
 *.pdf
 
-# ── Keep these ──
+# ── Force-keep (override above rules) ──
 !.gitignore
 !requirements.txt
 !requirements-mamba.txt

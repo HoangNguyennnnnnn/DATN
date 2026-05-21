@@ -25,7 +25,9 @@ def main():
     ap.add_argument("--ckpt", default="checkpoints/imf_unet/best.pt")
     ap.add_argument("--lmdb", default="data/slat_context.lmdb")
     ap.add_argument("--num-samples", type=int, default=8)
-    ap.add_argument("--omega", type=float, default=4.0, help="CFG guidance scale")
+    ap.add_argument("--omega", type=float, default=1.0,
+                    help="CFG guidance scale. Default 1.0 matches cfg_conditioning_enable=False training. "
+                         "For old CFG-enabled checkpoints use --omega 4.0.")
     ap.add_argument("--use-ema", action="store_true", help="Use EMA weights")
     args = ap.parse_args()
 
@@ -33,6 +35,17 @@ def main():
     print(f"Loading checkpoint: {args.ckpt}")
     ckpt = torch.load(args.ckpt, map_location="cpu", weights_only=False)
     print(f"  epoch={ckpt.get('epoch')} global_step={ckpt.get('global_step')} loss={ckpt.get('loss'):.4f}")
+
+    # Warn if omega mismatch with training config
+    train_cfg = ckpt.get('train_config', {}) or {}
+    cfg_enabled_in_training = train_cfg.get('cfg_conditioning_enable', None)
+    if cfg_enabled_in_training is False and args.omega != 1.0:
+        print(f"  ⚠️  WARNING: checkpoint trained with cfg_conditioning_enable=False but --omega={args.omega}. "
+              f"Model never saw omega≠1 during training → out-of-distribution input. "
+              f"Recommended: --omega 1.0")
+    elif cfg_enabled_in_training is True and args.omega == 1.0:
+        print(f"  ℹ️  Note: checkpoint trained with CFG enabled but --omega=1.0 disables guidance. "
+              f"Use --omega 4.0 for CFG-augmented sampling.")
 
     mcfg = ckpt.get("stage2_model_config", {})
     print(f"  arch={mcfg.get('arch')} hidden={mcfg.get('hidden_dim')} layers={mcfg.get('num_layers')}")

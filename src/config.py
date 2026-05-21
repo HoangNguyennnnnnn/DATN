@@ -223,11 +223,15 @@ class IMFConfig:
     mamba_d_state: int = 16              # Số chiều trạng thái SSM
     mamba_d_conv: int = 4                # Kích thước hạt nhân tích chập (kernel size)
     mamba_expand: int = 2                # Hệ số mở rộng
-    mamba_num_context_tokens: int = 8    # In-context tokens cho điều kiện ngữ cảnh
-    mamba_num_time_tokens: int = 4       # In-context tokens cho t
-    mamba_num_r_tokens: int = 4          # In-context tokens cho r
-    mamba_num_interval_tokens: int = 4   # In-context tokens cho (t-r) theo iMF appendix
-    mamba_num_guidance_tokens: int = 4   # In-context tokens cho [omega, tmin, tmax]
+    # 2026-05-21: Drop all prefix tokens. Dual AdaLN (context_cond_mlp + time_guidance_mlp)
+    # đã inject toàn bộ 6 conditioning signals (context/t/r/t-r/omega/tmin/tmax) vào MỌI
+    # layer qua scale/shift/gate. Prefix path redundant với AdaLN path → simplify graph,
+    # tiết kiệm ~3M params (5 tokenizers) + 24 token overhead/sample.
+    mamba_num_context_tokens: int = 0
+    mamba_num_time_tokens: int = 0
+    mamba_num_r_tokens: int = 0
+    mamba_num_interval_tokens: int = 0
+    mamba_num_guidance_tokens: int = 0
     dual_branch: bool = False          # Chia iMF thành các nhánh hình học và vật liệu
     shape_sc_vae_checkpoint: Optional[str] = None      # Điểm kiểm tra VAE riêng biệt chuyên biệt cho hình học (tùy chọn)
     material_sc_vae_checkpoint: Optional[str] = None   # Điểm kiểm tra VAE riêng biệt chuyên biệt cho vật liệu (tùy chọn)
@@ -248,20 +252,20 @@ class IMFConfig:
     batch_size: int = 16               # Micro-batch trên GPU (giảm cho 17GB VRAM)
     gradient_accumulation_steps: int = 4  # Effective batch = batch_size × grad_accum = 64
     num_epochs: int = 400              # Khuyên dùng Early stopping (giám sát mất mát trên tập xác thực)
-    learning_rate: float = 1e-4        # Paper iMF Table 4: lr=1e-4
+    learning_rate: float = 3e-5        # 2026-05-21: 1.5e-4 → 3e-5. Plateau breaking: loss saturated at ~2.44 with 1e-4 (epoch 14-22) then 3.22 with 1.5e-4 (epoch 25-29). Lower LR lets optimizer converge deeper.
     weight_decay: float = 0.0          # Paper Table 4: weight_decay=0
-    lr_warmup_steps: int = 1000
-    lr_scheduler: str = "constant"     # Paper Table 4: lr schedule = constant
+    lr_warmup_steps: int = 500         # 2026-05-21: 1000 → 500. Resuming from warm model, shorter warmup needed.
+    lr_scheduler: str = "cosine"       # 2026-05-21: constant → cosine. Gradual decay prevents perpetual plateau. eta_min=1e-7 in get_lr_scheduler().
     
     # Đặc tả iMF (arXiv:2512.02012v1 — Geng et al., Improved Mean Flows)
     sigma_min: float = 1e-4            # Biên độ nhiễu tối thiểu
     ratio_r_neq_t: float = 0.5        # 50% mẫu dùng JVP (r≠t), 50% dùng điều kiện biên (r=t)
-    t_sampler: str = "logit_normal"    # Paper Table 4: logit-normal(−0.4, 1.0) — KHÔNG dùng curriculum
+    t_sampler: str = "uniform"         # 2026-05-19 intervention: từ logit_normal → uniform để force balanced t coverage (paper iMF dùng logit_normal nhưng FaceDiff Mamba arch nhỏ + 20K samples cần t=1 nhiều hơn cho extrapolation).
     t_loc: float = -0.4               # Trung bình logit-normal (Giai đoạn 1: thiên vị ở giữa)
     t_scale: float = 1.0              # Tỉ lệ logit-normal
     curriculum_switch_ratio: float = 0.3   # Compromise 0.6→0.3 (17/05): switch ở 30% (epoch 120) — balance giữa boundary stability và 1-step learning
     curriculum_uniform_prob: float = 0.8   # Xác suất chọn giá trị đồng đều ở Giai đoạn 2 của tiến trình
-    cfg_conditioning_enable: bool = True    # iMF Mục 4.2: học điều hướng linh hoạt dưới dạng điều kiện
+    cfg_conditioning_enable: bool = False   # 2026-05-19: DISABLED. Diagnostic ep58 confirm CFG branch tạo degenerate "predict average ignore context" minimum (Test 1 cos_sim=1.0 across diff contexts). Switch to clean v_target = e-x.
     
     # iMF v5.0: v-loss cùng với khối phụ trợ v-head (Chỉ số cải thiện lợi nhuận ROI cao)
     use_v_loss: bool = True              # Dùng v-loss thay vì u-loss (huấn luyện ổn định hơn)
@@ -269,11 +273,15 @@ class IMFConfig:
     v_head_dim: int = 512               # Chiều ẩn cho khối phụ trợ v-head
     v_head_depth: int = 8                # Paper Table 4: aux-head depth = 8 (cũ: 2-layer MLP)
     v_head_mlp_ratio: int = 4            # MLP expansion ratio trong v-head block
-    v_loss_weight: float = 0.1           # Trọng số auxiliary v-head loss; khớp objective đang dùng trong iMF paper impl
+    v_loss_weight: float = 0.5           # 2026-05-21: 1.0 → 0.5 (rollback). 1.0 caused gradient conflict between main velocity loss and v-head, leading to +44% loss jump at resume and persistent plateau.
+    # Contrastive auxiliary loss (2026-05-20): force hidden state to encode context.
+    # InfoNCE on (pooled_hidden → predicted_ctx) vs (true context).
+    contrastive_loss_weight: float = 0.3 # 2026-05-21: 0.6 → 0.3 (rollback). 0.6 overwhelmed main loss gradient, preventing convergence.
+    contrastive_temperature: float = 0.1 # InfoNCE temperature
     cfg_omega_min: float = 1.0              # Cận dưới thang điều hướng (1.0 = không điều hướng)
     cfg_omega_max: float = 8.0              # Cận trên thang điều hướng
     cfg_omega_power_beta: float = 1.0       # Giá trị beta hàm lũy thừa cho p(omega) ~ omega^-beta
-    cfg_context_dropout: float = 0.1        # Loại bỏ các ngữ cảnh điều kiện để học nhánh vô điều kiện ổn định
+    cfg_context_dropout: float = 0.0        # 2026-05-19: 0.1 → 0. Bỏ random context-drop (gây pressure cho context-invariance). Always train với real context.
     cfg_interval_conditioning: bool = True  # Điều kiện hóa trên đoạn [tmin, tmax] giống trong phụ lục iMF
     adaptive_loss_weighting: bool = True    # iMF Appendix A: per-bin EMA reweighting cho main + v-head loss
     ema_decay: float = 0.9999          # Paper Table 4: ema_decay = 0.9999

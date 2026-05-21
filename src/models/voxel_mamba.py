@@ -91,77 +91,200 @@ class TimestepEmbedding(nn.Module):
 
     def forward(self, t):
         device = t.device
-        half_dim = self.dim // 2
-        embeddings = math.log(10000) / (half_dim - 1)
-        embeddings = torch.exp(torch.arange(half_dim, device=device) * -embeddings)
-        embeddings = t[:, None] * embeddings[None, :]
+        half_dim = max(self.dim // 2, 1)
+        if half_dim == 1:
+            frequencies = torch.ones(1, device=device)
+        else:
+            scale = math.log(10000) / (half_dim - 1)
+            frequencies = torch.exp(torch.arange(half_dim, device=device) * -scale)
+        embeddings = t[:, None] * frequencies[None, :]
         embeddings = torch.cat((embeddings.sin(), embeddings.cos()), dim=-1)
-        return embeddings
+        if embeddings.shape[-1] < self.dim:
+            embeddings = F.pad(embeddings, (0, self.dim - embeddings.shape[-1]))
+        return embeddings[:, :self.dim]
+
+
+class FeedForward(nn.Module):
+    """Per-token nonlinear transformation (MLP) — CRITICAL missing component.
+
+    2026-05-21 v3: Added to fix memorization failure. Without FFN, Mamba can
+    only do linear sequential mixing (recurrence). FFN provides:
+    - Feature expansion: dim → ffn_dim (4x) → dim
+    - Nonlinearity: GELU activation
+    - Per-token independence: each token transformed separately
+
+    This is the standard design from DiT, DiM-3D, and all Transformer-based
+    diffusion models. Mamba handles inter-token mixing, FFN handles
+    intra-token feature transformation. Both are essential.
+    """
+    def __init__(self, dim: int, expand: int = 4, dropout: float = 0.0):
+        super().__init__()
+        ffn_dim = dim * expand
+        self.net = nn.Sequential(
+            nn.Linear(dim, ffn_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(ffn_dim, dim),
+            nn.Dropout(dropout),
+        )
+        # Zero-init last linear → FFN starts as identity (safe for residual)
+        nn.init.zeros_(self.net[-2].weight)
+        nn.init.zeros_(self.net[-2].bias)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.net(x)
+
+
+# NOTE: ContextCrossAttention removed in v4 (was 31.5M params = overkill).
+# Context is a single global vector, not a sequence → AdaLN scale+shift
+# is the standard approach (DiT uses this for class labels).
+# Savings: 31.5M → 7.2M params for context conditioning.
 
 
 class BidirectionalMambaBlock(nn.Module):
     """
-    Khối SSM Hai chiều (Bidirectional SSM Block) với kết nối phần dư (residual connection).
-    
-    Sử dụng Mamba cho quét xuôi (forward scan) + quét ngược (backward scan),
-    sau đó kết hợp với phần dư.
+    Khối SSM Hai chiều + FFN + Dual AdaLN Conditioning.
+
+    2026-05-21 v4: FFN + Context AdaLN (replaces cross-attention).
+    - Mamba: inter-token sequential mixing (spatial)
+    - FFN: intra-token nonlinear feature transformation (CRITICAL)
+    - Time AdaLN: modulate both sub-blocks with (t, r) info
+    - Context AdaLN: modulate Mamba output with identity/expression info
+
+    Architecture per block:
+        # Sub-block 1: Mamba + Context modulation
+        x_mod = norm(x) * (1 + scale_t) + shift_t    # Time AdaLN
+        out = bimamba(x_mod)                           # Spatial mixing
+        out = out * (1 + scale_c) + shift_c            # Context AdaLN
+        x = x + gate_t * out                           # Gated residual
+
+        # Sub-block 2: FFN
+        x_ffn = norm_ffn(x) * (1 + scale_f) + shift_f # Time AdaLN
+        x = x + gate_ffn * ffn(x_ffn)                 # Gated residual
     """
-    def __init__(self, dim, d_state=16, d_conv=4, expand=2, dropout=0.1, backend: str = "auto"):
+    def __init__(self, dim, time_dim, ctx_dim, d_state=16, d_conv=4, expand=2,
+                 ffn_expand=4, dropout=0.0, use_mamba=True, use_ffn=True, backend: str = "auto"):
         super().__init__()
         self.dim = dim
         self.backend = _resolve_requested_backend(backend)
-        self.use_mamba = self.backend == "mamba"
-        
+        self.use_mamba = use_mamba
+        self.use_ffn = use_ffn
+
         if self.use_mamba:
-            # Mamba quét xuôi và ngược
             self.forward_mamba = Mamba(
-                d_model=dim,
-                d_state=d_state,
-                d_conv=d_conv,
-                expand=expand,
+                d_model=dim, d_state=d_state, d_conv=d_conv, expand=expand,
             )
             self.backward_mamba = Mamba(
-                d_model=dim,
-                d_state=d_state,
-                d_conv=d_conv,
-                expand=expand,
+                d_model=dim, d_state=d_state, d_conv=d_conv, expand=expand,
             )
         else:
-            # Dự phòng (Fallback): GRU Hai chiều
             self.gru = nn.GRU(
-                input_size=dim,
-                hidden_size=dim // 2,
-                num_layers=1,
-                bidirectional=True,
-                batch_first=True,
+                input_size=dim, hidden_size=dim // 2,
+                num_layers=1, bidirectional=True, batch_first=True,
             )
-        
-        self.norm = RMSNorm(dim)  # RMSNorm: cheaper, no mean-centering (update3.md §4.5)
+
+        self.norm = RMSNorm(dim)
         self.dropout = nn.Dropout(dropout)
-        
-    def forward(self, x):
+
+        # Time-only AdaLN: time_cond [B, time_dim] → (scale, shift, gate) [B, dim] × 3
+        # Time signal is monotonic and high-variance → suitable for AdaLN modulation
+        self.adaLN_time = nn.Sequential(
+            nn.SiLU(),
+            nn.Linear(time_dim, 3 * dim, bias=True),
+        )
+        # Init: scale small non-zero, shift zero, gate bias = 1.0 (NOT zero!)
+        # Gate bias = 1.0 → Mamba receives full gradient from step 1 → breaks gate=0 trap
+        last_linear = self.adaLN_time[-1]
+        W = last_linear.weight
+        nn.init.normal_(W[:dim], mean=0.0, std=0.02)      # scale weights
+        nn.init.zeros_(W[dim : 2 * dim])                   # shift weights
+        nn.init.zeros_(W[2 * dim :])                       # gate weights
+        nn.init.zeros_(last_linear.bias[:dim])             # scale bias
+        nn.init.zeros_(last_linear.bias[dim : 2 * dim])   # shift bias
+        nn.init.constant_(last_linear.bias[2 * dim :], 1.0)  # gate bias = 1.0
+
+        # Context AdaLN (POST-Mamba): scale+shift from context vector
+        # Much lighter than cross-attention (600K vs 2.6M per layer)
+        # Context is global vector → AdaLN is the standard approach (DiT class labels)
+        self.adaLN_ctx = nn.Sequential(
+            nn.SiLU(),
+            nn.Linear(ctx_dim, 2 * dim, bias=True),  # scale + shift only
+        )
+        # Init: small scale, zero shift → starts near identity
+        ctx_linear = self.adaLN_ctx[-1]
+        nn.init.normal_(ctx_linear.weight[:dim], mean=0.0, std=0.02)
+        nn.init.zeros_(ctx_linear.weight[dim:])
+        nn.init.zeros_(ctx_linear.bias)
+
+        # ============================================================
+        # SUB-BLOCK 2: FFN (Per-token nonlinear transform)
+        # 2026-05-21 v3: The CRITICAL missing component.
+        # Without FFN, model cannot learn per-token features independently.
+        # ============================================================
+        self.norm_ffn = RMSNorm(dim)
+        self.ffn = FeedForward(dim=dim, expand=ffn_expand, dropout=dropout)
+
+        # FFN also gets Time AdaLN (same as DiT paper — same conditioning for both sub-blocks)
+        self.adaLN_ffn = nn.Sequential(
+            nn.SiLU(),
+            nn.Linear(time_dim, 3 * dim, bias=True),
+        )
+        # Same init pattern: scale small, shift zero, gate bias = 1.0
+        last_ffn = self.adaLN_ffn[-1]
+        W_ffn = last_ffn.weight
+        nn.init.normal_(W_ffn[:dim], mean=0.0, std=0.02)
+        nn.init.zeros_(W_ffn[dim : 2 * dim])
+        nn.init.zeros_(W_ffn[2 * dim :])
+        nn.init.zeros_(last_ffn.bias[:dim])
+        nn.init.zeros_(last_ffn.bias[dim : 2 * dim])
+        nn.init.constant_(last_ffn.bias[2 * dim :], 1.0)
+
+    def forward(self, x: torch.Tensor, time_cond: torch.Tensor, ctx_cond: torch.Tensor) -> torch.Tensor:
         """
-        x: [B, L, dim]
-        Trả về: [B, L, dim]
+        x: [B, L, dim] hidden states
+        time_cond: [B, time_dim] time conditioning (t, r, interval, guidance)
+        ctx_cond: [B, ctx_dim] context conditioning (identity/expression)
         """
+        # ── Sub-block 1: Mamba + Context Cross-Attention ──
+        scale_t, shift_t, gate_t = self.adaLN_time(time_cond).chunk(3, dim=-1)
+        scale_t = scale_t.unsqueeze(1)  # [B, 1, dim]
+        shift_t = shift_t.unsqueeze(1)
+        gate_t = gate_t.unsqueeze(1)
+
         residual = x
-        x = self.norm(x)
-        
+        x_norm = self.norm(x)
+        x_mod = x_norm * (1 + scale_t) + shift_t
+
         if self.use_mamba:
-            # Quét xuôi (Forward scan)
-            fwd = self.forward_mamba(x)
-            # Quét ngược (Backward scan)
-            bwd_input = torch.flip(x, dims=[1])
+            fwd = self.forward_mamba(x_mod)
+            bwd_input = torch.flip(x_mod, dims=[1])
             bwd = self.backward_mamba(bwd_input)
             bwd = torch.flip(bwd, dims=[1])
-            # Kết hợp (Combine)
             out = fwd + bwd
         else:
-            # GRU dự phòng (Fallback GRU)
-            out, _ = self.gru(x)
-        
+            out, _ = self.gru(x_mod)
+
         out = self.dropout(out)
-        return out + residual
+
+        # Context AdaLN: modulate Mamba output with identity/expression
+        scale_c, shift_c = self.adaLN_ctx(ctx_cond).chunk(2, dim=-1)
+        scale_c = scale_c.unsqueeze(1)  # [B, 1, dim]
+        shift_c = shift_c.unsqueeze(1)
+        out = out * (1 + scale_c) + shift_c
+
+        x = residual + gate_t * out
+
+        # ── Sub-block 2: FFN (per-token nonlinear transform) ──
+        if self.use_ffn:
+            scale_f, shift_f, gate_f = self.adaLN_ffn(time_cond).chunk(3, dim=-1)
+            scale_f = scale_f.unsqueeze(1)
+            shift_f = shift_f.unsqueeze(1)
+            gate_f = gate_f.unsqueeze(1)
+    
+            x_ffn = self.norm_ffn(x) * (1 + scale_f) + shift_f
+            x = x + gate_f * self.ffn(x_ffn)
+            
+        return x
 
 
 class VoxelMamba(nn.Module):
@@ -170,11 +293,13 @@ class VoxelMamba(nn.Module):
     
     Thay thế mạng IMFUNet1D với độ phức tạp O(N).
     
-    Kiến trúc:
-    1. Nhúng đầu vào (Input embedding): [B, L, input_dim] -> [B, L, hidden_dim]
-    2. Các token tiền tố (Prefix tokens): [ngữ cảnh(8) + thời_gian_t(4) + thời_gian_r(4) + interval(4) + điều_hướng(4)] = 24 tokens
-    3. Ngăn xếp các khối BidirectionalMambaBlocks
-    4. Phép chiếu đầu ra (Output projection): [B, L, hidden_dim] -> [B, L, input_dim]
+    Kiến trúc (v6 — AdaLN additive, không prefix):
+    1. Nhúng đầu vào: [B, 4096, input_dim] -> [B, 4096, hidden_dim] (+ Hilbert reorder)
+    2. cond_emb = context_cond_mlp(ctx) + time_guidance_mlp(t, r, t−r, ω, cfg) → AdaLN mọi layer
+    3. 12× BidirectionalMambaBlock (chỉ 4096 slat tokens, không prefix)
+    4. output_proj → velocity [B, 4096, input_dim]
+
+    Legacy: num_*_tokens > 0 bật lại prefix in-context (checkpoint cũ).
     
     iMF yêu cầu u_θ(z_t, r, t) phải được điều kiện hóa trên CẢ HAI dấu thời gian r (bắt đầu) và t (kết thúc).
     Nếu không có điều kiện r, mô hình sẽ suy thoái thành khớp luồng đơn giản (simple flow matching)
@@ -202,16 +327,18 @@ class VoxelMamba(nn.Module):
         context_dim: int = 946,
         backend: str = "auto",
         strict: bool = False,
-        num_context_tokens: int = 8,
-        num_time_tokens: int = 4,
-        num_r_tokens: int = 4,
-        num_interval_tokens: int = 4,
-        num_guidance_tokens: int = 4,
+        num_context_tokens: int = 0,
+        num_time_tokens: int = 0,
+        num_r_tokens: int = 0,
+        num_interval_tokens: int = 0,
+        num_guidance_tokens: int = 0,
         dropout: float = 0.1,
         d_state: int = 16,
         d_conv: int = 4,
         expand: int = 2,
+        ffn_expand: int = 4,
         use_hilbert_ordering: bool = True,
+        use_ffn: bool = True,
     ):
         super().__init__()
         
@@ -254,10 +381,15 @@ class VoxelMamba(nn.Module):
         )
         
         # Các bộ tạo token điều kiện hóa trong ngữ cảnh (In-context conditioning tokenizers)
+        # 2026-05-19: Refactored từ 1-layer Linear+SiLU → 2-layer MLP với residual-style
+        # expansion. Diagnostic ep59 phát hiện 1-layer Linear không đủ capacity preserve
+        # 946-dim context diversity → output tokens cos_sim 0.94 across IDs (vs input 0.87).
+        # 2-layer MLP cho phép non-linear features, RMSNorm + larger intermediate stabilize.
         self.context_tokenizer = (
             nn.Sequential(
-                nn.Linear(context_dim, hidden_dim * num_context_tokens),
+                nn.Linear(context_dim, hidden_dim * 2),                  # 946 → 1024
                 nn.SiLU(),
+                nn.Linear(hidden_dim * 2, hidden_dim * num_context_tokens),  # 1024 → 4096
             )
             if num_context_tokens > 0 else None
         )
@@ -304,16 +436,37 @@ class VoxelMamba(nn.Module):
             )
             if num_guidance_tokens > 0 else None
         )
-        
-        # Ngăn xếp các khối Mamba hai chiều
+
+        # 2026-05-21 v4: SEPARATE context and time conditioning paths.
+        # - time_cond → AdaLN (scale, shift, gate) PRE-Mamba + FFN
+        # - ctx_cond → AdaLN (scale, shift) POST-Mamba output
+        self.context_cond_mlp = nn.Sequential(
+            nn.Linear(context_dim, hidden_dim),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+        )
+        self._time_guidance_in_dim = 3 * self.time_embed_dim + 3
+        self.time_guidance_mlp = nn.Sequential(
+            nn.Linear(self._time_guidance_in_dim, hidden_dim),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+        )
+        self._time_dim = hidden_dim
+        self._ctx_dim = hidden_dim
+
+        # Ngăn xếp các khối Mamba hai chiều + FFN với Dual AdaLN Conditioning
         self.layers = nn.ModuleList([
             BidirectionalMambaBlock(
                 dim=hidden_dim,
+                time_dim=self._time_dim,
+                ctx_dim=self._ctx_dim,
                 d_state=d_state,
                 d_conv=d_conv,
                 expand=expand,
                 dropout=dropout,
-                backend=self.backend,
+                ffn_expand=ffn_expand,
+                use_mamba=self.use_mamba,
+                use_ffn=use_ffn
             )
             for _ in range(num_layers)
         ])
@@ -322,8 +475,14 @@ class VoxelMamba(nn.Module):
         self.output_norm = RMSNorm(hidden_dim)
         self.output_proj = nn.Linear(hidden_dim, input_dim)
         
-        # Khởi tạo ma trận trọng số phép chiếu đầu ra về 0 để thiết lập ánh xạ đồng nhất (identity mapping) ở bước đầu
-        nn.init.zeros_(self.output_proj.weight)
+        # 2026-05-21 CRITICAL FIX: output_proj MUST NOT be zero-initialized!
+        # Zero W_out → gradient backprop through output_proj = W_out^T @ grad = 0
+        # → ALL upstream parameters (Mamba layers, AdaLN, context conditioning)
+        # receive ZERO gradient → model CANNOT learn from context/time!
+        # Only output_proj.weight/bias got gradient (outer product), everything else starved.
+        # Fix: Small Xavier init ensures gradients flow through backbone from step 1.
+        # gain=0.02 keeps initial velocity small (~0.02 * hidden_std) for stable training.
+        nn.init.xavier_uniform_(self.output_proj.weight, gain=0.02)
         nn.init.zeros_(self.output_proj.bias)
         
         # Hilbert Space-Filling Curve ordering
@@ -353,6 +512,35 @@ class VoxelMamba(nn.Module):
             return source.new_zeros((batch_size, 0, self.hidden_dim))
         return tokenizer(source).view(batch_size, num_tokens, self.hidden_dim)
 
+    def _build_cond_emb(
+        self,
+        t: torch.Tensor,
+        r: torch.Tensor,
+        context: torch.Tensor,
+        omega: torch.Tensor,
+        cfg_tmin: torch.Tensor,
+        cfg_tmax: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Build SEPARATE time and context conditioning embeddings.
+        
+        2026-05-21 v2: Returns tuple (ctx_cond, time_cond) instead of additive fusion.
+        Bug 1 fix: additive fusion caused time_cond (high variance from t∈[0,1]) to
+        drown ctx_cond (low variance, static per identity). Separate paths ensure
+        each signal reaches its target mechanism with full magnitude.
+        
+        Returns:
+            ctx_cond: [B, ctx_dim] — for cross-attention POST-Mamba
+            time_cond: [B, time_dim] — for AdaLN (scale, shift, gate) PRE-Mamba
+        """
+        t_emb = self.time_mlp(t)
+        r_emb = self.r_mlp(r)
+        interval_emb = self.interval_mlp(t - r)
+        guidance_feat = torch.stack([omega, cfg_tmin, cfg_tmax], dim=-1)
+        time_feat = torch.cat([t_emb, r_emb, interval_emb, guidance_feat], dim=-1)
+        time_cond = self.time_guidance_mlp(time_feat)
+        ctx_cond = self.context_cond_mlp(context)
+        return ctx_cond, time_cond
+
     def _forward_core(
         self,
         x_t: torch.Tensor,
@@ -377,37 +565,39 @@ class VoxelMamba(nn.Module):
             cfg_tmax = torch.ones(B, device=device)
         
         h = self.input_embed(x_t)
-        
-        # Hilbert reorder: raster → hilbert (bảo toàn spatial locality cho GRU/Mamba)
+
         if self.use_hilbert_ordering:
             h = h[:, self._hilbert_to_raster, :]
-        
-        ctx_tokens = self._make_prefix_tokens(self.context_tokenizer, context, self.num_context_tokens, B)
-        
-        t_emb = self.time_mlp(t)
-        time_tokens = self._make_prefix_tokens(self.time_tokenizer, t_emb, self.num_time_tokens, B)
-        
-        r_emb = self.r_mlp(r)
-        r_tokens = self._make_prefix_tokens(self.r_tokenizer, r_emb, self.num_r_tokens, B)
-        
-        # (t-r) interval tokens — iMF paper Tab. 4 ("(t,r) cond: t-r"). Signed.
-        # _sample_t_r() đảm bảo r ≤ t nên (t-r) ≥ 0; vẫn giữ signed để model học
-        # đúng đặc trưng "interval magnitude" mà sin/cos timestep embedding xử lý
-        # native cho đầu vào không âm.
-        interval = (t - r)
-        interval_emb = self.interval_mlp(interval)
-        interval_tokens = self._make_prefix_tokens(self.interval_tokenizer, interval_emb, self.num_interval_tokens, B)
-        
-        guidance_input = torch.stack([omega, cfg_tmin, cfg_tmax], dim=-1)
-        guidance_tokens = self._make_prefix_tokens(self.guidance_tokenizer, guidance_input, self.num_guidance_tokens, B)
-        
-        prefix = torch.cat([ctx_tokens, time_tokens, r_tokens, interval_tokens, guidance_tokens], dim=1)
-        h = torch.cat([prefix, h], dim=1)
-        
+
+        # v7 (2026-05-20): Hybrid End-prefix strategy.
+        # Place prefix tokens at END of sequence (positions slat_length .. slat_length+24).
+        # - Forward Mamba scan: data tokens first (Hilbert spatial locality intact),
+        #   prefix processed LAST → state ends knowing context
+        # - Backward Mamba scan: reversed sequence puts prefix FIRST → backward state
+        #   initialized with context info → propagates to ALL data positions
+        # → Combined fwd+bwd: data tokens absorb context via backward state.
+        if self.total_prefix_tokens > 0:
+            t_emb = self.time_mlp(t)
+            r_emb = self.r_mlp(r)
+            interval_emb = self.interval_mlp(t - r)
+            guidance_input = torch.stack([omega, cfg_tmin, cfg_tmax], dim=-1)
+            ctx_tokens = self._make_prefix_tokens(self.context_tokenizer, context, self.num_context_tokens, B)
+            time_tokens = self._make_prefix_tokens(self.time_tokenizer, t_emb, self.num_time_tokens, B)
+            r_tokens = self._make_prefix_tokens(self.r_tokenizer, r_emb, self.num_r_tokens, B)
+            interval_tokens = self._make_prefix_tokens(self.interval_tokenizer, interval_emb, self.num_interval_tokens, B)
+            guidance_tokens = self._make_prefix_tokens(self.guidance_tokenizer, guidance_input, self.num_guidance_tokens, B)
+            prefix = torch.cat([ctx_tokens, time_tokens, r_tokens, interval_tokens, guidance_tokens], dim=1)
+            # PREFIX AT END (not start) → preserves Hilbert order for data tokens in forward scan
+            h = torch.cat([h, prefix], dim=1)
+
+        ctx_cond, time_cond = self._build_cond_emb(t, r, context, omega, cfg_tmin, cfg_tmax)
+
         for layer in self.layers:
-            h = layer(h)
-        
-        h = h[:, self.total_prefix_tokens:, :]
+            h = layer(h, time_cond, ctx_cond)
+
+        if self.total_prefix_tokens > 0:
+            # Strip prefix tokens FROM END (not start)
+            h = h[:, :self.slat_length, :]
         
         # Hilbert inverse: hilbert → raster (trả output về thứ tự gốc)
         if self.use_hilbert_ordering:

@@ -12,13 +12,14 @@ CONDA_BASE="/mnt/18TData/facediff/miniconda3"
 source "${CONDA_BASE}/etc/profile.d/conda.sh"
 conda activate facediff
 
-BATCH_SIZE="${BATCH_SIZE:-2}"
-GRAD_ACCUM="${GRAD_ACCUM:-32}"
+BATCH_SIZE="${BATCH_SIZE:-4}"
+GRAD_ACCUM="${GRAD_ACCUM:-16}"
 LR="${LR:-1e-4}"  # Paper iMF Table 4
 EPOCHS="${EPOCHS:-400}"
-NUM_WORKERS="${NUM_WORKERS:-4}"   # Parallel LMDB I/O — GPU không phải đợi (SlatDataset lazy re-open trong worker)
-RESUME="${RESUME:-checkpoints/imf_unet/best.pt}"
-RESUME_MODEL_ONLY="${RESUME_MODEL_ONLY:-0}"  # 1 = skip optimizer/scheduler/scaler/EMA state (paper-aligned restart)
+NUM_WORKERS="${NUM_WORKERS:-4}"
+# Fresh start after context-conditioning fix (2026-05-19); old checkpoints incompatible
+RESUME="${RESUME:-}"
+RESUME_MODEL_ONLY="${RESUME_MODEL_ONLY:-0}"
 SC_VAE_CKPT="${SC_VAE_CKPT:-checkpoints/sc_vae_shape/epoch_500.pt}"
 
 # Use LMDB only when pack finished (avoid partial/corrupt DB during pack_slat_lmdb.py)
@@ -48,7 +49,7 @@ echo "=============================================="
 echo "  FACEDIFF — Phase 2: iMF VoxelMamba Training"
 echo "=============================================="
 echo "  batch=${BATCH_SIZE} × grad_accum=${GRAD_ACCUM} = effective ${EFFECTIVE}"
-echo "  CFG: ENABLED | Resume: ${RESUME}"
+echo "  CFG: OFF (audit fix) | Resume: ${RESUME:-none}"
 echo "  Data: ${DATA_MODE}"
 echo "  SC-VAE (cache tag): ${SC_VAE_CKPT}"
 echo "  Log: ${LOG_FILE}"
@@ -78,7 +79,7 @@ if [ "${FOREGROUND:-0}" = "1" ]; then
       --lr "${LR}" \
       --epochs "${EPOCHS}" \
       --num-workers "${NUM_WORKERS}" \
-      --enable-cfg-conditioning \
+      --disable-cfg-conditioning \
       --disable-id-filters \
       --manifest data/mesh_manifest.json \
       "${RESUME_ARGS[@]}" \
@@ -94,7 +95,7 @@ else
       --lr "${LR}" \
       --epochs "${EPOCHS}" \
       --num-workers "${NUM_WORKERS}" \
-      --enable-cfg-conditioning \
+      --disable-cfg-conditioning \
       --disable-id-filters \
       --manifest data/mesh_manifest.json \
       "${RESUME_ARGS[@]}" \
