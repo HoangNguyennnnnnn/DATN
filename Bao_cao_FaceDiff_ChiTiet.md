@@ -1,10 +1,10 @@
 # Báo cáo Nghiên cứu Chuyên sâu: FaceDiff — Hệ thống Tạo sinh Khuôn mặt 3D Một Bước trên Đơn GPU
 
-**Ngày cập nhật:** 18/05/2026 (revision 17 — MediaPipe FLAME + CFG VRAM optimization + batch=4 speedup + architecture audit)  
+**Ngày cập nhật:** 22/05/2026 (revision 18 — VoxelMamba v4: dual AdaLN + FFN, bỏ prefix/cond_fusion, CFG off, slat norm)  
 **Tác giả:** Nhóm nghiên cứu FaceDiff  
 **Cấu hình Mục tiêu:** Đơn GPU RTX 4090 (24GB VRAM)  
 **Bộ dữ liệu:** FaceVerse_3D (2,100 — high detail) & FaceScape (18,298 — registered)  
-**Trạng thái checkpoint:** SC-VAE epoch 500 done. Stage 2 iMF VoxelMamba **đang train** (ep7→). FLAME fix (MediaPipe), CFG refactor (split forward) + batch=4 + TF32 → ETA Stage A: **7 ngày** (vs 11.4 ban đầu). Xem Section 10.
+**Trạng thái checkpoint:** SC-VAE epoch 500 done. Stage 2 iMF VoxelMamba v4 **đang train** (`scripts/train_imf.sh`, LMDB offline, CFG tắt). Kiến trúc mới từ commit `c92ba00` — checkpoint ep30 cũ (`cond_fusion` / prefix) không load được. Xem Mục 4.4.1 và Section 10.
 
 ---
 
@@ -69,7 +69,7 @@ Thách thức chính của các phương pháp hiện tại:
 ### 2.2. Đóng góp
 
 1. **SC-VAE tiết kiệm VRAM** với SparseResMLPBlock (giảm 45% VRAM so với ConvNeXt 3D) + Generative Pruning (Rho Loss)
-2. **VoxelMamba** — backbone SSM $O(N)$ thay Transformer $O(N^2)$, Hilbert curve ordering. *Thiết kế lai (hybrid): BiMamba generation lấy cảm hứng từ DiM-3D [14], Hilbert ordering từ VoxelMamba [4], kết hợp in-context conditioning tự thiết kế cho iMF.*
+2. **VoxelMamba** — backbone SSM $O(N)$ (~94M): 12× BiMamba+FFN, dual AdaLN (context + time), Hilbert ordering. *Thiết kế lai: DiM-3D [14] + VoxelMamba [4] ordering; điều kiện hóa broadcast AdaLN (không prefix token).*
 3. **iMF (Improved Mean Flow)** — sinh 1 bước bằng JVP correction
 4. **Hybrid Context 946-dim** = ArcFace(512) + FLAME(50) + DINOv2(384)
 5. **Tối ưu đơn GPU**: INT4 quantization, BFloat16, gradient checkpointing, LMDB caching
@@ -645,7 +645,7 @@ Với $w_{\text{KL}} = 10^{-6}$, $w_\rho = 0.2$.
 
 ### 4.4. Giai đoạn 2: VoxelMamba + iMF
 
-> **Nguồn gốc kiến trúc:** Backbone VoxelMamba trong FaceDiff là *thiết kế lai (hybrid)* kết hợp: (1) Bidirectional Mamba cho 3D generation từ DiM-3D [14], (2) Hilbert space-filling curve ordering từ VoxelMamba [4], (3) In-context prefix token conditioning tự thiết kế cho iMF [1]. FaceDiff **không** sử dụng Dual-scale SSM Block hay Implicit Window Partition từ paper VoxelMamba gốc.
+> **Nguồn gốc kiến trúc (revision 18):** Backbone VoxelMamba là *thiết kế lai* kết hợp: (1) Bidirectional Mamba từ DiM-3D [14], (2) Hilbert ordering từ VoxelMamba [4], (3) **Dual AdaLN** điều kiện hóa context + time (broadcast tới 4096 slat tokens — **không** dùng 24 prefix tokens; `mamba_num_*_tokens=0`). FaceDiff **không** dùng Dual-scale SSM Block / Implicit Window Partition từ paper VoxelMamba gốc. Lịch sử: prefix + `cond_fusion` (ep≤30) đã bỏ vì identity collapse và prefix không lan truyền tới vị trí dữ liệu trong scan SSM.
 
 #### 4.4.0. Pipeline dữ liệu iMF: `SlatDataset`, cache đĩa, và chế độ `--offline-data`
 
@@ -670,103 +670,61 @@ Với $w_{\text{KL}} = 10^{-6}$, $w_\rho = 0.2$.
    **Lưu ý lịch sử:** bản `precompute_slat_cache.py` cũ không truyền extractors → context trong cache bị **random**; revision 3 đã sửa.
 
 2. **Giai đoạn B — Huấn luyện iMF:**  
-   `python src/train_imf.py --offline-data --batch-size <tăng theo VRAM còn lại> ...`  
-   Chỉ nạp VoxelMamba (+ v-head, EMA, optimizer). CFG vẫn hoạt động: dropout ngữ cảnh áp dụng trên tensor `context` đã load, không cần forward lại ArcFace trong training loop.
+   `bash scripts/train_imf.sh` (hoặc `python src/train_imf.py --offline-data --slat-lmdb data/slat_context.lmdb --disable-cfg-conditioning ...`)  
+   Chỉ nạp VoxelMamba (+ v-head, contrastive head, EMA). **CFG tắt** mặc định (`--disable-cfg-conditioning`) sau audit ep30; slat được **chuẩn hóa theo kênh** qua `data/slat_stats.pt`.
 
 **Hạn chế cần biết:** Chế độ `dual_branch` (hai SC-VAE) chưa được script precompute hỗ trợ — cần mở rộng script hoặc tạm tắt dual khi precompute. `num_workers>0` có thể gây xung đột EGL/GPU với renderer; mặc định `0` an toàn.
 
-#### 4.4.1. Kiến trúc VoxelMamba
+#### 4.4.1. Kiến trúc VoxelMamba (v4 — dual AdaLN, không prefix)
 
-**Sơ đồ tổng quan Pipeline (Overall Pipeline):**
+**Sơ đồ tổng quan Pipeline:**
 
 ```mermaid
 graph TD
     subgraph INPUTS["Đầu vào"]
-        Z["z_t<br/>[B, 4096, 32]<br/>Slat tokens + noise"]
-        CTX["ctx<br/>[B, 946]<br/>ArcFace(512)+FLAME(50)+DINOv2(384)"]
-        T["t ∈ [0,1]<br/>[B]<br/>End timestep"]
-        R["r ∈ [0,1]<br/>[B]<br/>Start timestep"]
-        OMEGA["Ω = {ω, t_min, t_max}<br/>[B, 3]<br/>CFG guidance"]
+        Z["z_t [B,4096,32]"]
+        CTX["ctx [B,946]"]
+        T["t, r, |t-r|, Ω"]
     end
 
-    Z --> INPUT_EMBED["input_embed<br/>Linear(32 → 512)"]
-    INPUT_EMBED --> HILBERT["Hilbert Reorder<br/>raster → hilbert<br/>(preserve 3D locality)"]
+    Z --> EMB["input_embed 32→512"]
+    EMB --> HIL["Hilbert reorder"]
 
-    CTX --> CTX_TOK["context_tokenizer<br/>Linear(946 → 512×8) + SiLU<br/>→ [B, 8, 512]"]
+    CTX --> CTXMLP["context_cond_mlp → ctx_cond [B,512]"]
+    T --> TIMEMLP["time_guidance_mlp(t,r,interval,ω) → time_cond [B,512]"]
 
-    T --> T_MLP["time_mlp<br/>SinEmbed(128) → MLP → 512"]
-    T_MLP --> T_TOK["time_tokenizer<br/>Linear(512 → 512×4) + SiLU<br/>→ [B, 4, 512]"]
+    HIL --> STACK["12× BidirectionalMambaBlock"]
+    CTXMLP --> STACK
+    TIMEMLP --> STACK
 
-    R --> R_MLP["r_mlp<br/>SinEmbed(128) → MLP → 512"]
-    R_MLP --> R_TOK["r_tokenizer<br/>Linear(512 → 512×4) + SiLU<br/>→ [B, 4, 512]"]
+    STACK --> HILINV["Hilbert inverse"]
+    HILINV --> OUTN["output_norm RMSNorm"]
+    OUTN --> OUTP["output_proj 512→32<br/>Xavier gain=0.02"]
+    OUTP --> U["u_θ [B,4096,32]"]
 
-    T --> INTERVAL_COMPUTE["interval = |t - r|"]
-    R --> INTERVAL_COMPUTE
-    INTERVAL_COMPUTE --> IV_MLP["interval_mlp<br/>SinEmbed(128) → MLP → 512"]
-    IV_MLP --> IV_TOK["interval_tokenizer<br/>Linear(512 → 512×4) + SiLU<br/>→ [B, 4, 512]"]
-
-    OMEGA --> G_TOK["guidance_tokenizer<br/>Linear(3 → 512×4) + SiLU<br/>→ [B, 4, 512]"]
-
-    CTX_TOK --> PREFIX["Concat Prefix<br/>[B, 24, 512]"]
-    T_TOK --> PREFIX
-    R_TOK --> PREFIX
-    IV_TOK --> PREFIX
-    G_TOK --> PREFIX
-
-    HILBERT --> CONCAT["Concat<br/>[B, 4120, 512]"]
-    PREFIX --> CONCAT
-
-    CONCAT --> BIMAMBA["12× BiMamba Block<br/>(see detail below)"]
-
-    BIMAMBA --> STRIP["Strip Prefix<br/>[B, 4120, 512] → [B, 4096, 512]"]
-    STRIP --> HILBERT_INV["Hilbert Inverse<br/>hilbert → raster"]
-    HILBERT_INV --> OUTNORM["output_norm<br/>RMSNorm(512)"]
-    OUTNORM --> OUTPROJ["output_proj<br/>Linear(512 → 32)<br/>⚠ Zero-init W,b"]
-    OUTPROJ --> OUTPUT["u_θ(z_t, r, t, ctx)<br/>[B, 4096, 32]<br/>Predicted avg velocity"]
-
-    style INPUTS fill:#1a1a2e,stroke:#16213e,color:#e0e0e0
-    style BIMAMBA fill:#0f3460,stroke:#533483,color:#ffffff
-    style OUTPUT fill:#1a1a2e,stroke:#e94560,color:#ffffff
-    style PREFIX fill:#16213e,stroke:#533483,color:#e0e0e0
+    style STACK fill:#0f3460,stroke:#533483,color:#fff
 ```
 
-**Chi tiết khối BiDirectional Mamba Block:**
+**Chi tiết `BidirectionalMambaBlock` (×12):**
 
 ```mermaid
 graph TD
-    subgraph BIMAMBA_BLOCK["BiDirectional Mamba Block (×12)"]
-        IN["Input x<br/>[B, L, 512]"] --> NORM["RMSNorm(512)"]
-
-        NORM --> FWD_MAMBA["Forward Mamba SSM<br/>d_model=512, d_state=16<br/>d_conv=4, expand=2<br/>(inner_dim=1024)"]
-
-        NORM --> FLIP["torch.flip(dim=1)<br/>Reverse sequence"]
-        FLIP --> BWD_MAMBA["Backward Mamba SSM<br/>d_model=512, d_state=16<br/>d_conv=4, expand=2"]
-        BWD_MAMBA --> UNFLIP["torch.flip(dim=1)<br/>Restore order"]
-
-        FWD_MAMBA --> ADD_SCAN["fwd + bwd<br/>(element-wise sum)"]
-        UNFLIP --> ADD_SCAN
-
-        ADD_SCAN --> DROP["Dropout(0.1)"]
-        DROP --> RESIDUAL["+ residual<br/>(skip connection)"]
-        IN --> RESIDUAL
-
-        RESIDUAL --> OUT["Output<br/>[B, L, 512]"]
-    end
-
-    subgraph MAMBA_INTERNAL["Mamba SSM Internal (mỗi chiều)"]
-        MI_IN["x [B,L,512]"] --> MI_PROJ["in_proj<br/>Linear(512 → 2×1024)"]
-        MI_PROJ --> MI_SPLIT["split → x, z"]
-        MI_SPLIT --> MI_CONV["Conv1D(1024, k=4)<br/>+ SiLU"]
-        MI_SPLIT --> MI_Z["z branch<br/>SiLU gate"]
-        MI_CONV --> MI_SSM["Selective SSM<br/>A[n=16], B[n=16]<br/>C[n=16], Δ[d=1024]<br/>parallel scan O(L)"]
-        MI_SSM --> MI_GATE["× SiLU(z)"]
-        MI_Z --> MI_GATE
-        MI_GATE --> MI_OUT["out_proj<br/>Linear(1024 → 512)"]
-    end
-
-    style BIMAMBA_BLOCK fill:#0f3460,stroke:#533483,color:#e0e0e0
-    style MAMBA_INTERNAL fill:#16213e,stroke:#0f3460,color:#e0e0e0
+    X["x [B,4096,512]"] --> AT["AdaLN_time: norm·(1+s_t)+b_t"]
+    AT --> BM["BiMamba fwd+bwd sum"]
+    BM --> AC["AdaLN_ctx: out·(1+s_c)+b_c"]
+    AC --> G1["x += gate_t·out (gate bias=1)"]
+    G1 --> FF["FFN expand×4 + AdaLN_time + gate"]
+    FF --> OUT["x' [B,4096,512]"]
 ```
+
+**Tham số (đo trên GPU, `facediff` env):**
+
+| Thành phần | Params |
+|------------|--------|
+| VoxelMamba backbone | **~93.9M** |
+| v-head (depth 8) | **~16.8M** |
+| contrastive `ctx_classifier` | **~0.5M** |
+| Prefix tokens | **0** (`mamba_num_*_tokens=0`) |
 
 **Fallback GRU** *(khi mamba-ssm không khả dụng):*
 
@@ -826,35 +784,23 @@ graph TD
     style INFERENCE fill:#0f3460,stroke:#e94560,color:#ffffff
 ```
 
-**Prefix Tokens (24 tổng):**
+**Điều kiện hóa (broadcast AdaLN, không prefix):**
 
-| Token | Số lượng | Nguồn | Kích thước |
-|-------|----------|-------|------------|
-| Context | 8 | $\text{ctx}_{946} \xrightarrow{\text{Linear}} \mathbb{R}^{8 \times 512}$ | $[B, 8, 512]$ |
-| Time $t$ | 4 | $t \xrightarrow{\text{SinEmbed}} \xrightarrow{\text{MLP}} \mathbb{R}^{4 \times 512}$ | $[B, 4, 512]$ |
-| Time $r$ | 4 | $r \xrightarrow{\text{SinEmbed}} \xrightarrow{\text{MLP}} \mathbb{R}^{4 \times 512}$ | $[B, 4, 512]$ |
-| Interval $(t-r)$ | 4 | $|t-r| \xrightarrow{\text{SinEmbed}} \xrightarrow{\text{MLP}} \mathbb{R}^{4 \times 512}$ | $[B, 4, 512]$ |
-| Guidance | 4 | $[\omega, t_{\min}, t_{\max}] \xrightarrow{\text{Linear}} \mathbb{R}^{4 \times 512}$ | $[B, 4, 512]$ |
+- $\text{ctx\_cond} = \text{MLP}(\text{ctx}_{946}) \in \mathbb{R}^{512}$ → `adaLN_ctx` (scale+shift trên output Mamba).
+- $\text{time\_cond} = \text{time\_guidance\_mlp}(t, r, |t-r|, \omega, t_{\min}, t_{\max})$ → `adaLN_time` + `adaLN_ffn` (scale, shift, **gate**; bias gate khởi tạo **1.0**).
+- $(t-r)$ vẫn được đưa vào `time_guidance_mlp` (theo iMF Tab. 4), không qua token riêng.
 
-> **Ghi chú:** Token Interval $(t-r)$ được thêm theo iMF paper Tab. 4: network conditions on $(t-r)$ ngoài $t$ và $r$ riêng biệt, giúp SSM trực tiếp nhận biết độ dài khoảng trung bình mà không cần học ngầm phép trừ.
+**Sinusoidal embedding** cho $t$, $r$, $|t-r|$ trong `time_guidance_mlp` ($d=128$).
 
-**Sinusoidal Timestep Embedding:**
-
-$$\text{emb}(t, k) = \begin{cases} \sin(t \cdot 10000^{-2k/d}) & k < d/2 \\ \cos(t \cdot 10000^{-2(k-d/2)/d}) & k \geq d/2 \end{cases} \tag{VoxM-1}$$
-
-Với $d = \text{hidden\_dim} / 4 = 128$.
-
-**Output Projection Zero-Init:**
-
-$$W_{\text{out}} = \mathbf{0}, \quad b_{\text{out}} = \mathbf{0} \quad \text{(khởi tạo)} \tag{VoxM-2}$$
-
-Đảm bảo ở bước đầu, $u_\theta(z, t, \text{ctx}) \approx 0$ → quỹ đạo xuất phát gần identity → ổn định gradient.
+**Output projection (revision 18):** `output_proj` dùng **Xavier uniform, gain=0.02** — không zero-init (zero-init + gate=0 từng làm mất gradient qua backbone/context). FFN layer cuối vẫn zero-init cho residual an toàn.
 
 #### 4.4.2. Hàm Mất mát iMF (Triển khai trong FaceDiff)
 
 Xem chi tiết toán học tại Mục 3.4. Triển khai cụ thể:
 
-$$\mathcal{L} = \mathbb{E}_{t,r}\left[w_{\text{adaptive}}(t) \cdot \ell(t,r)\right] + 0.1 \cdot \mathbb{E}_{t}\left[w_{\text{adaptive}}(t) \cdot \ell_{\text{v-head}}(t)\right] \tag{iMF-L}$$
+$$\mathcal{L} = \mathbb{E}_{t,r}\left[w_{\text{adaptive}}(t) \cdot \ell(t,r)\right] + w_v \cdot \mathbb{E}_{t}\left[w_{\text{adaptive}}(t) \cdot \ell_{\text{v-head}}(t)\right] + w_c \cdot \mathcal{L}_{\text{contrastive}} \tag{iMF-L}$$
+
+Với $w_v=0.5$, $w_c=0.3$ (`src/config.py`, 2026-05-21). Contrastive: pool hidden → linear → InfoNCE với `context` (batch≥2).
 
 Trong đó $\ell(t,r)$ là loss theo nhánh: nếu $r=t$ thì $\ell = \|v_\theta - (\varepsilon - x)\|^2$, nếu $r\neq t$ thì $\ell = \|V_\theta - (\varepsilon - x)\|^2$. V-head dùng mục tiêu FM thô $(\varepsilon - x)$ và cũng được weight bởi $w_{\text{adaptive}}(t)$ theo Appendix A.
 
@@ -901,9 +847,11 @@ Trong đó $\beta$ = shape params (300-dim), $\theta$ = pose (jaw rotation), $\p
 - Đầu ra: 384-dim CLS token từ render mặt sau
 - **Mục đích:** Thông tin gáy, tóc, tai — phần ArcFace không nắm bắt
 
-#### 4.5.4. Tokenization
+#### 4.5.4. Điều kiện hóa trong backbone (không tokenize prefix)
 
-$$\text{ctx}_{946} \xrightarrow{\text{Linear}(946 \to 512 \times 8)} \xrightarrow{\text{SiLU}} \xrightarrow{\text{reshape}} \text{prefix\_tokens} \in \mathbb{R}^{8 \times 512} \tag{Ctx-2}$$
+$$\text{ctx}_{946} \xrightarrow{\text{context\_cond\_mlp}} \text{ctx\_cond} \in \mathbb{R}^{512} \xrightarrow{\text{AdaLN\_ctx (broadcast)}} \text{modulate mọi vị trí Slat} \tag{Ctx-2}$$
+
+(Legacy: khi `mamba_num_context_tokens>0`, vẫn có nhánh prefix tokenizer cho checkpoint cũ.)
 
 ---
 
@@ -1009,20 +957,23 @@ Số liệu thực tế đọc trực tiếp từ `data_signature` được hash
 | SSM state dim ($n$) | 16 | |
 | SSM conv kernel | 4 | |
 | Expansion factor | 2 | $512 \to 1024$ inner |
-| Prefix tokens | 24 | 8+4+4+4+4 (ctx+t+r+interval+guidance) |
+| FFN per block | Có (expand×4, GELU) | DiT-style sub-block |
+| Prefix tokens | **0** | `mamba_num_*_tokens=0` (revision 18) |
+| Conditioning | Dual AdaLN (ctx + time) | Không `cond_fusion` |
 | Context dim | 946 | ArcFace+FLAME+DINOv2 |
-| **Total params** | **~21.2 M** (thêm interval tokenizer so với 20.88M trước) | Comment "~45M" trong `src/config.py` đã hết hạn — sẽ chỉnh lại trong commit kế tiếp |
-| Optimizer | Adam | |
-| LR | $2 \times 10^{-4}$ | |
-| Batch size | 48 | |
-| Gradient Accum | 33 | |
+| **Backbone params** | **~93.9 M** | + v-head ~16.8M + contrastive ~0.5M |
+| Optimizer | AdamW | |
+| LR | $1 \times 10^{-4}$ | `train_imf.sh` default |
+| Batch × accum | 4 × 16 = **64** effective | Có thể 3×21≈63 |
 | EMA decay | 0.9995 | |
 | Max epochs | 400 | |
 | t sampler | logit-normal → curriculum | $\mu=-0.4$, scale=1.0 |
-| CFG $\omega$ | $[1, 8]$, $\beta=1$ | |
-| CFG context dropout | 0.1 | |
+| CFG | **Tắt** (`--disable-cfg-conditioning`) | Sau audit ep30 |
+| v-head weight | 0.5, depth 8 | Paper Table 4 |
+| Contrastive weight | 0.3, $\tau=0.1$ | InfoNCE on context |
+| Slat norm | per-channel (`slat_stats.pt`) | + occupancy mask |
 | Adaptive loss weighting | Enabled (100 bins, EMA decay=0.99) | iMF Appendix A |
-| Precision | BFloat16 | |
+| Precision | FP16/BF16 (AMP) | |
 
 ### 6.2. Tối ưu Phần cứng
 
@@ -1196,7 +1147,7 @@ Chi tiết chiến lược 2-stage và switch decision gate xem Section 9.4-9.6.
 | SSIM | Eq. Eval-4 | Render loss và so sánh 2D |
 | ArcFace cos | $\frac{f_{\text{render}} \cdot f_{\text{gt}}}{\|f_{\text{render}}\|\|f_{\text{gt}}\|}$ | Identity preservation |
 
-**Ablations dự kiến:** Mamba vs GRU, Hilbert vs Morton ordering, prefix token count (24 vs 8 vs 0), KL schedule, slat normalization (per-channel vs scalar vs none).
+**Ablations dự kiến:** Mamba vs GRU, Hilbert vs Morton, AdaLN-only vs prefix (đã chọn AdaLN), FFN on/off (`test_pure_t1_no_ffn.py`), contrastive weight, slat normalization.
 
 **Inference optimization:** TorchScript export, batched pipeline, target < 1s/mesh trên RTX 4090.
 
@@ -1522,34 +1473,29 @@ Section này ghi lại 3 đóng góp lớn ngày 18/05:
 - `scripts/remix_slat_lmdb_with_new_context.py` — merge new context với slat cũ (slat unchanged) trong ~5 phút
 - Training restart từ epoch 0 với context đầy đủ thông tin
 
-### 10.3. Audit Architecture vs Papers
+### 10.3. Audit Architecture vs Papers (cập nhật revision 18)
 
-**So sánh với iMF paper (arXiv:2512.02012v1)** — paper chính cho objective + conditioning:
+**So sánh với iMF paper (arXiv:2512.02012v1):**
 
-| Aspect | iMF Paper Sec 4.3 | FaceDiff | Verdict |
-|--------|---------------------|----------|---------|
-| Conditioning mechanism | **In-context tokens** (paper EXPLICITLY reject AdaLN-zero) | **In-context 24 prefix tokens** | ✅ **MATCH** |
-| Tokens cho class/context | 8 | 8 | ✅ MATCH |
-| Tokens cho r, t, interval, guidance | 4 mỗi loại | 4 mỗi loại | ✅ MATCH |
-| AdaLN-zero | KHÔNG dùng | KHÔNG dùng | ✅ MATCH |
-| Algorithm 2 (CFG training) | `v_c, v_u` separate forward | Refactored 2 forward (cond + no_grad uncond) | ✅ MATCH (math identical) |
-| Boundary supervision (r=t case) | Implicit qua `v_g` | Explicit via `mask_eq` branch | OK (FaceDiff design cleaner) |
+| Aspect | iMF Paper | FaceDiff v4 (22/05/2026) | Ghi chú |
+|--------|-----------|--------------------------|---------|
+| Conditioning | In-context prefix tokens | **Dual AdaLN broadcast** (0 prefix) | Deviate có chủ đích: prefix không ảnh hưởng slat positions trong SSM scan; AdaLN ctx đổi được output tại mọi index |
+| $(t,r,|t-r|,\omega)$ | Tokenized | `time_guidance_mlp` vector | Cùng thông tin, khác mechanism |
+| CFG training | Algorithm 2 | **Tắt** trong production train | Tránh VRAM + collapse sau ep30 audit |
+| Objective + JVP | iMF | Giữ (boundary 50% + JVP 50%) | |
+| FFN | Transformer blocks | **Có** per Mamba block | Khớp DiT-style capacity |
 
-**iMF paper Table 1(c) chứng minh in-context tốt hơn AdaLN:**
-- adaLN-zero: FID 4.57, params 133M
-- **in-context**: FID **4.09**, params **89M** (33% nhỏ hơn, 11% FID tốt hơn)
+**Lịch sử lỗi conditioning (ep≤30):** `cond_fusion` concat làm `time_cond` giống nhau khi $t$ giống nhau → cos_sim output ~0.99 (identity collapse). Đã bỏ; train lại scratch.
 
-**So sánh với DiM-3D paper (arXiv:2406.05038v1)** — paper inspiration cho Mamba backbone:
+**So sánh DiM-3D:**
 
-| Aspect | DiM-3D Paper | FaceDiff | Verdict |
-|--------|--------------|----------|---------|
-| BiMamba | Internal fwd+bwd shared input_proj | 2 separate Mamba modules với `torch.flip` | ⚠️ Equivalent functionally, FaceDiff dùng 2× params |
-| Hilbert ordering | ❌ Raster scan | ✅ **Hilbert curve** | ✅ FaceDiff cải thiện (preserve 3D locality) |
-| RMSNorm | LayerNorm | RMSNorm | ✅ FaceDiff (rẻ hơn) |
-| Output init | Standard | **Zero-init** | ✅ FaceDiff (chuẩn diffusion) |
-| FFN sub-block | ✅ Có (Mamba + FFN per block) | ❌ Không (chỉ BiMamba) | ⚠️ FaceDiff capacity giảm ~30% per block |
+| Aspect | DiM-3D | FaceDiff v4 |
+|--------|--------|-------------|
+| BiMamba + FFN | Có | ✅ Có |
+| Hilbert | Raster | ✅ Hilbert |
+| Output init | Standard | Xavier gain=0.02 (không zero backbone out) |
 
-**Verdict:** FaceDiff = **hybrid design** Mamba backbone (DiM-3D inspired) + in-context conditioning (iMF paper Sec 4.3 đúng) + iMF objective. Chỉ deviate FFN sub-block — defer evaluation đến Phase F (ep200 cos_sim).
+**Verdict:** FaceDiff v4 = Mamba+FFN backbone + **AdaLN conditioning** (trade-off vs paper in-context) + iMF loss + contrastive auxiliary. Checkpoint `c92ba00` trở đi dùng `adaLN_time` / `adaLN_ctx` — không load ckpt `cond_fusion` / `adaLN_modulation`.
 
 ### 10.4. CFG VRAM Optimization
 

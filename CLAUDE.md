@@ -7,7 +7,7 @@ FaceDiff generates high-quality 3D face meshes (200K+ vertices, 10-channel O-Vox
 ## Architecture (3 Stages)
 
 1. **SC-VAE** (35M params) — Sparse Convolution VAE. Compresses O-Voxel (256^3 grid, 10ch) to Slat tokens [4096, 32]. Uses spconv for sparse 3D convolutions.
-2. **VoxelMamba + iMF** (~21M params) — Bidirectional Mamba SSM backbone with Hilbert curve ordering. Generates Slat tokens conditioned on 946-dim hybrid context via Improved Mean Flow (1-step generation).
+2. **VoxelMamba + iMF** (~94M backbone + ~17M v-head + optional contrastive) — 12× BiMamba+FFN blocks, dual AdaLN conditioning (context + time), Hilbert ordering. Generates Slat via Improved Mean Flow (1-step). **No prefix tokens** (conditioning via AdaLN broadcast to all 4096 positions).
 3. **Decode** — SC-VAE decoder + Dual Contouring → polygon mesh with vertex colors.
 
 ## Key Data Formats
@@ -47,6 +47,10 @@ scripts/
   pack_slat_lmdb.py           # Convert .pt → merged LMDB
   pack_lmdb_fast.py           # Pack O-Voxel cache → LMDB
   build_context_lmdb.py       # Build hybrid context LMDB
+  train_imf.sh                # Launch Stage 2 (nohup + LMDB auto-detect)
+  test_pure_t1.py             # Memorization gate test (1 sample, t≈1)
+  test_imf_identity_t0.py     # Multi-ID identity diagnostic at t=0
+  test_imf_memorization.py    # Memorization / conditioning diagnostics
   eval_scvae_checkpoints.py   # Evaluate SC-VAE checkpoints
   test_sc_vae_recon_v2.py     # Reconstruction testing + mesh extraction
   generate_ovoxel_cache.py    # Generate O-Voxel cache
@@ -78,12 +82,40 @@ python scripts/precompute_slat_cache.py \
 # Pack slat cache → LMDB
 python scripts/pack_slat_lmdb.py
 
-# iMF training (offline mode, fastest)
-python src/train_imf.py --offline-data --slat-lmdb data/slat_context.lmdb --batch-size 64
+# iMF training (recommended: script + LMDB)
+bash scripts/train_imf.sh
+# Or manually:
+python src/train_imf.py --offline-data \
+  --slat-lmdb data/slat_context.lmdb \
+  --context-lmdb data/hybrid_context.lmdb \
+  --sc-vae-ckpt checkpoints/sc_vae_shape/epoch_500.pt \
+  --batch-size 4 --gradient-accumulation-steps 16 \
+  --disable-cfg-conditioning --disable-id-filters
 
 # Evaluate SC-VAE reconstruction
 python scripts/test_sc_vae_recon_v2.py --checkpoint checkpoints/sc_vae_shape/epoch_500.pt
 ```
+
+## Stage 2 Architecture (VoxelMamba v4, May 2026)
+
+**Sequence:** `[4096 slat tokens]` only (Hilbert-ordered). **No** 24 prefix tokens (`mamba_num_*_tokens=0`).
+
+**Per `BidirectionalMambaBlock` (×12):**
+1. **Time AdaLN** → modulate pre-Mamba: `x' = norm(x)·(1+scale_t)+shift_t`
+2. **BiMamba** — forward + backward Mamba scan, sum
+3. **Context AdaLN** — modulate Mamba output: `out' = out·(1+scale_c)+shift_c`
+4. **Gated residual:** `x = x + gate_t·out'` (`gate` bias init **1.0**, not 0)
+5. **FFN** (expand×4, GELU) + **Time AdaLN** + gated residual
+
+**Conditioning paths (separate, not concat-fusion):**
+- `ctx_cond = context_cond_mlp(context)` → AdaLN_ctx (scale+shift)
+- `time_cond = time_guidance_mlp(t, r, t−r, ω, tmin, tmax)` → AdaLN_time + AdaLN_ffn
+
+**Init fixes (2026-05-21):** `output_proj` uses **Xavier gain=0.02** (NOT zero — zero starved backbone gradients). FFN last layer zero-init for safe residual.
+
+**Training loss stack:** iMF velocity (boundary + JVP, 50/50) + v-head (weight 0.5, depth 8) + contrastive InfoNCE (weight 0.3, batch≥2). CFG **off** by default (`--disable-cfg-conditioning`). Slat **per-channel normalize** via `data/slat_stats.pt`.
+
+**Checkpoint compatibility:** Old runs with `adaLN_modulation` / `cond_fusion` / 24-prefix are **incompatible** — train scratch or use matching `stage2_model_config` in checkpoint.
 
 ## Important Implementation Details
 
@@ -103,6 +135,8 @@ python scripts/test_sc_vae_recon_v2.py --checkpoint checkpoints/sc_vae_shape/epo
 | Encoder input | 10ch (dv+delta+gamma+rgb), no centering | 6ch (dv+delta only), centered by -0.5 |
 | Render loss | Point splatting, 64px, optional | Mesh rasterization, 1024px, always on, depth=10.0 |
 | RGB | Joint geometry+color in SC-VAE | Separate PBR VAE |
+| Stage 2 conditioning | Dual AdaLN (ctx + time), no prefix | Prefix tokens + single AdaLN (TRELLIS-style) |
+| Stage 2 FFN | Per-block FFN (DiT-style) | Often in Transformer blocks only |
 
 ## Code Style
 

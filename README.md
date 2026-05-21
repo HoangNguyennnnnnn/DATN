@@ -7,7 +7,7 @@ FaceDiff hiện chạy theo pipeline 2 stage:
 
 Runtime mặc định hiện tại:
 - Stage 1: unified `shape_mat` 10 kênh `[dv(3), δ(3), γ(1), rgb(3)]`.
-- Stage 2: single-branch iMF với `VoxelMamba` (12 BiMamba layers, hidden 512, d_state 16).
+- Stage 2: single-branch iMF với `VoxelMamba` (~94M backbone: 12× BiMamba+FFN, dual AdaLN ctx/time, **không prefix**; + v-head ~17M).
 - Dual-branch (shape vs material) vẫn được hỗ trợ qua flag `--dual-branch`.
 - Hybrid U-DiT vẫn được hỗ trợ và inference tự nhận backbone theo checkpoint.
 
@@ -82,12 +82,25 @@ python src/train_sc_vae.py \
 # Hoặc dùng script tự động (Steps 4→5→6)
 bash scripts/resume_from_step4.sh
 
-# Stage 2: iMF mặc định
+# Stage 2: iMF (khuyến nghị — LMDB + CFG off)
+bash scripts/train_imf.sh
+# Hoặc thủ công:
 python src/train_imf.py \
-  --dataset both \
-  --sc-vae-ckpt checkpoints/sc_vae_shape/latest_step.pt \
-  --shape-feature-mode shape_mat \
-  --shape-target-in-channels 10
+  --offline-data \
+  --slat-lmdb data/slat_context.lmdb \
+  --context-lmdb data/hybrid_context.lmdb \
+  --sc-vae-ckpt checkpoints/sc_vae_shape/epoch_500.pt \
+  --batch-size 4 --gradient-accumulation-steps 16 \
+  --disable-cfg-conditioning --disable-id-filters
+```
+
+Precompute (một lần) trước khi pack LMDB:
+
+```bash
+python scripts/precompute_slat_cache.py \
+  --sc-vae-ckpt checkpoints/sc_vae_shape/epoch_500.pt \
+  --dataset both --context-lmdb data/hybrid_context.lmdb --skip-existing
+python scripts/pack_slat_lmdb.py
 ```
 
 Optional: branch-specific experiment
@@ -161,6 +174,23 @@ Ghi chú:
 - Dual contouring trong build `o_voxel` hiện phụ thuộc CUDA runtime; khi fail/OOM sẽ fallback marching cubes.
 - Nếu GPU đang đầy VRAM, DC fail là hành vi mong đợi chứ không phải pipeline sai.
 
-## 5. Tài liệu nghiên cứu
+## 5. Stage 2 — thay đổi kiến trúc (2026-05-22, commit `c92ba00`)
+
+| Trước | Hiện tại |
+|-------|----------|
+| 24 prefix tokens (ctx+t+r+interval+guidance) | **0 prefix** — `mamba_num_*_tokens=0` |
+| `cond_fusion` concat ctx+time | **Dual AdaLN**: `context_cond_mlp` + `time_guidance_mlp` |
+| Chỉ BiMamba, không FFN | **FFN** mỗi block (DiT-style) + gated residual |
+| `output_proj` zero-init | **Xavier gain=0.02** (tránh chết gradient backbone) |
+| AdaLN gate bias=0 | **gate bias=1.0** |
+| CFG bật mặc định | **`--disable-cfg-conditioning`** trong `train_imf.sh` |
+| ~21M params | **~94M** backbone + **~17M** v-head + contrastive |
+
+Checkpoint cũ (`adaLN_modulation`, `cond_fusion`, prefix) **không tương thích** — train lại từ scratch.
+
+Diagnostic scripts: `scripts/test_pure_t1.py` (memorization 1 mẫu), `scripts/test_imf_identity_t0.py`, `scripts/test_imf_memorization.py`.
+
+## 6. Tài liệu nghiên cứu
 
 - `Bao_cao_FaceDiff_ChiTiet.md`: báo cáo chi tiết toán học + kết quả + roadmap.
+- `CLAUDE.md`: tóm tắt kiến trúc + lệnh thường dùng cho agent.
