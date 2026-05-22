@@ -15,7 +15,7 @@ Tài liệu tham khảo (References):
 
 import os
 import math
-from typing import Optional, List
+from typing import Optional, List, Tuple
 
 import torch
 import torch.nn as nn
@@ -210,9 +210,9 @@ class BidirectionalMambaBlock(nn.Module):
             nn.SiLU(),
             nn.Linear(ctx_dim, 2 * dim, bias=True),  # scale + shift only
         )
-        # Init: small scale, zero shift → starts near identity
+        # Init: scale đủ lớn để context không bị time gate áp đảo (v7: 0.02 → 0.1)
         ctx_linear = self.adaLN_ctx[-1]
-        nn.init.normal_(ctx_linear.weight[:dim], mean=0.0, std=0.02)
+        nn.init.normal_(ctx_linear.weight[:dim], mean=0.0, std=0.1)
         nn.init.zeros_(ctx_linear.weight[dim:])
         nn.init.zeros_(ctx_linear.bias)
 
@@ -293,13 +293,12 @@ class VoxelMamba(nn.Module):
     
     Thay thế mạng IMFUNet1D với độ phức tạp O(N).
     
-    Kiến trúc (v6 — AdaLN additive, không prefix):
-    1. Nhúng đầu vào: [B, 4096, input_dim] -> [B, 4096, hidden_dim] (+ Hilbert reorder)
-    2. cond_emb = context_cond_mlp(ctx) + time_guidance_mlp(t, r, t−r, ω, cfg) → AdaLN mọi layer
-    3. 12× BidirectionalMambaBlock (chỉ 4096 slat tokens, không prefix)
-    4. output_proj → velocity [B, 4096, input_dim]
-
-    Legacy: num_*_tokens > 0 bật lại prefix in-context (checkpoint cũ).
+    Kiến trúc (v7 — per-layer context + prefix in-context):
+    1. Nhúng đầu vào + Hilbert reorder
+    2. Prefix tokens (ctx/time/r/interval/guidance) ở CUỐI sequence → backward Mamba lan context
+    3. ctx_cond_mlp(ctx) → ctx_layer_projs[i] mỗi layer (U-Net-style multi-inject)
+    4. 12× BidirectionalMambaBlock: time AdaLN + context AdaLN mỗi layer
+    5. output_proj → velocity [B, 4096, input_dim]
     
     iMF yêu cầu u_θ(z_t, r, t) phải được điều kiện hóa trên CẢ HAI dấu thời gian r (bắt đầu) và t (kết thúc).
     Nếu không có điều kiện r, mô hình sẽ suy thoái thành khớp luồng đơn giản (simple flow matching)
@@ -327,11 +326,12 @@ class VoxelMamba(nn.Module):
         context_dim: int = 946,
         backend: str = "auto",
         strict: bool = False,
-        num_context_tokens: int = 0,
-        num_time_tokens: int = 0,
-        num_r_tokens: int = 0,
-        num_interval_tokens: int = 0,
-        num_guidance_tokens: int = 0,
+        num_context_tokens: int = 8,
+        num_time_tokens: int = 4,
+        num_r_tokens: int = 4,
+        num_interval_tokens: int = 4,
+        num_guidance_tokens: int = 4,
+        use_per_layer_context: bool = True,
         dropout: float = 0.1,
         d_state: int = 16,
         d_conv: int = 4,
@@ -339,8 +339,18 @@ class VoxelMamba(nn.Module):
         ffn_expand: int = 4,
         use_hilbert_ordering: bool = True,
         use_ffn: bool = True,
+        context_segment_weights: Optional[Tuple[float, float, float]] = None,
+        context_arc_dim: int = 512,
+        context_flame_dim: int = 50,
     ):
         super().__init__()
+        self.context_arc_dim = int(context_arc_dim)
+        self.context_flame_dim = int(context_flame_dim)
+        if context_segment_weights is not None:
+            w = torch.tensor(context_segment_weights, dtype=torch.float32)
+            self.register_buffer("_context_segment_weights", w, persistent=True)
+        else:
+            self._context_segment_weights = None
         
         self.input_dim = input_dim
         self.hidden_dim = hidden_dim
@@ -453,6 +463,21 @@ class VoxelMamba(nn.Module):
         )
         self._time_dim = hidden_dim
         self._ctx_dim = hidden_dim
+        self.use_per_layer_context = bool(use_per_layer_context)
+        if self.use_per_layer_context:
+            self.ctx_layer_projs = nn.ModuleList([
+                nn.Sequential(
+                    nn.SiLU(),
+                    nn.Linear(hidden_dim, hidden_dim, bias=True),
+                )
+                for _ in range(num_layers)
+            ])
+            for proj in self.ctx_layer_projs:
+                last = proj[-1]
+                nn.init.normal_(last.weight, mean=0.0, std=0.02)
+                nn.init.zeros_(last.bias)
+        else:
+            self.ctx_layer_projs = None
 
         # Ngăn xếp các khối Mamba hai chiều + FFN với Dual AdaLN Conditioning
         self.layers = nn.ModuleList([
@@ -476,13 +501,12 @@ class VoxelMamba(nn.Module):
         self.output_proj = nn.Linear(hidden_dim, input_dim)
         
         # 2026-05-21 CRITICAL FIX: output_proj MUST NOT be zero-initialized!
-        # Zero W_out → gradient backprop through output_proj = W_out^T @ grad = 0
-        # → ALL upstream parameters (Mamba layers, AdaLN, context conditioning)
-        # receive ZERO gradient → model CANNOT learn from context/time!
-        # Only output_proj.weight/bias got gradient (outer product), everything else starved.
-        # Fix: Small Xavier init ensures gradients flow through backbone from step 1.
-        # gain=0.02 keeps initial velocity small (~0.02 * hidden_std) for stable training.
-        nn.init.xavier_uniform_(self.output_proj.weight, gain=0.02)
+        # Zero W_out → gradient = W_out^T @ grad = 0 → backbone starved.
+        # 2026-05-22 Paper alignment: iMF Appendix A uses N(0, σ²) with σ²=0.1/fan_in
+        # for all linear layers (except zero-init last residual layer).
+        # Old: xavier_uniform_(gain=0.02) → σ≈0.0009 (too small, 16x below paper).
+        # New: N(0, sqrt(0.1/fan_in)) → σ≈0.014 for fan_in=512.
+        nn.init.normal_(self.output_proj.weight, std=math.sqrt(0.1 / self.output_proj.in_features))
         nn.init.zeros_(self.output_proj.bias)
         
         # Hilbert Space-Filling Curve ordering
@@ -538,8 +562,23 @@ class VoxelMamba(nn.Module):
         guidance_feat = torch.stack([omega, cfg_tmin, cfg_tmax], dim=-1)
         time_feat = torch.cat([t_emb, r_emb, interval_emb, guidance_feat], dim=-1)
         time_cond = self.time_guidance_mlp(time_feat)
-        ctx_cond = self.context_cond_mlp(context)
+        ctx_in = self._scale_context_segments(context)
+        ctx_cond = self.context_cond_mlp(ctx_in)
         return ctx_cond, time_cond
+
+    def _scale_context_segments(self, context: torch.Tensor) -> torch.Tensor:
+        """Nhân Arc/FLAME/DINO trước MLP — giảm ảnh hưởng DINO trùng hướng (audit 2026-05-22)."""
+        w = self._context_segment_weights
+        if w is None:
+            return context
+        arc, fl = self.context_arc_dim, self.context_flame_dim
+        w = w.to(device=context.device, dtype=context.dtype)
+        parts = [
+            context[..., :arc] * w[0],
+            context[..., arc : arc + fl] * w[1],
+            context[..., arc + fl :] * w[2],
+        ]
+        return torch.cat(parts, dim=-1)
 
     def _forward_core(
         self,
@@ -592,8 +631,12 @@ class VoxelMamba(nn.Module):
 
         ctx_cond, time_cond = self._build_cond_emb(t, r, context, omega, cfg_tmin, cfg_tmax)
 
-        for layer in self.layers:
-            h = layer(h, time_cond, ctx_cond)
+        for i, layer in enumerate(self.layers):
+            if self.ctx_layer_projs is not None:
+                ctx_l = self.ctx_layer_projs[i](ctx_cond)
+            else:
+                ctx_l = ctx_cond
+            h = layer(h, time_cond, ctx_l)
 
         if self.total_prefix_tokens > 0:
             # Strip prefix tokens FROM END (not start)

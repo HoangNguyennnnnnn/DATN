@@ -806,12 +806,14 @@ def _build_stage2_model_config(model: nn.Module, imf_cfg, model_input_dim: int) 
         "num_time_tokens": int(getattr(model, "num_time_tokens", getattr(imf_cfg, "mamba_num_time_tokens", 4))),
         "num_r_tokens": int(getattr(model, "num_r_tokens", getattr(imf_cfg, "mamba_num_r_tokens", 4))),
         "num_interval_tokens": int(getattr(model, "num_interval_tokens", getattr(imf_cfg, "mamba_num_interval_tokens", 4))),
-        "num_guidance_tokens": int(getattr(model, "num_guidance_tokens", getattr(imf_cfg, "mamba_num_guidance_tokens", 0))),
-        "conditioning": "adaln_additive",
+        "num_guidance_tokens": int(getattr(model, "num_guidance_tokens", getattr(imf_cfg, "mamba_num_guidance_tokens", 4))),
+        "use_per_layer_context": bool(getattr(model, "use_per_layer_context", getattr(imf_cfg, "mamba_use_per_layer_context", True))),
+        "conditioning": "v7_prefix_per_layer_adaln",
         "d_state": int(getattr(imf_cfg, "mamba_d_state", 16)),
         "d_conv": int(getattr(imf_cfg, "mamba_d_conv", 4)),
         "expand": int(getattr(imf_cfg, "mamba_expand", 2)),
         "dropout": float(getattr(imf_cfg, "dropout", 0.0)),
+        "context_segment_weights": getattr(imf_cfg, "context_segment_weights", None),
     }
 
 
@@ -1205,6 +1207,10 @@ def train_imf(
     model_input_dim = imf_cfg.input_dim * 2 if imf_cfg.dual_branch else imf_cfg.input_dim
     print("\n[4/5] Building Voxel Mamba v5.0...")
     from src.models.voxel_mamba import VoxelMamba
+    seg_w = getattr(imf_cfg, "context_segment_weights", None)
+    if seg_w is not None and len(seg_w) == 3:
+        seg_w = tuple(float(x) for x in seg_w)
+        print(f"  [context] segment weights Arc/FLAME/DINO = {seg_w}")
     model = VoxelMamba(
         input_dim=model_input_dim,
         hidden_dim=imf_cfg.mamba_hidden_dim,
@@ -1218,10 +1224,12 @@ def train_imf(
         num_r_tokens=int(getattr(imf_cfg, "mamba_num_r_tokens", 4)),
         num_interval_tokens=int(getattr(imf_cfg, "mamba_num_interval_tokens", 4)),
         num_guidance_tokens=int(getattr(imf_cfg, "mamba_num_guidance_tokens", 4)),
+        use_per_layer_context=bool(getattr(imf_cfg, "mamba_use_per_layer_context", True)),
         d_state=imf_cfg.mamba_d_state,
         d_conv=imf_cfg.mamba_d_conv,
         expand=imf_cfg.mamba_expand,
         dropout=imf_cfg.dropout,
+        context_segment_weights=seg_w,
     ).to(device)
     print(f"  Architecture: Voxel Mamba [D={imf_cfg.mamba_hidden_dim}, L={imf_cfg.mamba_num_layers}]")
     print(f"  Backend: {getattr(model, 'backend', 'unknown')}")
@@ -1281,6 +1289,9 @@ def train_imf(
     ctx_classifier = None
     contrastive_weight = float(getattr(imf_cfg, "contrastive_loss_weight", 0.0))
     if contrastive_weight > 0.0:
+        from src.models.imf_diffusion import contrastive_target_dim
+        contrastive_mode = str(getattr(imf_cfg, "contrastive_mode", "arcface"))
+        ctx_out_dim = contrastive_target_dim(int(imf_cfg.context_dim), contrastive_mode)
         if stage2_model_config["arch"] == "voxel_mamba":
             model_hidden_dim = int(stage2_model_config["hidden_dim"])
         else:
@@ -1288,11 +1299,12 @@ def train_imf(
         ctx_classifier = nn.Sequential(
             nn.Linear(model_hidden_dim, model_hidden_dim),
             nn.SiLU(),
-            nn.Linear(model_hidden_dim, int(imf_cfg.context_dim)),
+            nn.Linear(model_hidden_dim, ctx_out_dim),
         ).to(device)
         n_ctx = sum(p.numel() for p in ctx_classifier.parameters())
-        print(f"  [contrastive] ctx_classifier params={n_ctx/1e6:.2f}M, "
-              f"weight={contrastive_weight:.2f}, temp={float(getattr(imf_cfg, 'contrastive_temperature', 0.1)):.2f}")
+        print(f"  [contrastive] mode={contrastive_mode} out_dim={ctx_out_dim} "
+              f"params={n_ctx/1e6:.2f}M, weight={contrastive_weight:.2f}, "
+              f"temp={float(getattr(imf_cfg, 'contrastive_temperature', 0.1)):.2f}")
 
     param_count = sum(p.numel() for p in model.parameters() if p.requires_grad)
     if v_head is not None:
@@ -1400,6 +1412,8 @@ def train_imf(
         epoch_material_loss = 0.0
         epoch_boundary_loss = 0.0
         epoch_jvp_loss = 0.0
+        epoch_context_sep_loss = 0.0
+        epoch_ctx_sep_cos = 0.0
         epoch_cfg_context_keep = 0.0
         t_start = time.time()
         optimizer.zero_grad(set_to_none=True)
@@ -1443,6 +1457,9 @@ def train_imf(
                     ctx_classifier=ctx_classifier,
                     contrastive_loss_weight=float(getattr(imf_cfg, "contrastive_loss_weight", 0.0)),
                     contrastive_temperature=float(getattr(imf_cfg, "contrastive_temperature", 0.1)),
+                    contrastive_mode=str(getattr(imf_cfg, "contrastive_mode", "arcface")),
+                    context_velocity_sep_weight=float(getattr(imf_cfg, "context_velocity_sep_weight", 0.0)),
+                    context_velocity_sep_margin=float(getattr(imf_cfg, "context_velocity_sep_margin", 0.0)),
                     occupancy_mask=occupancy_mask,
                     return_components=True,
                 )
@@ -1452,6 +1469,8 @@ def train_imf(
                 loss_material_val = float(loss_out.get("loss_material", 0.0))
                 loss_boundary_val = float(loss_out.get("loss_boundary", 0.0))
                 loss_jvp_val = float(loss_out.get("loss_jvp", 0.0))
+                loss_context_sep_val = float(loss_out.get("loss_context_sep", 0.0))
+                ctx_sep_cos_val = float(loss_out.get("ctx_sep_cos", 0.0))
                 loss_v_head_val = float(loss_out.get("loss_v_head", 0.0))
                 material_keep_val = float(loss_out.get("material_supervision_keep_ratio", 1.0))
                 cfg_keep_val = float(loss_out.get("cfg_context_keep_ratio", 1.0))
@@ -1482,7 +1501,15 @@ def train_imf(
                 epoch_material_loss += loss_material_val
                 epoch_boundary_loss += loss_boundary_val
                 epoch_jvp_loss += loss_jvp_val
+                epoch_context_sep_loss += loss_context_sep_val
+                epoch_ctx_sep_cos += ctx_sep_cos_val
                 epoch_cfg_context_keep += cfg_keep_val
+
+            # 2026-05-22: Defensive empty_cache để giảm memory fragmentation (Bug C).
+            # JVP path tạo allocation pattern không-chuẩn → PyTorch caching allocator
+            # accumulate fragments → OOM sau ~1000 steps. Periodic release giúp tránh.
+            if (batch_idx + 1) % 500 == 0 and device.type == 'cuda':
+                torch.cuda.empty_cache()
 
             if (batch_idx + 1) % 200 == 0 or batch_idx == 0:
                 _total_batches = len(dataloader)
@@ -1536,8 +1563,12 @@ def train_imf(
         elapsed = time.time() - t_start
         vram = torch.cuda.max_memory_allocated(device) / (1024**2) if device.type == 'cuda' else 0
         
+        sep_w = float(getattr(imf_cfg, "context_velocity_sep_weight", 0.0))
         print(f"  Epoch {epoch+1}/{imf_cfg.num_epochs} | "
-              f"Velocity Loss: {avg_loss:.4f} | "
+              f"Loss: {avg_loss:.4f} | "
+              f"bnd: {epoch_boundary_loss / n_batches:.4f} | "
+              f"ctx_sep: {epoch_context_sep_loss / n_batches:.4f} (w={sep_w}) | "
+              f"cos_u: {epoch_ctx_sep_cos / n_batches:.3f} | "
               f"LR: {optimizer.param_groups[0]['lr']:.2e} | "
               f"{elapsed:.1f}s | VRAM: {vram:.0f}MB")
         if imf_cfg.dual_branch:
@@ -1635,6 +1666,14 @@ def main():
     parser.add_argument("--gradient-accumulation-steps", type=int, default=None, help="Gradient accumulation steps (effective_batch = batch_size × this)")
     parser.add_argument("--lr", type=float, default=None, help="Override learning_rate")
     parser.add_argument("--checkpoint-dir", type=str, default=None, help="Override checkpoint output directory")
+    parser.add_argument("--contrastive-loss-weight", type=float, default=None, help="InfoNCE weight on context (0=off). Use ~0.2 after balanced context LMDB.")
+    parser.add_argument("--contrastive-mode", type=str, default=None, choices=["arcface", "flame", "full"],
+                        help="InfoNCE target block: arcface (512), flame (50), or full 946-d")
+    parser.add_argument("--context-velocity-sep-weight", type=float, default=None,
+                        help="relu(cos(u|ctx_a,u|ctx_b)-margin)^2 on shared z_t (>=0). Default 0.25.")
+    parser.add_argument("--context-velocity-sep-margin", type=float, default=None,
+                        help="Margin for context sep loss (penalize cos above this).")
+    parser.add_argument("--ratio-r-neq-t", type=float, default=None, help="Fraction of batches with r≠t (JVP). 0.5 = paper default.")
     parser.add_argument("--num-workers", type=int, default=0, help="Dataloader workers (0 to avoid EGL crash over caches)")
     parser.add_argument("--no-wandb", action="store_true", help="Disable WandB")
     parser.add_argument("--no-ema", action="store_true", help="Disable EMA")
@@ -1717,6 +1756,16 @@ def main():
         cfg.imf.learning_rate = args.lr
     if args.checkpoint_dir:
         cfg.imf.checkpoint_dir = args.checkpoint_dir
+    if args.contrastive_loss_weight is not None:
+        cfg.imf.contrastive_loss_weight = float(max(0.0, args.contrastive_loss_weight))
+    if args.contrastive_mode is not None:
+        cfg.imf.contrastive_mode = str(args.contrastive_mode)
+    if args.context_velocity_sep_weight is not None:
+        cfg.imf.context_velocity_sep_weight = float(max(0.0, args.context_velocity_sep_weight))
+    if args.context_velocity_sep_margin is not None:
+        cfg.imf.context_velocity_sep_margin = float(args.context_velocity_sep_margin)
+    if args.ratio_r_neq_t is not None:
+        cfg.imf.ratio_r_neq_t = float(max(0.0, min(1.0, args.ratio_r_neq_t)))
     if args.num_workers is not None:
         cfg.data.num_workers = args.num_workers   # Cấu hình đè cực quan trọng chống EGL multiprocessing crash!
         

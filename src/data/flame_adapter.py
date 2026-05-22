@@ -167,12 +167,45 @@ class FLAMEExpressionAdapter(nn.Module):
             pass
 
 
+def balance_hybrid_context_segments(
+    identity: torch.Tensor,
+    expression: torch.Tensor,
+    back_shape: Optional[torch.Tensor] = None,
+    *,
+    arc_dim: int = 512,
+    flame_dim: int = 50,
+) -> torch.Tensor:
+    """L2-normalize từng khối trước khi concat — tránh DINO (~‖·‖≈46) lấn át ArcFace (~1).
+
+    2026-05-22: Audit phát hiện ArcFace chỉ ~0.05% năng lượng của vector 946-d thô
+    → context_cond_mlp gần như chỉ thấy DINO → model bỏ qua identity.
+    """
+    import torch.nn.functional as F
+
+    id_n = identity.reshape(-1, arc_dim)
+    id_n = F.normalize(id_n, p=2, dim=-1)
+
+    ex = expression.reshape(-1, flame_dim)
+    ex_norm = ex.norm(dim=-1, keepdim=True)
+    ex_n = torch.where(ex_norm > 1e-6, ex / ex_norm.clamp(min=1e-8), ex)
+
+    if back_shape is None:
+        return torch.cat([id_n, ex_n], dim=-1)
+
+    d_n = back_shape.reshape(-1, back_shape.shape[-1])
+    d_n = F.normalize(d_n, p=2, dim=-1)
+    return torch.cat([id_n, ex_n, d_n], dim=-1)
+
+
 def create_hybrid_context(
     identity: torch.Tensor,
     expression: torch.Tensor,
     back_shape: Optional[torch.Tensor] = None,
+    balance_segments: bool = True,
 ) -> torch.Tensor:
     """Kết hợp ArcFace [512] + FLAME [50] + DINOv2_Back [384] → [946]."""
+    if balance_segments:
+        return balance_hybrid_context_segments(identity, expression, back_shape)
     if back_shape is None:
         return torch.cat([identity, expression], dim=-1)
     return torch.cat([identity, expression, back_shape], dim=-1)

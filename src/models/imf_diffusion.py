@@ -20,6 +20,95 @@ import torch.nn as nn
 import torch.nn.functional as F
 from typing import Optional, Tuple
 
+# Hybrid context layout: ArcFace(512) + FLAME(50) + DINOv2(384)
+HYBRID_ARC_DIM = 512
+HYBRID_FLAME_DIM = 50
+HYBRID_DINO_DIM = 384
+
+
+def contrastive_target_dim(
+    context_dim: int,
+    mode: str = "arcface",
+    arc_dim: int = HYBRID_ARC_DIM,
+    flame_dim: int = HYBRID_FLAME_DIM,
+) -> int:
+    """Output dim của ctx_classifier theo mode contrastive."""
+    m = (mode or "full").strip().lower()
+    if m == "arcface":
+        return int(arc_dim)
+    if m == "flame":
+        return int(flame_dim)
+    return int(context_dim)
+
+
+def slice_contrastive_context(
+    context: torch.Tensor,
+    mode: str = "arcface",
+    arc_dim: int = HYBRID_ARC_DIM,
+    flame_dim: int = HYBRID_FLAME_DIM,
+) -> torch.Tensor:
+    """Lấy khối context cho InfoNCE — mặc định chỉ ArcFace (audit: margin identity tốt nhất)."""
+    m = (mode or "full").strip().lower()
+    if m == "arcface":
+        return context[..., :arc_dim]
+    if m == "flame":
+        return context[..., arc_dim : arc_dim + flame_dim]
+    return context
+
+
+def context_velocity_separation_loss(
+    model: nn.Module,
+    z_t: torch.Tensor,
+    t: torch.Tensor,
+    r: torch.Tensor,
+    context: torch.Tensor,
+    *,
+    contrastive_mode: str = "arcface",
+    margin: float = 0.0,
+    omega: Optional[torch.Tensor] = None,
+    cfg_tmin: Optional[torch.Tensor] = None,
+    cfg_tmax: Optional[torch.Tensor] = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    Penalty >= 0: relu(cos(u(z,t,ctx_a), u(z,t,ctx_b)) - margin)^2 với cùng z_t,t,r.
+    Không cộng cos thẳng (tránh total loss âm khi cos < 0).
+    """
+    b = int(context.shape[0])
+    device = z_t.device
+    if b < 2:
+        z = torch.zeros((), device=device)
+        return z, z
+
+    arc = slice_contrastive_context(context, mode=contrastive_mode)
+    arc_n = F.normalize(arc, dim=-1)
+    sim_arc = (arc_n[0:1] @ arc_n.t()).squeeze(0)
+    sim_arc[0] = -2.0
+    j = int(sim_arc.argmin().item())
+    if j == 0:
+        j = 1
+
+    z0 = z_t[0:1]
+    t0 = t[0:1]
+    r0 = r[0:1]
+    if omega is None:
+        omega0 = torch.ones_like(t0)
+    else:
+        omega0 = omega[0:1]
+    if cfg_tmin is None:
+        tmin0 = torch.zeros_like(t0)
+    else:
+        tmin0 = cfg_tmin[0:1]
+    if cfg_tmax is None:
+        tmax0 = torch.ones_like(t0)
+    else:
+        tmax0 = cfg_tmax[0:1]
+
+    u_a = model(z0, t0, context[0:1], r=r0, omega=omega0, cfg_tmin=tmin0, cfg_tmax=tmax0)
+    u_b = model(z0, t0, context[j : j + 1], r=r0, omega=omega0, cfg_tmin=tmin0, cfg_tmax=tmax0)
+    cos = F.cosine_similarity(u_a.float().flatten(1), u_b.float().flatten(1), dim=1)
+    loss = F.relu(cos - float(margin)).pow(2).mean()
+    return loss, cos.mean().detach()
+
 
 class ImprovedMeanFlow:
     """
@@ -168,11 +257,20 @@ class ImprovedMeanFlow:
         r_candidate = (u * t).clamp(0.0, 1.0 - self.sigma_min)
 
         # Multi-way split with dice roll
+        # FIX 2026-05-22 (Bug A): Gate all special-case masks behind ratio_r_neq_t > 0.
+        # Previously endpoint_jvp_mask was HARDCODED at 5% regardless of config → with
+        # ratio_r_neq_t=0 (pure boundary mode), JVP path still triggered for 5% of batches,
+        # causing unexpected memory fragmentation + OOM.
+        if self.ratio_r_neq_t <= 0:
+            # Pure boundary mode — no JVP, no near-boundary forcing
+            r = t.clone()
+            return t, r
+
         dice = torch.rand(batch_size, device=device)
         # 0.00-0.15: near-boundary (r=t=1-σ, stable MSE at t≈1)
         # 0.15-0.20: endpoint JVP (r=0, t=1-σ, direct mean-velocity learning)
-        # 0.20-0.50: random JVP (r<t, standard iMF)
-        # 0.50-1.00: boundary (r=t, standard v-loss)
+        # 0.20-ratio: random JVP (r<t, standard iMF)
+        # ratio-1.00: boundary (r=t, standard v-loss)
         near_boundary_mask = dice < 0.15
         endpoint_jvp_mask = (dice >= 0.15) & (dice < 0.20)
         random_jvp_mask = (dice >= 0.20) & (dice < self.ratio_r_neq_t)
@@ -367,6 +465,9 @@ class ImprovedMeanFlow:
         ctx_classifier: Optional[nn.Module] = None,
         contrastive_loss_weight: float = 0.0,
         contrastive_temperature: float = 0.1,
+        contrastive_mode: str = "arcface",
+        context_velocity_sep_weight: float = 0.0,
+        context_velocity_sep_margin: float = 0.0,
         occupancy_mask: Optional[torch.Tensor] = None,
         return_components: bool = False,
     ):
@@ -600,14 +701,35 @@ class ImprovedMeanFlow:
         loss_contrastive = torch.zeros((), device=device)
         if ctx_classifier is not None and contrastive_loss_weight > 0.0 and _cached_hidden is not None and b >= 2:
             hidden_pooled = _cached_hidden.mean(dim=1)  # [B, hidden_dim]
-            pred_ctx = ctx_classifier(hidden_pooled)  # [B, context_dim]
-            pred_norm = F.normalize(pred_ctx, dim=-1)
-            target_norm = F.normalize(context.detach(), dim=-1)
-            # Similarity matrix: each pred vs all targets in batch
-            sim_matrix = pred_norm @ target_norm.t()  # [B, B]
-            sim_matrix = sim_matrix / max(contrastive_temperature, 1e-4)
-            labels = torch.arange(b, device=device)
-            loss_contrastive = F.cross_entropy(sim_matrix, labels)
+            pred_ctx = ctx_classifier(hidden_pooled)
+            ctx_tgt = slice_contrastive_context(context.detach(), mode=contrastive_mode)
+            # Bỏ mẫu ArcFace = 0 (face detect fail)
+            valid = ctx_tgt.norm(dim=-1) > 1e-3
+            if int(valid.sum()) >= 2:
+                pred_v = pred_ctx[valid]
+                tgt_v = ctx_tgt[valid]
+                pred_norm = F.normalize(pred_v, dim=-1)
+                target_norm = F.normalize(tgt_v, dim=-1)
+                sim_matrix = pred_norm @ target_norm.t()
+                sim_matrix = sim_matrix / max(contrastive_temperature, 1e-4)
+                labels = torch.arange(int(valid.sum()), device=device)
+                loss_contrastive = F.cross_entropy(sim_matrix, labels)
+
+        loss_context_sep = torch.zeros((), device=device)
+        ctx_sep_cos_monitor = torch.zeros((), device=device)
+        if float(context_velocity_sep_weight) > 0.0 and b >= 2:
+            loss_context_sep, ctx_sep_cos_monitor = context_velocity_separation_loss(
+                model,
+                z_t,
+                t,
+                r,
+                context_cond,
+                contrastive_mode=contrastive_mode,
+                margin=float(context_velocity_sep_margin),
+                omega=omega_effective,
+                cfg_tmin=cfg_tmin,
+                cfg_tmax=cfg_tmax,
+            )
 
         if mask_eq_all:
             # Tất cả đều là biên → hàm mất mát khớp luồng đơn giản
@@ -622,6 +744,8 @@ class ImprovedMeanFlow:
                 loss = loss + float(v_loss_weight) * (per_sample_v_head * adaptive_w).mean()
             if contrastive_loss_weight > 0.0:
                 loss = loss + float(contrastive_loss_weight) * loss_contrastive
+            if float(context_velocity_sep_weight) > 0.0:
+                loss = loss + float(context_velocity_sep_weight) * loss_context_sep
             loss_boundary = per_sample_boundary.mean()
             if return_components:
                 return {
@@ -632,6 +756,8 @@ class ImprovedMeanFlow:
                     "loss_material": loss_material.detach(),
                     "loss_v_head": loss_v_head.detach(),
                     "loss_contrastive": loss_contrastive.detach(),
+                    "loss_context_sep": loss_context_sep.detach(),
+                    "ctx_sep_cos": ctx_sep_cos_monitor.detach(),
                     "material_supervision_keep_ratio": material_keep_ratio.detach(),
                     "cfg_context_keep_ratio": cfg_context_keep_ratio.detach(),
                     "adaptive_weight_scale": adaptive_w.mean().detach(),
@@ -741,6 +867,8 @@ class ImprovedMeanFlow:
             loss = loss + float(v_loss_weight) * (per_sample_v_head * adaptive_w).mean()
         if contrastive_loss_weight > 0.0:
             loss = loss + float(contrastive_loss_weight) * loss_contrastive
+        if float(context_velocity_sep_weight) > 0.0:
+            loss = loss + float(context_velocity_sep_weight) * loss_context_sep
 
         if return_components:
             return {
@@ -751,6 +879,8 @@ class ImprovedMeanFlow:
                 "loss_material": loss_material.detach(),
                 "loss_v_head": loss_v_head.detach(),
                 "loss_contrastive": loss_contrastive.detach(),
+                "loss_context_sep": loss_context_sep.detach(),
+                "ctx_sep_cos": ctx_sep_cos_monitor.detach(),
                 "material_supervision_keep_ratio": material_keep_ratio.detach(),
                 "cfg_context_keep_ratio": cfg_context_keep_ratio.detach(),
                 "adaptive_weight_scale": adaptive_scale.detach(),
