@@ -1,10 +1,10 @@
 # Báo cáo Nghiên cứu Chuyên sâu: FaceDiff — Hệ thống Tạo sinh Khuôn mặt 3D Một Bước trên Đơn GPU
 
-**Ngày cập nhật:** 22/05/2026 (revision 18 — VoxelMamba v4: dual AdaLN + FFN, bỏ prefix/cond_fusion, CFG off, slat norm)  
+**Ngày cập nhật:** 23/05/2026 (snapshot v7 — kiến trúc + thuật toán hiện tại, đối chiếu code)  
 **Tác giả:** Nhóm nghiên cứu FaceDiff  
 **Cấu hình Mục tiêu:** Đơn GPU RTX 4090 (24GB VRAM)  
-**Bộ dữ liệu:** FaceVerse_3D (2,100 — high detail) & FaceScape (18,298 — registered)  
-**Trạng thái checkpoint:** SC-VAE epoch 500 done. Stage 2 iMF VoxelMamba v4 **đang train** (`scripts/train_imf.sh`, LMDB offline, CFG tắt). Kiến trúc mới từ commit `c92ba00` — checkpoint ep30 cũ (`cond_fusion` / prefix) không load được. Xem Mục 4.4.1 và Section 10.
+**Bộ dữ liệu:** FaceVerse_3D (2,100) & FaceScape (18,298) — tổng 20,398 mesh  
+**Trạng thái pipeline:** SC-VAE ep500 ✅ done. Stage 2 VoxelMamba v7 đang chạy Phase B+C (JVP + v-head + contrastive InfoNCE) — context conditioning đã được activate (xem Section 7).
 
 ---
 
@@ -13,14 +13,12 @@
 1. [Giới thiệu Đề tài](#1-giới-thiệu-đề-tài)
 2. [Mục tiêu và Đóng góp](#2-mục-tiêu-và-đóng-góp)
 3. [Nền tảng Toán học](#3-nền-tảng-toán-học)
-4. [Phương pháp Đề xuất](#4-phương-pháp-đề-xuất)
+4. [Phương pháp Đề xuất (Kiến trúc v7)](#4-phương-pháp-đề-xuất-kiến-trúc-v7)
 5. [Bộ dữ liệu: FaceScape & FaceVerse](#5-bộ-dữ-liệu-facescape--faceverse)
 6. [Thực nghiệm](#6-thực-nghiệm)
-7. [Phân tích và Lịch sử Bug Fix](#7-phân-tích-và-giải-thích-kết-quả)
-8. [Kế hoạch Tiếp theo](#8-kế-hoạch-tiếp-theo)
-9. [Trạng thái Hiện tại — Identity-Collapse Fix + 2-Stage Strategy (17/05/2026)](#9-trạng-thái-hiện-tại--identity-collapse-fix--chiến-lược-2-stage-training-17052026)
-10. [Revision 17 — Architecture Audit + CFG VRAM Optimization (18/05/2026)](#10-revision-17--architecture-audit--cfg-vram-optimization-18052026)
-11. [Tài liệu Tham khảo](#tài-liệu-tham-khảo)
+7. [Phân tích Kết quả và Phát hiện Quan trọng](#7-phân-tích-kết-quả-và-phát-hiện-quan-trọng)
+8. [Trạng thái Hiện tại và Lộ trình](#8-trạng-thái-hiện-tại-và-lộ-trình)
+9. [Tài liệu Tham khảo](#tài-liệu-tham-khảo)
 
 ---
 
@@ -69,7 +67,7 @@ Thách thức chính của các phương pháp hiện tại:
 ### 2.2. Đóng góp
 
 1. **SC-VAE tiết kiệm VRAM** với SparseResMLPBlock (giảm 45% VRAM so với ConvNeXt 3D) + Generative Pruning (Rho Loss)
-2. **VoxelMamba** — backbone SSM $O(N)$ (~94M): 12× BiMamba+FFN, dual AdaLN (context + time), Hilbert ordering. *Thiết kế lai: DiM-3D [14] + VoxelMamba [4] ordering; điều kiện hóa broadcast AdaLN (không prefix token).*
+2. **VoxelMamba v7** — backbone SSM $O(N)$ (105.4M backbone + 16.8M v-head + 0.5M contrastive = 122.7M tổng): 12× BiMamba+FFN, dual AdaLN (context post-Mamba + time pre-Mamba & pre-FFN), Hilbert ordering, **24 prefix tokens at END of sequence** (8 context + 4 time + 4 r + 4 interval + 4 guidance) để backward Mamba lan toả context, **per-layer context projections** (12× Linear(512→512)) để tránh Mamba SSM nuốt signal điều kiện. *Thiết kế lai: BiMamba từ DiM-3D [4], Hilbert ordering từ VoxelMamba [4b], AdaLN-style conditioning từ DiT.*
 3. **iMF (Improved Mean Flow)** — sinh 1 bước bằng JVP correction
 4. **Hybrid Context 946-dim** = ArcFace(512) + FLAME(50) + DINOv2(384)
 5. **Tối ưu đơn GPU**: INT4 quantization, BFloat16, gradient checkpointing, LMDB caching
@@ -643,9 +641,9 @@ $$\mathcal{L}_{\text{total}} = \mathcal{L}_{\text{recon}} + w_{\text{KL}} \cdot 
 
 Với $w_{\text{KL}} = 10^{-6}$, $w_\rho = 0.2$.
 
-### 4.4. Giai đoạn 2: VoxelMamba + iMF
+### 4.4. Giai đoạn 2: VoxelMamba v7 + iMF
 
-> **Nguồn gốc kiến trúc (revision 18):** Backbone VoxelMamba là *thiết kế lai* kết hợp: (1) Bidirectional Mamba từ DiM-3D [14], (2) Hilbert ordering từ VoxelMamba [4], (3) **Dual AdaLN** điều kiện hóa context + time (broadcast tới 4096 slat tokens — **không** dùng 24 prefix tokens; `mamba_num_*_tokens=0`). FaceDiff **không** dùng Dual-scale SSM Block / Implicit Window Partition từ paper VoxelMamba gốc. Lịch sử: prefix + `cond_fusion` (ep≤30) đã bỏ vì identity collapse và prefix không lan truyền tới vị trí dữ liệu trong scan SSM.
+> **Nguồn gốc kiến trúc:** Backbone VoxelMamba v7 là *thiết kế lai* kết hợp: (1) Bidirectional Mamba từ DiM-3D [4], (2) Hilbert ordering từ VoxelMamba [4b], (3) **Dual AdaLN** điều kiện hóa context + time (DiT-style), (4) **24 prefix tokens at END of sequence** + (5) **per-layer context projections**. FaceDiff **không** dùng Dual-scale SSM Block / Implicit Window Partition từ paper VoxelMamba gốc (sản phẩm khác — LiDAR detection). Lý do v7 quay lại prefix tokens: AdaLN broadcast đơn thuần không đủ override Mamba SSM dynamics (xem Section 7.2 — phát hiện Mamba absorb context).
 
 #### 4.4.0. Pipeline dữ liệu iMF: `SlatDataset`, cache đĩa, và chế độ `--offline-data`
 
@@ -675,142 +673,351 @@ Với $w_{\text{KL}} = 10^{-6}$, $w_\rho = 0.2$.
 
 **Hạn chế cần biết:** Chế độ `dual_branch` (hai SC-VAE) chưa được script precompute hỗ trợ — cần mở rộng script hoặc tạm tắt dual khi precompute. `num_workers>0` có thể gây xung đột EGL/GPU với renderer; mặc định `0` an toàn.
 
-#### 4.4.1. Kiến trúc VoxelMamba (v4 — dual AdaLN, không prefix)
+#### 4.4.1. Kiến trúc VoxelMamba v7
 
-**Sơ đồ tổng quan Pipeline:**
+**Tham số tổng (đối chiếu `src/models/voxel_mamba.py`):**
+
+| Thành phần | Params | Ghi chú |
+|------------|--------|---------|
+| `input_embed` (Linear 32→512) | ~16K | `src/models/voxel_mamba.py:362` |
+| Prefix token embeddings (24 tokens × 512) | ~12K | ctx=8, time=4, r=4, interval=4, guidance=4 |
+| 12× `BidirectionalMambaBlock` (~8.5M/block) | ~102M | core backbone |
+| `context_cond_mlp` (946→512→512) | ~750K | conditioning head |
+| `time_guidance_mlp` (528→512→512) | ~530K | t, r, |t-r|, ω, tmin, tmax |
+| 12× `ctx_layer_projs` (512→512) | ~3.15M | per-layer context projection (v7) |
+| `output_norm` (RMSNorm) + `output_proj` (512→32) | ~16K | output head |
+| **VoxelMamba v7 backbone** | **~105.4M** | đã đo trên GPU |
+| `v_head` (depth=8, MLP-style block) | ~16.8M | bật ở Phase B (`use_auxiliary_v_head=True`) |
+| `ctx_classifier` (contrastive InfoNCE, arcface mode) | ~0.5M | bật ở Phase C (`contrastive_loss_weight=0.2`) |
+| **Tổng khi train Phase B+C** | **~122.7M** | |
+
+**Sơ đồ Pipeline tổng quan:**
 
 ```mermaid
 graph TD
     subgraph INPUTS["Đầu vào"]
         Z["z_t [B,4096,32]"]
         CTX["ctx [B,946]"]
-        T["t, r, |t-r|, Ω"]
+        T["t, r, |t-r|, ω, t_min, t_max"]
     end
 
-    Z --> EMB["input_embed 32→512"]
-    EMB --> HIL["Hilbert reorder"]
+    Z --> EMB["input_embed (Linear 32→512)"]
+    EMB --> HIL["Hilbert reorder<br/>raster→hilbert (h2r)"]
 
-    CTX --> CTXMLP["context_cond_mlp → ctx_cond [B,512]"]
-    T --> TIMEMLP["time_guidance_mlp(t,r,interval,ω) → time_cond [B,512]"]
+    CTX --> SCALE["_scale_context_segments<br/>Arc×1.5, FLAME×1.0, DINO×0.5"]
+    SCALE --> CTXMLP["context_cond_mlp<br/>946→512→512"]
+    CTXMLP --> CTXCOND["ctx_cond [B,512]"]
 
-    HIL --> STACK["12× BidirectionalMambaBlock"]
-    CTXMLP --> STACK
-    TIMEMLP --> STACK
+    T --> TIMEMLP["time_guidance_mlp<br/>(3·128 + 3)→512→512"]
+    TIMEMLP --> TIMECOND["time_cond [B,512]"]
 
-    STACK --> HILINV["Hilbert inverse"]
-    HILINV --> OUTN["output_norm RMSNorm"]
-    OUTN --> OUTP["output_proj 512→32<br/>Xavier gain=0.02"]
+    HIL --> PREP["Append 24 prefix tokens<br/>AT END (pos 4096..4120)"]
+    PREP --> STACK["12× BidirectionalMambaBlock"]
+    CTXCOND --> CTXPROJ["ctx_layer_projs[i] per layer"]
+    CTXPROJ --> STACK
+    TIMECOND --> STACK
+
+    STACK --> STRIP["Strip prefix from END<br/>→ [B,4096,512]"]
+    STRIP --> HILINV["Hilbert inverse<br/>hilbert→raster (r2h)"]
+    HILINV --> OUTN["output_norm (RMSNorm)"]
+    OUTN --> OUTP["output_proj 512→32<br/>normal_(std=√(0.1/fan_in))≈0.014"]
     OUTP --> U["u_θ [B,4096,32]"]
 
     style STACK fill:#0f3460,stroke:#533483,color:#fff
+    style PREP fill:#16213e,stroke:#e94560,color:#fff
+    style OUTP fill:#533483,stroke:#fff,color:#fff
 ```
 
-**Chi tiết `BidirectionalMambaBlock` (×12):**
+**Sequence Layout — Prefix Tokens at END (v7 design):**
+
+Chuỗi đầy đủ vào Mamba: `[4096 slat tokens (Hilbert-ordered) + 24 prefix tokens]` = **4120 tokens**.
+
+```
+positions:    0    1    ...    4095 | 4096 4097 ... 4103 | 4104 ... 4107 | 4108 ... 4111 | 4112 ... 4115 | 4116 ... 4119
+content:      slat_0 slat_1 ... slat_4095 | ctx[8 tokens]  | t[4 tokens] | r[4 tokens]   | interval[4]   | guidance[4]
+              └─────── data tokens ──────┘ └────────────────── prefix tokens (24) ──────────────────────┘
+```
+
+**Lý do đặt prefix ở CUỐI:**
+- **Forward Mamba** quét: $0 \to 4119$ → trạng thái ẩn ở vị trí cuối có **tổng hợp cả context + data** → backward path có "summary" hoàn chỉnh.
+- **Backward Mamba** quét: $4119 \to 0$ → bắt đầu từ prefix → **state mang context lan toả về mọi data token** ngay từ token 4095 trở về 0.
+- Nếu đặt prefix ở đầu (token 0): Forward scan có context tốt nhưng backward scan kết thúc ở prefix → state cuối lại không thấy data.
+- Đặt prefix ở END là cân bằng tối ưu cho bidirectional scan.
+
+**Strip prefix khi xuất:** Sau 12 layer, lấy lại 4096 data tokens đầu, bỏ 24 prefix cuối, rồi áp Hilbert inverse permutation.
+
+**Chi tiết `BidirectionalMambaBlock` (×12) — code-accurate:**
 
 ```mermaid
 graph TD
-    X["x [B,4096,512]"] --> AT["AdaLN_time: norm·(1+s_t)+b_t"]
-    AT --> BM["BiMamba fwd+bwd sum"]
-    BM --> AC["AdaLN_ctx: out·(1+s_c)+b_c"]
-    AC --> G1["x += gate_t·out (gate bias=1)"]
-    G1 --> FF["FFN expand×4 + AdaLN_time + gate"]
-    FF --> OUT["x' [B,4096,512]"]
+    X["x [B, 4120, 512]"] --> NORM1["x_norm = RMSNorm(x)"]
+    TC["time_cond [B, 512]"] --> AT["adaLN_time = SiLU + Linear<br/>→ scale_t, shift_t, gate_t [B, 512] × 3"]
+    NORM1 --> AT
+    AT --> MOD["x_mod = x_norm·(1+scale_t) + shift_t"]
+    MOD --> FWD["forward_mamba(x_mod)"]
+    MOD --> BWD["backward_mamba(flip(x_mod)) → flip"]
+    FWD --> SUM["out = fwd + bwd"]
+    BWD --> SUM
+    SUM --> DROP["Dropout"]
+    DROP --> AC["adaLN_ctx = SiLU + Linear<br/>→ scale_c, shift_c [B, 512] × 2"]
+    CL["ctx_l = ctx_layer_projs[i](ctx_cond)"] --> AC
+    AC --> CMOD["out = out·(1+scale_c) + shift_c"]
+    CMOD --> GATE1["x = residual + gate_t·out"]
+
+    GATE1 --> NORM2["x_norm_ffn = RMSNorm_ffn(x)"]
+    AF["adaLN_ffn = SiLU + Linear<br/>→ scale_f, shift_f, gate_f"]
+    TC --> AF
+    NORM2 --> AF
+    AF --> FFNMOD["x_ffn = x_norm_ffn·(1+scale_f)+shift_f"]
+    FFNMOD --> FFN["FFN: Linear↑4× + GELU + Linear↓ (zero-init)"]
+    FFN --> GATE2["x = x + gate_f · FFN(x_ffn)"]
+    GATE2 --> OUT["x' [B, 4120, 512]"]
+
+    style FWD fill:#0f3460,stroke:#fff,color:#fff
+    style BWD fill:#0f3460,stroke:#fff,color:#fff
+    style AC fill:#533483,stroke:#fff,color:#fff
+    style GATE1 fill:#16213e,stroke:#e94560,color:#fff
 ```
 
-**Tham số (đo trên GPU, `facediff` env):**
+**Code chính xác của BidirectionalMambaBlock.forward()** ([voxel_mamba.py:242-287](src/models/voxel_mamba.py#L242)):
 
-| Thành phần | Params |
-|------------|--------|
-| VoxelMamba backbone | **~93.9M** |
-| v-head (depth 8) | **~16.8M** |
-| contrastive `ctx_classifier` | **~0.5M** |
-| Prefix tokens | **0** (`mamba_num_*_tokens=0`) |
+```python
+def forward(self, x, time_cond, ctx_cond):
+    # Sub-block 1: Time AdaLN → BiMamba → Context AdaLN → Gated residual
+    scale_t, shift_t, gate_t = self.adaLN_time(time_cond).chunk(3, dim=-1)
+    residual = x
+    x_norm = self.norm(x)
+    x_mod = x_norm * (1 + scale_t.unsqueeze(1)) + shift_t.unsqueeze(1)
+    fwd = self.forward_mamba(x_mod)
+    bwd = torch.flip(self.backward_mamba(torch.flip(x_mod, dims=[1])), dims=[1])
+    out = self.dropout(fwd + bwd)
+    scale_c, shift_c = self.adaLN_ctx(ctx_cond).chunk(2, dim=-1)
+    out = out * (1 + scale_c.unsqueeze(1)) + shift_c.unsqueeze(1)
+    x = residual + gate_t.unsqueeze(1) * out
 
-**Fallback GRU** *(khi mamba-ssm không khả dụng):*
-
-```mermaid
-graph LR
-    IN_GRU["Input x<br/>[B, L, 512]"] --> NORM_GRU["RMSNorm"]
-    NORM_GRU --> GRU["nn.GRU<br/>input=512, hidden=256<br/>bidirectional=True<br/>→ [B, L, 512]"]
-    GRU --> DROP_GRU["Dropout(0.1)"]
-    DROP_GRU --> RES_GRU["+ residual"]
-    IN_GRU --> RES_GRU
-    RES_GRU --> OUT_GRU["Output [B, L, 512]"]
-
-    style GRU fill:#533483,stroke:#e94560,color:#ffffff
+    # Sub-block 2: Time AdaLN → FFN → Gated residual
+    scale_f, shift_f, gate_f = self.adaLN_ffn(time_cond).chunk(3, dim=-1)
+    x_ffn = self.norm_ffn(x) * (1 + scale_f.unsqueeze(1)) + shift_f.unsqueeze(1)
+    x = x + gate_f.unsqueeze(1) * self.ffn(x_ffn)
+    return x
 ```
 
-**Luồng huấn luyện iMF (iMF Training Flow):**
+**Init chi tiết (đối chiếu `voxel_mamba.py:195-217`):**
 
-```mermaid
-graph TD
-    subgraph SAMPLING["Lấy mẫu"]
-        X["x_data<br/>[B, 4096, 32]"] --> INTERP
-        E["ε ~ N(0,I)"] --> INTERP
-        TS["t ~ logit-normal(μ=-0.4)"] --> INTERP["z_t = (1-t)x + tε"]
-        TS --> R_SAMPLE["r: 50% r=t, 50% r~U[0,1]"]
-    end
+| Thành phần | Khởi tạo | Lý do |
+|-----------|---------|------|
+| `adaLN_time` scale weights | $\mathcal{N}(0, 0.02^2)$ | DiT default, modulation nhẹ ban đầu |
+| `adaLN_time` shift weights | 0 | identity transform |
+| `adaLN_time` gate bias | **1.0** (NOT zero!) | Mamba nhận full gradient từ step 0; gate=0 sẽ làm "trap" gradient |
+| `adaLN_ctx` scale weights | $\mathcal{N}(0, 0.1^2)$ (**v7: 5× larger**) | Context modulation cần mạnh hơn để không bị time gate áp đảo và không bị Mamba dynamics nuốt |
+| `adaLN_ctx` shift weights + bias | 0 | identity at init |
+| `adaLN_ffn` (tương tự `adaLN_time`) | scale std=0.02, shift=0, gate_bias=1.0 | |
+| `FFN.net[-2]` (linear cuối) | 0 weight, 0 bias | FFN xuất phát là identity → residual ổn định |
+| `output_proj` weights | $\mathcal{N}(0, \sqrt{0.1/\text{fan\_in}}^2)$ ≈ $\sigma{\approx}0.014$ | iMF Appendix A. Trước đó `xavier(0.02)` $\sigma{\approx}0.0009$ → 16× quá nhỏ, gradient bị starve |
+| `output_proj` bias | 0 | |
 
-    subgraph FORWARD["Forward Passes"]
-        INTERP --> V_PASS["v_θ = VoxelMamba(z_t, t=t, r=t)<br/>Boundary condition"]
-        INTERP --> JVP_PASS["u, du/dt = JVP(VoxelMamba,<br/>(z_t, r, t), (v_θ, 0, 1))<br/>create_graph=False"]
-        V_PASS --> JVP_PASS
-    end
+**Per-layer Context Projections** ([voxel_mamba.py:466-480](src/models/voxel_mamba.py#L466)):
 
-    subgraph COMPOUND["Compound Function"]
-        JVP_PASS --> V_COMPOUND["V = u + (t-r) × stopgrad(du/dt)"]
-        R_SAMPLE --> V_COMPOUND
-    end
-
-    subgraph LOSS["Loss Computation"]
-        V_COMPOUND --> LOSS_JVP["L_JVP = ||V - (ε-x)||²<br/>(khi r≠t)"]
-        V_PASS --> LOSS_BND["L_boundary = ||v_θ - (ε-x)||²<br/>(khi r=t)"]
-        LOSS_JVP --> ADAPTIVE["w_adaptive(t) × weighted_avg"]
-        LOSS_BND --> ADAPTIVE
-        V_PASS --> LOSS_VHEAD["L_v-head = ||v_head(h) - (ε-x)||²"]
-        ADAPTIVE --> TOTAL["L_total = w_adaptive × (α·L_bnd + (1-α)·L_jvp) + 0.1 × w_adaptive × L_vhead"]
-        LOSS_VHEAD --> TOTAL
-    end
-
-    subgraph INFERENCE["1-Step Sampling (Inference)"]
-        Z1["z_1 ~ N(0,I)"] --> UNET["u = VoxelMamba(z_1, t=1, r=0, ctx)"]
-        UNET --> Z0["z_0 = z_1 - u<br/>→ SC-VAE Decode → Mesh"]
-    end
-
-    style SAMPLING fill:#1a1a2e,stroke:#16213e,color:#e0e0e0
-    style FORWARD fill:#0f3460,stroke:#533483,color:#e0e0e0
-    style COMPOUND fill:#16213e,stroke:#e94560,color:#e0e0e0
-    style LOSS fill:#533483,stroke:#e94560,color:#e0e0e0
-    style INFERENCE fill:#0f3460,stroke:#e94560,color:#ffffff
+```python
+if self.use_per_layer_context:                       # True trong v7
+    self.ctx_layer_projs = nn.ModuleList([
+        nn.Sequential(
+            nn.SiLU(),
+            nn.Linear(hidden_dim, hidden_dim, bias=True),
+        )
+        for _ in range(num_layers)                   # 12 instances
+    ])
 ```
 
-**Điều kiện hóa (broadcast AdaLN, không prefix):**
+Khi forward, mỗi layer $i$ nhận projection riêng: `ctx_l = self.ctx_layer_projs[i](ctx_cond)`. Tổng tham số extra: $12 \times (512 \times 512 + 512) \approx 3.15$M.
 
-- $\text{ctx\_cond} = \text{MLP}(\text{ctx}_{946}) \in \mathbb{R}^{512}$ → `adaLN_ctx` (scale+shift trên output Mamba).
-- $\text{time\_cond} = \text{time\_guidance\_mlp}(t, r, |t-r|, \omega, t_{\min}, t_{\max})$ → `adaLN_time` + `adaLN_ffn` (scale, shift, **gate**; bias gate khởi tạo **1.0**).
-- $(t-r)$ vẫn được đưa vào `time_guidance_mlp` (theo iMF Tab. 4), không qua token riêng.
+**Lý do per-layer:** Phát hiện 23/05/2026 (Section 7.2) — single global `ctx_cond` broadcast tới tất cả 12 layer làm Mamba **học cách suppress** context modulation. Per-layer projection cho phép mỗi layer "nhìn" context dưới một transformation khác → giảm gradient interference và tạo path tham số phong phú hơn cho context signal.
 
-**Sinusoidal embedding** cho $t$, $r$, $|t-r|$ trong `time_guidance_mlp` ($d=128$).
+**Conditioning paths chi tiết:**
 
-**Output projection (revision 18):** `output_proj` dùng **Xavier uniform, gain=0.02** — không zero-init (zero-init + gate=0 từng làm mất gradient qua backbone/context). FFN layer cuối vẫn zero-init cho residual an toàn.
+1. **Context path** (post-Mamba modulation):
+   - Input: `ctx [B, 946]` = `[ArcFace 512] + [FLAME 50] + [DINOv2 384]`
+   - `_scale_context_segments`: multiply theo `context_segment_weights = (1.5, 1.0, 0.5)`
+     - Sau khi LMDB đã L2-normalize từng segment, scale lại để cân bằng energy
+     - Arc × 1.5: ưu tiên identity nhưng không độc tôn
+     - FLAME × 1.0: giữ nguyên expression
+     - DINO × 0.5: giảm bớt back-of-head (đỡ trùng hướng identity)
+   - `context_cond_mlp`: Linear(946, 512) + SiLU + Linear(512, 512) → `ctx_cond [B, 512]`
+   - `ctx_layer_projs[i](ctx_cond)` → `ctx_l [B, 512]` cho layer $i$
+   - `adaLN_ctx(ctx_l)` → `(scale_c, shift_c)` → modulate **output** của BiMamba (POST-Mamba)
 
-#### 4.4.2. Hàm Mất mát iMF (Triển khai trong FaceDiff)
+2. **Time path** (pre-Mamba + pre-FFN modulation):
+   - Input scalars: $t, r, |t-r|, \omega, t_{\min}, t_{\max}$ — 6 giá trị/sample
+   - Sinusoidal embed cho 3 giá trị thời gian: $t, r, |t-r|$ → mỗi giá trị $\in \mathbb{R}^{128}$
+   - Concat: $[\text{emb}(t), \text{emb}(r), \text{emb}(|t-r|), \omega, t_{\min}, t_{\max}] \in \mathbb{R}^{3 \cdot 128 + 3 = 387}$ (thực tế là 528 do chiều embed dim phụ thuộc cấu hình)
+   - `time_guidance_mlp`: Linear(_, 512) + SiLU + Linear(512, 512) → `time_cond [B, 512]`
+   - `adaLN_time(time_cond)` → `(scale_t, shift_t, gate_t)` → modulate **pre-Mamba** + gate
+   - `adaLN_ffn(time_cond)` → `(scale_f, shift_f, gate_f)` → modulate **pre-FFN** + gate
 
-Xem chi tiết toán học tại Mục 3.4. Triển khai cụ thể:
+**Hilbert Space-Filling Curve Ordering** ([voxel_mamba.py:512-526](src/models/voxel_mamba.py#L512)):
 
-$$\mathcal{L} = \mathbb{E}_{t,r}\left[w_{\text{adaptive}}(t) \cdot \ell(t,r)\right] + w_v \cdot \mathbb{E}_{t}\left[w_{\text{adaptive}}(t) \cdot \ell_{\text{v-head}}(t)\right] + w_c \cdot \mathcal{L}_{\text{contrastive}} \tag{iMF-L}$$
+- $\text{grid\_size} = \sqrt[3]{4096} = 16$, là lũy thừa của 2 ✓
+- `get_hilbert_permutation_tensors(16)` precompute 2 tensor:
+  - `_hilbert_to_raster [4096]`: chỉ số raster cần lấy để thành Hilbert order
+  - `_raster_to_hilbert [4096]`: chỉ số nghịch
+- Forward: `h = h[:, self._hilbert_to_raster, :]` ngay sau `input_embed`
+- Inverse: `h = h[:, self._raster_to_hilbert, :]` ngay trước `output_proj`
+- **Bảo toàn spatial locality 3D → 1D:** Hai voxel gần nhau trong lưới $16^3$ có xác suất cao là láng giềng trong chuỗi 1D → BiMamba (xử lý chuỗi tuần tự) nắm bắt được spatial structure mà không cần explicit positional encoding
 
-Với $w_v=0.5$, $w_c=0.3$ (`src/config.py`, 2026-05-21). Contrastive: pool hidden → linear → InfoNCE với `context` (batch≥2).
+#### 4.4.2. Hàm Mất mát iMF (Chi tiết Triển khai trong FaceDiff)
 
-Trong đó $\ell(t,r)$ là loss theo nhánh: nếu $r=t$ thì $\ell = \|v_\theta - (\varepsilon - x)\|^2$, nếu $r\neq t$ thì $\ell = \|V_\theta - (\varepsilon - x)\|^2$. V-head dùng mục tiêu FM thô $(\varepsilon - x)$ và cũng được weight bởi $w_{\text{adaptive}}(t)$ theo Appendix A.
+Mục này mô tả `ImprovedMeanFlow.compute_loss()` ([src/models/imf_diffusion.py:447-888](src/models/imf_diffusion.py#L447)) — luồng hoàn chỉnh từ input đến gradient.
 
-**Adaptive Loss Weighting** *(theo MeanFlow paper gốc, kế thừa bởi iMF Appendix A):*
+**Bước 1 — Lấy mẫu nhiễu và thời gian** ([imf_diffusion.py:528-535](src/models/imf_diffusion.py#L528)):
 
-$$w_{\text{adaptive}}(t) = \frac{1}{\overline{\ell}(\text{bin}(t))} \cdot \frac{1}{Z} \tag{iMF-Lw}$$
+```python
+e = torch.randn_like(x_data)                # Nhiễu Gauss, ε ~ N(0, I)
+t, r = self._sample_t_r(b, device)          # Sample (t, r) theo strategy
+z_t = self._interpolate(x_data, e, t)       # z_t = (1-t)·x + t·ε
+```
 
-Trong đó $\overline{\ell}(b)$ là EMA (decay=0.99) của loss trung bình tại bin $b$ (100 bins chia đều $[0,1]$), $Z$ là hệ số chuẩn hóa để $\mathbb{E}[w] = 1$. Mục đích: các vùng timestep có loss cao tự nhiên bị down-weight, đảm bảo mỗi vùng $t$ đóng góp đều vào gradient.
+**Strategy lấy mẫu (t, r)** — `_sample_t_r()` ([imf_diffusion.py:234-294](src/models/imf_diffusion.py#L234)):
 
-**Material Condition Dropout (10–20%):** Drop $v_{\text{target}}[\text{material}]$ thay bằng $v_\theta[\text{material}].\text{detach()}$ → ngăn overfitting color.
+| Trường hợp `ratio_r_neq_t` | Phân nhánh | Mục đích |
+|----------------------------|-----------|---------|
+| **= 0.0** (Phase A) | `r = t` cho TẤT CẢ samples | Pure boundary, không JVP — clean signal isolation |
+| **> 0.0** (Phase B/C) | Multi-way split: | |
+| | 0%-15%: near-boundary (t=1-σ, r=t) | Stable MSE tại t≈1 (avoid JVP noise) |
+| | 15%-20%: endpoint JVP (r=0, t=1-σ) | Học mean-velocity trực tiếp cho 1-step sampling |
+| | 20%-ratio: random JVP (r ~ U[0, t]) | Standard iMF JVP branch |
+| | ratio-100%: boundary (r=t) | Standard v-loss |
+
+Với mặc định `ratio_r_neq_t=0.5`: 15% near-boundary + 5% endpoint + 30% random JVP + 50% boundary.
+
+**Bước 2 — Lấy mẫu thời gian $t$** — `_sample_t()` ([imf_diffusion.py:212-232](src/models/imf_diffusion.py#L212)):
+
+Mặc định `t_sampler="logit_normal"` (theo iMF paper Table 4):
+
+$$t = \sigma\!\left(\frac{u - \mu}{s}\right), \quad u \sim \mathcal{N}(0, 1), \quad \mu = -0.4, \; s = 1.0$$
+
+Phân phối này tập trung mật độ ở $t \in [0.2, 0.6]$ — vùng signal mạnh nhất cho velocity field (xa cả nhiễu thuần và data thuần).
+
+**Bước 3 — CFG branch (tùy chọn, hiện tại DISABLED)** ([imf_diffusion.py:544-605](src/models/imf_diffusion.py#L544)):
+
+Khi `cfg_conditioning=True`:
+- 2 forward passes riêng (Paper Alg. 2, optimized cho VRAM):
+  - **Conditional pass** (có gradient): `v_θ = model(z_t, t, ctx, r=t, ω, tmin, tmax)`
+  - **Unconditional pass** (`torch.no_grad`): `v_uncond = model(z_t, t, 0, r=t, ω, tmin, tmax)`
+- Mục tiêu: $v_{\text{target}} = (\varepsilon - x) + (1 - 1/\omega)(v_\theta - v_{\text{uncond}}).\text{detach}()$
+
+Khi `cfg_conditioning=False` (hiện tại — sau audit ep30 cũ): $v_{\text{target}} = \varepsilon - x$ (raw FM target).
+
+**Bước 4 — Phân nhánh Boundary vs JVP** ([imf_diffusion.py:628-633](src/models/imf_diffusion.py#L628)):
+
+```python
+mask_eq = (r == t)             # [B] — True khi r=t (boundary path)
+mask_eq_all = mask_eq.all()    # toàn batch là boundary?
+```
+
+**Branch 1 — Pure Boundary ($r=t$ toàn batch)** ([imf_diffusion.py:734-765](src/models/imf_diffusion.py#L734)):
+
+Khi tất cả samples có $r=t$:
+$$\mathcal{L}_{\text{boundary}}(z_t, t, \text{ctx}) = \| v_\theta(z_t, t, \text{ctx}, r{=}t) - v_{\text{target}} \|^2_{\text{weighted}}$$
+
+Trong đó `weighted_MSE` áp dụng:
+- `channel_weights` (cho dual_branch shape/material — không dùng ở v7)
+- `position_weights` từ `occupancy_mask` (upweight non-zero slat positions — voxel thực)
+
+**Branch 2 — JVP ($r \neq t$)** ([imf_diffusion.py:767-833](src/models/imf_diffusion.py#L767)):
+
+```python
+# Forward pass cho dự đoán u
+u_pred = model(z_t_jvp, t_jvp, ctx_jvp, r=r_jvp, ω=ω, ...)
+
+# Vector tiếp tuyến cho JVP
+v_tangent = v_head_pred.detach()  # nếu có v_head; fallback v_θ
+
+# JVP với tangent (dz/dt = v, dt/dt = 1)
+dudt = torch.autograd.functional.jvp(
+    fn=lambda z, t: model(z, t, ctx, r=r, ...),
+    inputs=(z_t_jvp, t_jvp),
+    v=(v_tangent, ones_like(t_jvp)),
+    create_graph=False,
+)
+
+# Compound function: V = u + (t-r)·sg(du/dt)
+V = u_pred + (t - r).view(-1, 1, 1) * dudt.detach()
+
+# Loss JVP
+loss_jvp = weighted_MSE(V, v_target_jvp)
+```
+
+**Fallback sai phân hữu hạn** khi JVP API không khả dụng ([imf_diffusion.py:808-825](src/models/imf_diffusion.py#L808)):
+
+$$\frac{\partial u}{\partial t} \approx \frac{u_\theta(z_{t+\delta}, t+\delta, r) - u_\theta(z_t, t, r)}{\delta}, \quad \delta = 10^{-3}$$
+
+**Bước 5 — Auxiliary v-head loss** ([imf_diffusion.py:666-694](src/models/imf_diffusion.py#L666)):
+
+Khi `use_auxiliary_v_head=True` (Phase B/C):
+
+$$\mathcal{L}_{\text{v-head}} = \| v_{\text{head}}(h_{\text{hidden}}) - (\varepsilon - x) \|^2_{\text{weighted}}$$
+
+- $h_{\text{hidden}}$ = trạng thái ẩn của backbone (cached từ forward pass đầu, tránh recompute)
+- Mục tiêu = $\varepsilon - x$ **thô** (không qua CFG augmentation) — theo iMF Appendix A
+- v_head architecture: 8 MLP-style blocks với expand×4 + GELU, hidden=512, output=32 (latent_dim)
+- Cộng vào tổng loss với weight $w_v = 0.5$
+
+**Bước 6 — Contrastive InfoNCE loss (Phase C)** ([imf_diffusion.py:696-716](src/models/imf_diffusion.py#L696)):
+
+Khi `contrastive_loss_weight > 0` và `ctx_classifier` tồn tại và batch_size ≥ 2:
+
+```python
+hidden_pooled = _cached_hidden.mean(dim=1)             # [B, 512]
+pred_ctx = ctx_classifier(hidden_pooled)                # [B, 512] (arcface mode)
+ctx_tgt = slice_contrastive_context(context, "arcface") # ArcFace 512 slice
+# Bỏ samples ArcFace=0 (face detect fail)
+valid = ctx_tgt.norm(dim=-1) > 1e-3
+pred_n = F.normalize(pred_ctx[valid], dim=-1)
+tgt_n = F.normalize(ctx_tgt[valid], dim=-1)
+sim_matrix = (pred_n @ tgt_n.T) / temperature  # [V, V], τ=0.1
+labels = torch.arange(valid.sum(), device=device)
+loss_contrastive = F.cross_entropy(sim_matrix, labels)
+```
+
+**Vai trò contrastive:** Force pooled hidden state phải predict được ArcFace embedding của context → backbone không thể "ignore context" mà vẫn minimize loss. Đây là cơ chế "**ép Mamba phải dùng context**" — xem Section 7.2 cho deep dive về tại sao Mamba SSM tự nhiên có xu hướng absorb context modulation.
+
+**Bước 7 — Adaptive Loss Weighting (EMA per-bin)** ([imf_diffusion.py:170-178, 348-410](src/models/imf_diffusion.py#L170)):
+
+100 bins cho $t \in [0, 1]$, EMA decay 0.99:
+
+$$w_{\text{adaptive}}(t) = \frac{1/\overline{\ell}(\text{bin}(t))}{\frac{1}{B}\sum_{i} 1/\overline{\ell}(\text{bin}(t_i))}$$
+
+Các vùng $t$ có loss EMA cao bị down-weight để variance gradient ổn định. **Ở Phase A diagnostic hiện tại: DISABLED** (`adaptive_loss_weighting=False`) để isolate main signal — EMA có thể amplify variance bins khi bf16 + small batch.
+
+**Bước 8 — Tổng loss** ([imf_diffusion.py:863-871](src/models/imf_diffusion.py#L863)):
+
+$$\boxed{\mathcal{L}_{\text{total}} = \underbrace{\mathbb{E}[w_a(t) \cdot \ell_{\text{main}}(t,r)]}_{\text{boundary or JVP}} + w_v \cdot \mathbb{E}[w_a(t) \cdot \ell_{\text{v-head}}(t)] + w_c \cdot \mathcal{L}_{\text{contrastive}} + w_{\text{sep}} \cdot \mathcal{L}_{\text{ctx\_sep}}}$$
+
+Với cấu hình hiện tại (Phase C):
+- $w_v = 0.5$ (v_loss_weight)
+- $w_c = 0.2$ (contrastive_loss_weight, Phase C — tắt ở Phase A/B)
+- $w_{\text{sep}} = 0$ (context_velocity_sep_weight, **luôn DISABLED** — gây OOM, xem Section 7.2)
+
+**Bước 9 — 1-Step Sampling (Inference)** ([imf_diffusion.py:891-955](src/models/imf_diffusion.py#L891)):
+
+```python
+# Khởi tạo nhiễu thuần
+z_1 = torch.randn([B, 4096, 32])
+
+# Single forward pass: dự đoán average velocity từ t=1 về r=0
+u_pred = model(z_1, t=1, context, r=0, ω=1, tmin=0, tmax=1)
+
+# Trừ một lần ra dữ liệu
+z_0 = z_1 - u_pred
+
+# Denormalize bằng slat_stats
+z_0_denorm = z_0 * slat_std + slat_mean
+
+# Decode qua SC-VAE → O-Voxel → Mesh (Dual Contouring)
+mesh = SC_VAE.decode(z_0_denorm) → dual_contouring(...)
+```
+
+**Không cần ODE solver** (Euler/Heun/DPM). Toàn pipeline: 1 forward pass VoxelMamba + 1 forward pass SC-VAE Decoder + DC extraction ≈ **<2 giây/mesh** trên RTX 4090.
 
 ### 4.5. Hệ thống Ngữ cảnh Lai (Hybrid Context)
 
@@ -847,11 +1054,25 @@ Trong đó $\beta$ = shape params (300-dim), $\theta$ = pose (jaw rotation), $\p
 - Đầu ra: 384-dim CLS token từ render mặt sau
 - **Mục đích:** Thông tin gáy, tóc, tai — phần ArcFace không nắm bắt
 
-#### 4.5.4. Điều kiện hóa trong backbone (không tokenize prefix)
+#### 4.5.4. Điều kiện hóa trong backbone (v7: prefix tokens + per-layer ctx + AdaLN)
 
-$$\text{ctx}_{946} \xrightarrow{\text{context\_cond\_mlp}} \text{ctx\_cond} \in \mathbb{R}^{512} \xrightarrow{\text{AdaLN\_ctx (broadcast)}} \text{modulate mọi vị trí Slat} \tag{Ctx-2}$$
+Trong v7, context $\text{ctx} \in \mathbb{R}^{946}$ ảnh hưởng đến model qua **3 cơ chế đồng thời**:
 
-(Legacy: khi `mamba_num_context_tokens>0`, vẫn có nhánh prefix tokenizer cho checkpoint cũ.)
+1. **Prefix tokens (8 ctx tokens at END):** `ctx [946]` → MLP → 8 embedding vectors $\in \mathbb{R}^{512}$ → append vào cuối sequence (positions 4096..4103). Forward Mamba scan kết thúc ở các token này → state ẩn cuối "biết" context. Backward Mamba bắt đầu từ đây → lan toả context về mọi data token.
+2. **Per-layer context projection:** `ctx_cond [512]` → 12 transformation riêng `ctx_layer_projs[i]` → mỗi layer "thấy" context dưới góc nhìn khác.
+3. **adaLN_ctx (post-Mamba modulation):** $\text{out}_{\text{Mamba}} \cdot (1 + \text{scale}_c) + \text{shift}_c$, với $\text{scale}_c, \text{shift}_c$ tính từ `ctx_l` của layer hiện tại.
+
+**Lý do dùng 3 cơ chế đồng thời (deep dive ở Section 7.2):**
+- Chỉ adaLN-only (như v4): Mamba SSM dynamics (mean activation $\approx 0.32$, modulation $\pm 10\text{-}22\%$) → context bị **nuốt** sau 12 layer → hidden state cos(ctx_a, ctx_b) $\approx 0.999$.
+- Cộng thêm prefix tokens: backward state mang context tới mọi data position.
+- Cộng thêm per-layer projection: tránh "single point of failure" — mỗi layer có gradient path riêng đến context.
+- Cộng thêm **contrastive InfoNCE** ở Phase C: force hidden state phải predict được ArcFace embedding → ép Mamba phải dùng context.
+
+**Context segment scaling** (`_scale_context_segments` — voxel_mamba.py:569-581):
+
+$$\text{ctx}_{\text{scaled}} = [\underbrace{f_{\text{arc}} \times 1.5}_{\text{identity}\uparrow}, \underbrace{f_{\text{flame}} \times 1.0}_{\text{expression}}, \underbrace{f_{\text{dino}} \times 0.5}_{\text{back}\downarrow}]$$
+
+Trọng số $(1.5, 1.0, 0.5)$ được chọn cho **balanced LMDB** (đã L2-normalize từng segment độc lập). Nếu dùng raw LMDB (chưa balanced), cần $(3.0, 2.0, 0.5)$ để bù DINO trùng hướng identity.
 
 ---
 
@@ -948,32 +1169,79 @@ Số liệu thực tế đọc trực tiếp từ `data_signature` được hash
 
 > Đính chính: revision 1 viết "Precision BFloat16" và LR=$5\times 10^{-5}$ cố định. Hai số này *đúng cho train-from-scratch nhưng sai cho ckpt epoch 397*. Trong checkpoint thực tế (đọc từ `resume_contract.details.lr_scheduler='cosine_with_min_lr'` và `learning_rate=1e-5`), AMP dtype là FP16 (xem `train_sc_vae.py` dòng `amp_dtype = torch.float16`) chứ không phải BFloat16, và base_lr là $1\times 10^{-5}$ chứ không phải $5\times 10^{-5}$.
 
-#### 6.1.2. VoxelMamba + iMF
+#### 6.1.2. VoxelMamba v7 + iMF (Phase A/B/C Protocol)
+
+**Cấu hình kiến trúc cố định** (chung cho mọi phase):
+
+| Tham số | Giá trị | Ghi chú / Code reference |
+|---------|---------|--------------------------|
+| BiMamba layers | 12 | `mamba_num_layers` ([config.py:222](src/config.py#L222)) |
+| Hidden dim | 512 | `mamba_hidden_dim` |
+| SSM state dim ($n$) | 16 | `mamba_d_state` |
+| SSM conv kernel | 4 | `mamba_d_conv` |
+| Expansion factor | 2 | inner = $512 \times 2 = 1024$ |
+| FFN per block | Có (expand×4, GELU, zero-init cuối) | DiT-style |
+| Prefix tokens (END) | **24** (8 ctx + 4 t + 4 r + 4 interval + 4 guidance) | `mamba_num_*_tokens` |
+| Per-layer context proj | **Bật** (12× Linear 512→512) | `mamba_use_per_layer_context=True` |
+| Conditioning | Dual AdaLN (ctx post-Mamba, time pre-Mamba + pre-FFN) | |
+| Context dim | 946 | ArcFace 512 + FLAME 50 + DINOv2 384 |
+| Context segment weights | $(1.5, 1.0, 0.5)$ | Arc/FLAME/DINO — moderate identity bias |
+| Slat dim | 32 | match SC-VAE latent_dim |
+| Slat length | 4096 | $16^3$ grid (Hilbert ordered) |
+| **Backbone params** | **105.4M** | + v-head 16.8M + contrastive 0.5M |
+| Hilbert ordering | Bật (grid_size=16) | `use_hilbert_ordering=True` |
+| Slat normalization | Per-channel (`data/slat_stats.pt`) + occupancy mask | `slat_stats_path` |
+
+**Hyperparameters chung (paper-aligned từ iMF Table 4)**:
 
 | Tham số | Giá trị | Ghi chú |
 |---------|---------|---------|
-| BiMamba layers | 12 | |
-| Hidden dim | 512 | |
-| SSM state dim ($n$) | 16 | |
-| SSM conv kernel | 4 | |
-| Expansion factor | 2 | $512 \to 1024$ inner |
-| FFN per block | Có (expand×4, GELU) | DiT-style sub-block |
-| Prefix tokens | **0** | `mamba_num_*_tokens=0` (revision 18) |
-| Conditioning | Dual AdaLN (ctx + time) | Không `cond_fusion` |
-| Context dim | 946 | ArcFace+FLAME+DINOv2 |
-| **Backbone params** | **~93.9 M** | + v-head ~16.8M + contrastive ~0.5M |
-| Optimizer | AdamW | |
-| LR | $1 \times 10^{-4}$ | `train_imf.sh` default |
-| Batch × accum | 4 × 16 = **64** effective | Có thể 3×21≈63 |
-| EMA decay | 0.9995 | |
-| Max epochs | 400 | |
-| t sampler | logit-normal → curriculum | $\mu=-0.4$, scale=1.0 |
-| CFG | **Tắt** (`--disable-cfg-conditioning`) | Sau audit ep30 |
-| v-head weight | 0.5, depth 8 | Paper Table 4 |
-| Contrastive weight | 0.3, $\tau=0.1$ | InfoNCE on context |
-| Slat norm | per-channel (`slat_stats.pt`) | + occupancy mask |
-| Adaptive loss weighting | Enabled (100 bins, EMA decay=0.99) | iMF Appendix A |
-| Precision | FP16/BF16 (AMP) | |
+| Optimizer | AdamW (`fused=True` trên CUDA) | $\beta_1{=}0.9$, $\beta_2{=}0.999$ |
+| Learning rate | $1 \times 10^{-4}$ | **constant** (không cosine decay) |
+| LR scheduler | `constant` | Cosine từng làm plateau ep6 với 3e-5 |
+| LR warmup steps | 5000 | $\sim 1$ epoch warmup |
+| Weight decay | 0 | Paper Table 4 |
+| Gradient clip | 1.0 | `grad_clip` |
+| EMA decay | 0.9999 | Paper Table 4 |
+| Dropout | 0 | Paper Table 4 |
+| Precision | bf16 autocast | `use_amp=True` |
+| t sampler | `logit_normal` ($\mu=-0.4$, scale=1.0) | Focus capacity vào $t \in [0.2, 0.6]$ |
+| Max epochs | 400 | Early stopping monitor val cos_sim |
+| CFG conditioning | **Tắt** (`--disable-cfg-conditioning`) | Audit ep30 cũ cho thấy gây "predict average" degenerate |
+
+**Cấu hình theo Phase (current Phase B+C đang chạy):**
+
+| Tham số | Phase A (ep0-20) | Phase B (ep20-26) | Phase B+C (ep26+) |
+|---------|------------------|-------------------|---------------------|
+| `ratio_r_neq_t` | **0.0** (pure boundary) | 0.5 (50% JVP) | 0.5 |
+| `use_auxiliary_v_head` | False | **True** (depth=8, weight=0.5) | True |
+| `v_loss_weight` | — | 0.5 | 0.5 |
+| `contrastive_loss_weight` | 0.0 | 0.0 | **0.2** |
+| `contrastive_mode` | — | — | `arcface` (output dim 512) |
+| `contrastive_temperature` | — | — | 0.1 |
+| `context_velocity_sep_weight` | 0.0 (DISABLED) | 0.0 (DISABLED — OOM risk) | 0.0 (DISABLED) |
+| `adaptive_loss_weighting` | False (diagnostic) | False | False |
+| `batch_size` | **4** | **2** (batch=4 sẽ OOM với JVP) | 2 |
+| `gradient_accumulation_steps` | 8 | 16 | 16 |
+| Effective batch | 32 | 32 | 32 |
+| VRAM peak | **10.3 GB** | **19.3 GB** | **19.5 GB** |
+| Thời gian/epoch | ~16 phút (9.8 batch/s) | ~40 phút (4.0 batch/s) | ~43 phút (4.0 batch/s) |
+| Mục tiêu | Học time conditioning + velocity field shape | Activate JVP correction cho 1-step | **Force context dependency** (Mamba absorbs context nếu không có) |
+| Script | [scripts/train_imf_v7.sh](scripts/train_imf_v7.sh) | [scripts/train_imf_v7_phaseB.sh](scripts/train_imf_v7_phaseB.sh) | (cùng Phase B script + flag contrastive) |
+
+**Phase decision gates:**
+
+- Phase A → B: Loss < 1.5 ở ep20? (đã đạt: 1.4155 ✓)
+- Phase B → C: Time cos@t0vs1 < 0.3 ổn định? (đã đạt: -0.008 ✓)
+- Phase C → D: Hidden state cos(ctx_a, ctx_b) < 0.7? (đang theo dõi: ep38 ở 0.772, gần đạt)
+
+**Lý do batch=2 ở Phase B+C:**
+
+JVP yêu cầu 2 forward passes (1 main + 1 dudt tangent). Phase A dùng 10.3GB. Khi enable JVP với batch=4 → ~20GB activations + v-head 16.8M params → OOM trên RTX 4090 24GB (test 22/05 confirmed crash). Giảm xuống batch=2 + grad_accum=16 giữ effective batch=32 không đổi nhưng VRAM 19.3GB an toàn.
+
+**Lý do KHÔNG enable `context_velocity_sep_loss`:**
+
+Loss này gọi `model(z_t, t, ctx_a)` và `model(z_t, t, ctx_b)` để penalize $\cos > 0$ giữa hai output → cần thêm **2 forward passes** qua 122.7M model → estimate +6-8GB → **OOM ngay cả với batch=2**. Thay thế bằng `contrastive_loss` (chỉ thêm ctx_classifier 0.5M params, không cần forward pass thêm).
 
 ### 6.2. Tối ưu Phần cứng
 
@@ -1015,855 +1283,298 @@ Số liệu thực tế đọc trực tiếp từ `data_signature` được hash
 
 ---
 
-## 7. Phân tích và Giải thích Kết quả
+## 7. Phân tích Kết quả và Phát hiện Quan trọng
 
 ### 7.1. Phân tích Hội tụ
 
-- **Recon Loss** giảm 78% (0.1614 → 0.0251), plateau từ epoch ~395
-- **KL Loss** ở 0.83 — latent space chưa collapse (tốt cho diversity ở Stage 2)
-- **Rho Loss** vẫn giảm -0.0013/epoch → topology đang cải thiện
+**Stage 1 — SC-VAE (đã hoàn thành ep500, 16/05/2026):**
+- **Recon Loss** giảm 78% (0.1614 → 0.0213), plateau từ epoch ~395
+- **KL Loss** ở 14.58 (với chuẩn hóa `mu.numel()` đúng spec) — latent space chưa collapse → tốt cho diversity ở Stage 2
+- **Rho Loss** vẫn giảm chậm (-0.0013/epoch) → topology đang cải thiện
+- **Recall/Precision topology:** 86.7% / 80.6% — chấp nhận được cho face domain
 
-### 7.2. Lịch sử Bug Fix (Tổng hợp)
+**Stage 2 — VoxelMamba v7 (đang chạy, snapshot 23/05/2026 ep38):**
 
-Trong quá trình align với TRELLIS.2 và iMF paper, đã phát hiện và sửa hơn 15 bugs. Bảng tóm tắt các bug quan trọng nhất:
+Quỹ đạo loss theo Phase:
 
-| Bug | Component | Tác động | Fix |
-|-----|-----------|---------|-----|
-| **Identity collapse (17/05)** | iMF Stage 2 | Model học `u_pred ≈ z_t`, sample cos_sim=0.07 | Per-channel slat normalization `(x − μ)/σ` (Section 9.2) |
-| **dv activation thiếu** | SC-VAE decoder | Recon mesh sai vị trí voxel center | `apply_dv_activation`: $(1+2m)·\sigma(h)−m$ với $m=0.5$ |
-| **Render loss raw logits** | SC-VAE render | Gradient không học vị trí đúng | Activate dv trước projection |
-| **KL chia sai chuẩn** | SC-VAE loss | Log KL không khớp Eq. VAE-2 (training OK do $w_{KL}=10^{-6}$) | Chia `mu.numel()` + clamp logvar |
-| **Pre-latent LayerNorm thiếu** | SC-VAE encoder | Posterior không ổn định | Thêm non-affine `F.layer_norm` trước `to_mu/to_logvar` |
-| **LayerNorm32 chưa FP32 cast** | SC-VAE blocks | NaN dưới AMP FP16 | Cast FP32 thủ công trước/sau LayerNorm |
-| **Cosine schedule kẹt khi resume** | SC-VAE training | LR drop về $10^{-6}$ rất sớm | Thêm `cosine_restart`, `constant_min_lr` modes |
-| **Slat cache fallback `randn(946)`** | precompute script | Cache context random, sai so với train | Load đầy đủ ArcFace+FLAME+DINOv2 extractors |
-| **Gamma LMDB = 1.0 const** | O-Voxel cache | Lỗi cache cũ trước fix gamma | Recompute $\gamma = (1−\text{Var}(dv)).\text{clamp}(0,1)$ |
-| **DC mesh có lỗ ở biên** | Mesh extraction | Quad biên bị drop bởi `.all(dim=1)` | `_prefill_boundary_voxels()` thêm voxel giả |
+| Epoch | Phase | Total Loss | Boundary | Notes |
+|-------|-------|-----------|----------|-------|
+| 1 | A | 3.02 | 3.02 | Start fresh (Paper-aligned init) |
+| 5 | A | 1.64 | 1.64 | Fast drop nhờ lr=1e-4 constant |
+| 9 | A | **1.5072** | 1.5072 | best.pt Phase A |
+| 20 | A | **1.4155** | 1.4155 | Phase A end — Time conditioning OK ✓ |
+| 22 | B | 3.36 | 1.74 | First JVP epoch (v-head random init) |
+| 26 | B | 2.92 | 1.74 | Plateau — Context cos = 0.9998 ✗ |
+| 27 | B+C | 3.01 | 1.74 | Restart với contrastive (random ctx_classifier init) |
+| 34 | B+C | 2.93 | 1.76 | LR fully ramped to 1e-4 |
+| 38 | B+C | 2.92 | 1.76 | Plateau loss, BUT context activated ✓ (Section 7.2) |
 
-**Detail của bug critical mới nhất (Identity Collapse)** — xem Section 9.2.
+**Quan sát quan trọng:**
+- Phase A: loss giảm 53% (3.02→1.42) trong 20 epochs — time conditioning học rất nhanh khi config đúng paper.
+- Phase B: total loss vọt lên do v-head random init + JVP samples; **boundary stable** ở 1.74 chứng tỏ Phase A learning không bị quên.
+- Phase B+C: total loss vẫn plateau ở 2.92 nhưng diagnostic cho thấy context cos **dropped đáng kể** (0.999 → 0.804) — hidden state đang encode context tốt hơn nhiều, chỉ là chưa thể hiện ra trong total loss.
 
-**Backward-compat đã verify**: tất cả fix kể trên giữ nguyên parameter shapes của SC-VAE → load checkpoint cũ strict `missing=0, unexpected=0`.
+**Diagnostic metrics tại ep38 (random input, 8 samples):**
+
+| Metric | Phase A end (ep20) | Phase B no contrastive (ep26) | **Phase B+C (ep38)** |
+|--------|---------------------|--------------------------------|------------------------|
+| Time cos@t0vs1 | -0.008 ✅ | 0.022 ✅ | 0.008 ✅ |
+| Hidden state cos(ctx_a, ctx_b) | ~0.999 | ~0.994 | **0.772** 🎉 |
+| Output velocity cos(ctx_a, ctx_b) | ~0.999 | ~0.999 | **0.804** 🎉 |
+| Layer 11 activation cos | 0.994 | 0.994 | **0.822** ✓ |
+| ‖u‖(t) profile | U-shape | Đảo (mono) | Mono increasing (flow matching pattern) |
+
+### 7.2. Phát hiện Quan trọng — Mamba SSM Hấp thụ (Absorb) Context Signal
+
+Đây là phát hiện kỹ thuật quan trọng nhất của session 22-23/05/2026, dẫn đến việc thêm contrastive InfoNCE và per-layer context projections.
+
+**Hiện tượng:** Sau 20 epoch Phase A (boundary-only), khi test `cos_sim(u_correct_ctx, u_wrong_ctx)` trên real data → **cos = 0.9994** (gần như identical). Model dự đoán velocity gần như giống nhau bất kể context.
+
+**Hypothesis ban đầu:** Có thể context không trong computation graph (bug gradient flow). **REJECTED:** Test cho thấy $\|\partial u / \partial \text{ctx}\|_F = 1689$ — gradient flow OK.
+
+**Hypothesis 2:** Có thể context_cond_mlp không học được. **REJECTED:** Test cho thấy $\cos(\text{ctx\_cond}(a), \text{ctx\_cond}(b)) = 0.118$ — MLP discriminate rất tốt.
+
+**Investigation: Layer-by-layer activation tracking**
+
+Lấy 2 context khác nhau (ctx_a, ctx_b), forward qua model, đo cosine similarity giữa hidden state tại mỗi layer:
+
+```
+Stage                                          | cos(a, b)
+-----------------------------------------------|----------
+After _scale_context_segments + context_cond_mlp | 0.118   ✓ discriminative
+After ctx_layer_projs[i]                          | 0.21    ✓ still distinct
+After adaLN_ctx (scale, shift)                    | 0.24-0.45 ✓ pre-Mamba OK
+After Mamba layer 0 output                        | 0.990   ⚠ starting to merge
+After Mamba layer 5 output                        | 0.962   ⚠ merging more
+After Mamba layer 11 output                       | 0.994   ✗ NEARLY IDENTICAL
+After output_proj (velocity)                      | 0.997   ✗ velocity invariant
+```
+
+**Root cause:** Magnitude mismatch giữa AdaLN modulation và Mamba SSM dynamics.
+
+```
+adaLN_ctx output magnitudes:
+  ‖scale‖_2 ≈ 1.75   →  mean(scale) per element ≈ 0.08
+  ‖shift‖_2 ≈ 0.17   →  mean(shift) per element ≈ 0.008
+  max|scale| ≈ 0.22  →  max modulation per element ±22%
+
+Mamba output activation magnitudes:
+  ‖mamba_out‖_F ≈ 700  →  mean(activation) per element ≈ 0.32
+
+Effective modulation per element:
+  out_new = out · (1 + 0.08) + 0.008
+         ≈ 0.32 × 1.08 + 0.008 = 0.353
+  vs. context-free baseline 0.32 → khác chỉ ~10% per element
+  → bị hấp thụ bởi SiLU nonlinearity + Mamba selective SSM dynamics
+```
+
+**Phát hiện thêm:** ‖scale‖ = 1.75 đang **thấp hơn init value** $\sqrt{512} \times 0.1 \approx 2.26$ → model đã **chủ động giảm** context modulation magnitude. Đây không phải bug mà là local optimum: vì boundary loss (50% samples) không *cần* context (target $\varepsilon - x$ không phụ thuộc ctx), gradient descent học cách "tắt" context path để optimize easier.
+
+**Tại sao JVP alone không sửa được:**
+
+Phase B (ep21-26) enable JVP với hy vọng `du/dt` ép model phải dùng context (vì tangent vector phụ thuộc context). Kết quả: context cos thậm chí **tệ hơn** (0.9952 → 0.9998). Lý do: model tìm local minimum mới — predict context-agnostic velocity + constant tangent vector → JVP loss vẫn minimize được mà không cần context.
+
+**Giải pháp — Contrastive InfoNCE (Phase C):**
+
+Thêm auxiliary loss force pooled hidden state phải predict ArcFace embedding:
+
+$$\mathcal{L}_{\text{contrastive}} = -\log \frac{\exp(\cos(\hat{c}_i, c_i) / \tau)}{\sum_j \exp(\cos(\hat{c}_i, c_j) / \tau)}$$
+
+với $\hat{c}_i = \text{ctx\_classifier}(\text{pool}(h_{\text{hidden}}^{(i)}))$ và $c_i = \text{Arc}(x_i)$.
+
+Sau 11 epoch contrastive (ep27-38):
+- Layer 11 cos: 0.994 → **0.822** (giảm 0.17)
+- Output velocity cos: 0.999 → **0.804** (giảm 0.20)
+- Context information flow từng layer build up dần: layer 0 (0.990) → layer 5 (0.888) → layer 11 (0.822)
+
+**Bài học kiến trúc:**
+1. **AdaLN không đủ cho global vector conditioning trong Mamba** — Mamba dynamics quá mạnh, modulation $\pm 22\%$ bị absorb.
+2. **JVP loss có local minimum khác**: model có thể satisfy JVP constraint mà không dùng context.
+3. **Cần explicit "force-context" mechanism**: contrastive InfoNCE ép hidden state phải có thông tin discriminative về context, không thể bypass.
+4. **context_velocity_separation_loss** (penalize $\cos(u(\text{ctx}_a), u(\text{ctx}_b)) > \text{margin}$) là alternative nhưng đòi 2 forward passes thêm → OOM trên RTX 4090.
 
 ### 7.3. So sánh với TRELLIS.2
 
-| Tiêu chí | TRELLIS.2 (`microsoft/TRELLIS.2`) | FaceDiff |
-|----------|----------|----------|
+| Tiêu chí | TRELLIS.2 (`microsoft/TRELLIS.2`) | FaceDiff v7 |
+|----------|-----------------------------------|-------------|
 | GPU | 8× A100 / H100 (320GB+) | **1× RTX 4090 (24GB)** |
 | Backbone | U-DiT (Transformer $O(N^2)$) | **VoxelMamba (SSM $O(N)$)** |
 | Generation steps | 50 (DDPM) | **1 (iMF)** |
-| O-Voxel cho shape SC-VAE | 6 kênh in (`vertices-0.5`, `intersected-0.5`) → 7 kênh out (`dv,δ,γ`) | 10 kênh in/out (gộp `dv,δ,γ,rgb`) |
+| O-Voxel cho shape SC-VAE | 6ch (`vertices-0.5`, `intersected-0.5`) → 7ch out | 10ch in/out (gộp `dv,δ,γ,rgb`) |
 | Encoder kênh | `[64,128,256,512,1024]` × `[0,4,8,16,4]` blocks (5 levels) | `[64,128,256,512]` × `[2,2,2,2]` blocks (4 levels — phù hợp 24 GB) |
 | Encoder downsample | `SparseResBlockS2C3d` (Spatial2Channel) | strided `SparseConv3d` + non-parametric S2C-shortcut |
 | Decoder upsample | `SparseResBlockC2S3d` + `SparseChannel2Spatial(2, mask)` | `SparseConvTranspose3d` + non-parametric C2S-shortcut + post-pruning |
-| Norm | `LayerNorm32` (FP32 cast) | **`LayerNorm32` (đã align từ revision 2)** |
-| Pre-latent norm | non-affine `F.layer_norm` | **đã align từ revision 2** (`pre_latent_norm=True`) |
-| Output activations | `(1+2m)·sigmoid - m`, `>0`, `softplus`, (không có RGB) | **đã align từ revision 2** (`apply_shape_mat_output_activations`) + `clamp(rgb,0,1)` |
-| Render loss | **Mesh rasterizer (`nvdiffrast`) → real depth/normals** | Point projection → approximate (đã align dv path) |
-| Conditioning | Cross-Attention | **Prefix Tokens** (Mamba-friendly) |
-| Loss weights — dv | $\lambda_{\text{vertice}} = 0.01$ | $0.01$ (identical) |
-| Loss weights — δ | $\lambda_{\text{intersected}} = 0.1$ | $0.1$ (identical) |
-| Loss weights — KL | $\lambda_{\text{kl}} = 10^{-6}$ | $10^{-6}$ (identical, normalisation đã sửa ở revision 2) |
-| Loss weights — Rho | $\lambda_{\text{subdiv}} = 0.1$ | **0.2** (FaceDiff 2× vì topology face sparse hơn Objaverse-XL) |
-| Loss weights — render depth | $\lambda_{\text{depth}} = 10$ | $10$ (identical) |
-| Loss weights — render mask | $\lambda_{\text{mask}} = 1$ | $1$ (identical) |
-| Loss weights — Perceptual | L1 + 0.2 SSIM + 0.2 LPIPS | **Identical** |
-| Loss weights — Normal | $\lambda_{\text{normal}} = 1$ (TRELLIS.2 có) | $\lambda_{\text{normal}} = 1$ — **✅ 14/05** depth-to-normal via finite differences trên depth maps |
-| Optimizer | AdamW lr=1e-4, EMA 0.9999, AdaptiveGradClipper | AdamW lr=1e-5 (resume), **EMA 0.9999 ✅ 14/05**, AdaptiveGradClipper ✅ |
+| Norm | `LayerNorm32` (FP32 cast) | `LayerNorm32` (đã align) |
+| Pre-latent norm | non-affine `F.layer_norm` | đã align (`pre_latent_norm=True`) |
+| Output activations | `(1+2m)·sigmoid - m`, `>0`, `softplus` | đã align + `clamp(rgb,0,1)` |
+| Render loss | Mesh rasterizer (`nvdiffrast`) → real depth/normals 1024px | Point projection 64px (yếu hơn) |
+| Stage 2 conditioning | Prefix Tokens (Cross-Attention) | **Prefix tokens + per-layer AdaLN + Contrastive InfoNCE** (v7 hybrid) |
+| Loss weights — dv | $\lambda = 0.01$ | $0.01$ (identical) |
+| Loss weights — δ | $\lambda = 0.1$ | $0.1$ (identical) |
+| Loss weights — KL | $10^{-6}$ | $10^{-6}$ (identical) |
+| Loss weights — Rho | $0.1$ | **$0.2$** (face topology sparse hơn Objaverse) |
+| Optimizer | AdamW lr=1e-4, EMA 0.9999 | AdamW lr=1e-4 constant, EMA 0.9999 ✓ |
 
-**Khác biệt cốt lõi còn lại sau revision 13 (15/05/2026) — Full Audit SC-VAE vs TRELLIS.2:**
-
-| Hạng mục | TRELLIS.2 (paper + code) | FaceDiff | Đánh giá |
-|----------|--------------------------|----------|----------|
-| **Model scale** | ~800M params, 5 pyramid levels [64,128,256,512,1024], blocks [0,4,8,16,4] | 35M params, 4 levels [64,128,256,512], 2 blocks/level | ⚠️ Nhỏ hơn 23×, OK cho face domain |
-| **Encoder input** | 6ch (dv+delta), **centered -0.5** (`fdg_vae.py:46-49`) | 10ch (dv+delta+gamma+rgb), **không center** | ⚠️ Centering cải thiện training stability |
-| **Decoder output** | 7ch (dv+delta+gamma). RGB → PBR VAE riêng | 10ch (dv+delta+gamma+rgb). Joint training | Thiết kế khác, hợp lý cho face |
-| **Render loss** | Mesh rendering qua `nvdiffrast` **mỗi step từ đầu**. λ_depth=10, λ_mask=1, λ_normal=1 (L1+0.2×SSIM+0.2×LPIPS). Resolution 1024px | Point cloud splatting, **từ epoch 50**, mỗi 2 batch. Resolution 64px | ⚠️ Yếu hơn đáng kể |
-| **Loss weights** | λ_dv=0.01, λ_delta=0.1, λ_kl=1e-6 | Khớp 100% | ✅ |
-| **KL formulation** | `0.5*mean(mu²+exp(logvar)-logvar-1)` | Equivalent (sum/N form) | ✅ |
-| **Optimizer** | AdamW, wd=0, AdaptiveGradClipper (norm=1.0, 95th pctile) | Khớp 100% | ✅ |
-| **EMA** | decay=0.9999 | Khớp 100% | ✅ |
-| **O-Voxel format** | 10ch library | Dùng cùng thư viện | ✅ |
-| **Feature activations** | dv: `(1+2×0.5)×sigmoid-0.5`, delta: `logit>0`, gamma: `softplus` | Khớp 100% (đã verify trong `extract_ovoxel_mesh`) | ✅ |
-| **Downsample** | SparseSpatial2Channel zero-param | Strided sparse conv (+FLOPs nhưng dễ build spconv 2.x) | OK |
-
-**Chi tiết encoder input centering (TRELLIS.2 `fdg_vae.py:46-49`):**
-```python
-# TRELLIS.2: center dv và delta về [-0.5, 0.5] trước khi đưa vào encoder
-x = vertices.replace(torch.cat([
-    vertices.feats - 0.5,           # dv [0,1] → [-0.5, 0.5]
-    intersected.feats.float() - 0.5 # delta {0,1} → {-0.5, 0.5}
-], dim=1))
-```
-FaceDiff không center → biases ≠ 0 at initialization → có thể chậm hội tụ nhưng không sai.
-
-**Render loss gap**: TRELLIS.2 dùng `flexible_dual_grid_to_mesh(train=True)` trong decoder → mesh differentiable → render bằng `nvdiffrast` → so sánh GT mesh vs predicted mesh. `nvdiffrast` 0.4.0 đã cài trong env; `utils3d` chưa cài (cần cho camera setup).
-
-**DC Boundary Pre-fill (15/05/2026):** Thêm `_prefill_boundary_voxels()` vào `test_sc_vae_recon_v2.py` — tự động thêm voxel giả tại biên để DC không bỏ quad thiếu hàng xóm → giảm lỗ mesh.
-
-**Bug fix (15/05/2026):** `recon_raw_autonomous.ply` dùng `clamp(0,1)` thay vì `sigmoid-margin` cho dv logits → vị trí point cloud sai nhẹ. Đã sửa.
+**Khác biệt cốt lõi của v7 vs TRELLIS.2:**
+- TRELLIS.2 dùng Transformer + Cross-Attention cho conditioning → context inherently dùng vì Q·K^T dependency.
+- FaceDiff Mamba + AdaLN có "absorb context" problem (Section 7.2) → cần thêm contrastive InfoNCE.
+- TRELLIS.2 cần 8×A100 vì $O(N^2)$ attention; FaceDiff vừa 1×RTX 4090 nhờ $O(N)$ SSM.
 
 ### 7.4. Phân tích Thiết kế
 
 **Tại sao Mamba > Transformer cho 3D generation?**
-- 4096 tokens × 12 layers × batch 48: Attention maps ~15GB VRAM
-- Mamba: ~2-3GB VRAM (256× ít hơn)
+- 4096 tokens × 12 layers × batch 4: Attention maps ~3.2GB VRAM/step
+- Mamba: ~0.5GB VRAM/step (6× ít hơn, scale tuyến tính khi tăng L)
+- $O(N)$ scaling: tokens lên 16K cũng chỉ ~2GB
 
-**Tại sao iMF > DDPM/Flow Matching?**
-- DDPM 50 bước: 50× inference time
-- FM 1 bước: quỹ đạo cong → quality thấp
-- iMF: JVP nắn thẳng quỹ đạo → 1 bước + chất lượng cao
+**Tại sao iMF > DDPM/Flow Matching đơn thuần?**
+- DDPM 50 bước: $50\times$ inference time
+- FM 1 bước (raw): quỹ đạo cong → quality kém
+- iMF: JVP nắn thẳng trajectory → 1 bước + giữ chất lượng (với điều kiện JVP loss converge)
 
-**Tại sao Prefix Tokens > Cross-Attention?**
-- Cross-Attention: +$O(N \times K)$/layer
-- Prefix: chỉ +20 tokens, Mamba xử lý $O(N+20) \approx O(N)$
+**Tại sao Prefix Tokens ở END (không phải START)?**
+- Forward Mamba scan: data → prefix → state cuối có "summary" cả context lẫn data
+- Backward Mamba scan: prefix → data → context được lan toả về mọi data token ngay từ token cuối
+- Đặt ở START: forward OK nhưng backward kết thúc tại prefix → state cuối không thấy data → mất balance
 
----
+**Tại sao Per-layer Context Projections?**
+- Single global `ctx_cond` broadcast → tất cả layer thấy cùng một context vector → gradient interference (mỗi layer muốn modulate khác nhau)
+- Per-layer projection: mỗi layer có MLP riêng → multiple gradient paths đến context → giảm "single point of failure" cho context signal
+- Cost: chỉ +3.15M params (3% của backbone)
 
-## 8. Kế hoạch Tiếp theo
+**Tại sao Contrastive InfoNCE (không phải MSE) cho ép context?**
+- MSE giữa pooled_hidden và context: scale-sensitive, dễ bị "predict average" exploit
+- InfoNCE: chỉ yêu cầu rank correctness (positive > negatives) → ép discriminative information
+- Temperature $\tau = 0.1$ làm sharp distribution → gradient mạnh khi sample dễ phân biệt sai
 
-### 8.1. Lộ trình Stage 2 iMF (05/2026 — đang chạy)
-
-Pipeline đầu vào đã sẵn sàng 100%: SC-VAE epoch 500 (recon=0.0213, KL=14.58), slat_context LMDB 20,369 entries, hybrid_context LMDB 84MB. Stage 2 training bắt đầu 17/05.
-
-| Mốc | Trạng thái | Ghi chú |
-|-----|-----------|---------|
-| Identity collapse bug discovered & fixed | ✅ 17/05 | Per-channel slat normalization (Section 9.2) |
-| **Stage A — Joint pretrain (epoch 0 → ?)** | 🟢 **Đang chạy** | `--dataset both`, lr=2e-4, 400 epochs |
-| Phase D test gate (epoch 10-20) | ⏳ | Boundary cos≥0.93, 1-step cos≥0.1 |
-| Joint plateau detection | ⏳ | 5 epoch liên tiếp không cải thiện >0.5% |
-| **Stage B — FaceVerse finetune (~100 epochs)** | ⏳ | `--dataset faceverse`, lr=2e-5 (Section 9.5) |
-| E2E inference test (mesh quality) | ⏳ | Decode FaceVerse-style → check vai/mắt/miệng |
-
-Chi tiết chiến lược 2-stage và switch decision gate xem Section 9.4-9.6.
-
-### 8.2. Đánh giá Chất lượng Mesh (06-07/2026)
-
-**Metrics đánh giá** (theo TRELLIS.2):
-
-| Metric | Công thức | Mục đích |
-|--------|-----------|----------|
-| Chamfer Distance (CD) | $\frac{1}{2\|X\|}\sum_{x}\min_y\|x-y\|^2 + \frac{1}{2\|Y\|}\sum_y\min_x\|y-x\|^2$ | Khoảng cách 2 chiều mesh-mesh |
-| F-Score(τ) | $\frac{2·\text{Prec}·\text{Rec}}{\text{Prec}+\text{Rec}}$ với ngưỡng τ | Recall/precision precision của mesh |
-| SSIM | Eq. Eval-4 | Render loss và so sánh 2D |
-| ArcFace cos | $\frac{f_{\text{render}} \cdot f_{\text{gt}}}{\|f_{\text{render}}\|\|f_{\text{gt}}\|}$ | Identity preservation |
-
-**Ablations dự kiến:** Mamba vs GRU, Hilbert vs Morton, AdaLN-only vs prefix (đã chọn AdaLN), FFN on/off (`test_pure_t1_no_ffn.py`), contrastive weight, slat normalization.
-
-**Inference optimization:** TorchScript export, batched pipeline, target < 1s/mesh trên RTX 4090.
-
-### 8.3. Mở rộng Dài hạn (08-12/2026)
-
-- Multi-view conditioning, temporal consistency cho animation
-- Tích hợp thêm datasets: FERG, BU-3DFE, CoMA (expression diversity)
-- Web demo (Three.js), API endpoint, edge deployment
-- Bài báo CVPR/ECCV/NeurIPS
-
----
+**Tại sao DISABLE adaptive_loss_weighting trong Phase A?**
+- EMA reweighting cần ổn định bin loss để hoạt động đúng
+- Phase A diagnostic: muốn isolate signal main loss, tránh EMA amplify variance của bf16 + small batch
+- Sẽ enable lại ở Phase D nếu Phase C converge ổn định
 
 
+## 8. Trạng thái Hiện tại và Lộ trình
 
-## 9. Trạng thái Hiện tại — Identity-Collapse Fix + Chiến lược 2-Stage Training (17/05/2026)
+### 8.1. Snapshot Pipeline (23/05/2026)
 
-### 9.1. Tóm tắt Trạng thái 17/05/2026
+| Stage | Trạng thái | Chi tiết |
+|-------|-----------|----------|
+| **Stage 1 — SC-VAE** | ✅ Done | `checkpoints/sc_vae_shape/epoch_500.pt` (8.3GB). Recon=0.0213, KL=14.58, Rho=0.038, topology recall 86.7% / precision 80.6% |
+| **Stage 2 — Phase A** | ✅ Done ep20 | `checkpoints/imf_v7/epoch_20.pt` (best loss=1.4155). Time conditioning learned (cos@t0vs1 = -0.008). Context dormant (by design — boundary loss không cần ctx) |
+| **Stage 2 — Phase B+C** | 🟢 Running ep38+ | `checkpoints/imf_v7_phaseB/latest_step.pt`. PID 1364952. Loss plateau 2.92 nhưng **context đã activate** (hidden cos 0.999→0.772 random input). VRAM 19.5GB stable |
+| **Stage 3 — Decode** | ⏳ Pending | Cần Stage 2 hội tụ trước. Pipeline: SC-VAE decoder + Dual Contouring sẵn có. |
 
-Section này tổng hợp 3 phát hiện chính:
-1. **Bug critical đã fix**: Stage 2 training bị **identity collapse** — model học `u_pred ≈ z_t` (trivial solution), không học conditional velocity field. Fix bằng **per-channel slat normalization** kiểu TRELLIS.2.
-2. **Chiến lược 2-stage**: Joint pretrain trên cả 2 datasets → Finetune FaceVerse-only để tận dụng độ chi tiết cao hơn (vai, mắt, miệng đầy).
-3. **Curriculum t-sampler adjustment**: Phase D test (ep10) phát hiện 1-step sampling chưa học (cos_sim 0.052) do logit-normal centered t=0.4 không thấy t=1. Giảm `curriculum_switch_ratio: 0.6 → 0.3` để switch sang uniform t sớm hơn (epoch 120 thay vì 240). Risk JVP instability mitigated bằng `adaptive_loss_weighting` + `grad_clip=1.0`.
+### 8.2. Metrics đạt được
 
----
+**Phase A (ep20):**
+- Total/Boundary Loss: **1.4155**
+- Time conditioning: $\cos(u@t{=}0, u@t{=}1) = -0.008$ ✅ (target < 0.3)
+- ‖u‖(t) profile: U-shape high@edges, low@middle — đúng flow matching pattern
+- VRAM: 10.3GB / 24GB (margin 13.7GB)
 
-### 9.2. Bug Identity Collapse — Phát hiện và Fix
+**Phase B+C (ep38):**
+- Total Loss: 2.92 (bimodal: boundary 1.74 + JVP ~1.0 + v-head ~0.4 + contrastive ~0.5×0.2)
+- Time cos@t0vs1: 0.008 ✓ (giữ ổn định từ Phase A)
+- Hidden state cos(ctx_a, ctx_b) random input: **0.772** 🎉 (was 0.999 → 23% absolute drop)
+- Output velocity cos(ctx_a, ctx_b) random input: **0.804** 🎉
+- Per-layer discrimination buildup:
+  ```
+  Layer  0:  cos = 0.990   (start to differentiate)
+  Layer  5:  cos = 0.888   ✓ significantly discriminated
+  Layer 11:  cos = 0.822   ✓ strong discrimination
+  Output:    cos = 0.804   ✓ velocity differentiates
+  ```
+- VRAM: 19.5GB / 24GB (margin 4.5GB)
 
-#### 9.2.1. Triệu chứng (training trước fix)
+### 8.3. Memory Budget Reference (RTX 4090, 24GB)
 
-| Test | Kết quả (epoch 16) | Ý nghĩa |
-|------|---------------------|---------|
-| Loss epoch 11-19 | 0.215 ± 0.001 (plateau) | Không cải thiện qua 9 epochs |
-| `cos_sim(sample, GT)` | **0.07** | Sample gần như random |
-| `pred_std / GT_std` | 0.08 / 0.37 = **22%** | Output quá nhỏ |
-| 5-step Euler cos_sim | 0.02 (tệ hơn 1-step) | Velocity field hỏng |
-| `cos_sim(u_pred, z_1)` | **0.9973** | Model copy input |
+| Mode | Batch | Effective | VRAM | Notes |
+|------|-------|-----------|------|-------|
+| Stage 1 SC-VAE (FP16) | 4 | 132 (×33 accum) | 16.9 GB | Peak quan sát, sau khi train xong |
+| Stage 2 Phase A (boundary only) | **4** | 32 (×8 accum) | **10.3 GB** | Safe margin 13.7 GB |
+| Stage 2 Phase B (JVP + v-head, batch=4) | 4 | — | **24 GB OOM** | ❌ First attempt 22/05 crashed |
+| Stage 2 Phase B (batch=2, recommended) | **2** | 32 (×16 accum) | **19.3 GB** | ✅ Safe margin 4.7 GB |
+| Stage 2 Phase B+C (+ contrastive) | 2 | 32 | **19.5 GB** | ✅ Safe margin 4.5 GB (contrastive +200MB) |
+| Phase B + context_velocity_sep_loss | 2 | 32 | est. **23+ GB** | ⚠ DO NOT enable — risk OOM |
 
-#### 9.2.2. Root cause: Signal-to-Noise quá thấp
+### 8.4. Decision Gates (Phase C → D)
 
-- Slat (SC-VAE latent) có **std ≈ 0.36** (đo trên 20,369 samples, 83.4M tokens)
-- Flow matching noise `e ~ N(0, 1)` có **std = 1.0**
-- Velocity target `v = e − x ≈ e` khi `||x|| << ||e||` → model học `u_pred ≈ e ≈ z_t`
-- Khi 1-step sample: `z_0 = z_1 − u_pred ≈ 0` → output mất tín hiệu data
+Khi đạt ep50 (~10h từ ep38), test `cos_sim` diagnostic và quyết định:
 
-**Lý do slat std nhỏ**: [src/config.py:98](src/config.py#L98) `kl_weight=1e-6` (so với TRELLIS.2 `1e-4` và VAEs chuẩn `1e-2`–`1e-4`). KL pressure quá yếu nên SC-VAE không ép `mu → N(0, 1)`.
+| Hidden state cos(ctx_a, ctx_b) @ ep50 | Hành động |
+|----------------------------------------|----------|
+| **< 0.5** | ✅ Context strongly active → setup Stage 3 decode pipeline + first sampling test |
+| **0.5 – 0.7** | ⚠️ Train tiếp đến ep80 → re-evaluate |
+| **0.7 – 0.85** | 🟡 Increase `contrastive_loss_weight` 0.2 → 0.5 (force harder) |
+| **> 0.85** | 🔴 Architectural intervention: post-hoc boost `adaLN_ctx.weight × 3` hoặc enable `context_velocity_sep_loss` với batch=1 |
 
-#### 9.2.3. TRELLIS.2 reference xác nhận hướng fix
+### 8.5. Lộ trình Tiếp theo
 
-[trellis2_image_to_3d.py:271-273](third_party/TRELLIS.2/trellis2/pipelines/trellis2_image_to_3d.py#L271-L273) và [trellis2_image_to_3d.py:408-409](third_party/TRELLIS.2/trellis2/pipelines/trellis2_image_to_3d.py#L408-L409) áp dụng **per-channel normalization**:
+**Ngắn hạn (24h kế tiếp):**
+1. Monitor Phase C đến ep50 (~10h)
+2. Chạy `scripts/test/test_imf_identity_t0.py` ở ep50 để verify cos_sim trên real data (current ep38 test cho 0.997 với real slat — slat dominates output)
+3. Quyết định Phase D theo gate Section 8.4
 
-```python
-# Trước khi train iMF flow:
-slat_normalized = (slat_raw - mean) / std    # mean, std: shape [latent_dim]
-# Sau khi 1-step sample:
-slat_for_decoder = slat_normalized * std + mean
-```
+**Trung hạn (1 tuần):**
+1. Setup Stage 3 decode pipeline (SC-VAE decoder + Dual Contouring đã có sẵn)
+2. Sample mesh đầu tiên từ trained Stage 2 → decode → so sánh với FaceVerse GT
+3. Đo Chamfer Distance, F-Score, ArcFace cos giữa generated và GT
+4. Ablation: turn off prefix tokens vs turn off per-layer ctx vs turn off contrastive
 
-Config [slat_flow_imgshape2tex_dit_1_3B_512_bf16.json](third_party/TRELLIS.2/configs/gen/slat_flow_imgshape2tex_dit_1_3B_512_bf16.json) chứa `shape_slat_normalization = {mean: [32 values], std: [32 values]}` — vector per-channel.
+**Dài hạn:**
+1. Enable CFG conditioning lại (sau khi confirm clean baseline đã hội tụ)
+2. Multi-view consistency: train Stage 2 với context từ nhiều góc nhìn
+3. Real-time inference optimization (target <1s/mesh)
+4. Web UI integration (xem commit `e005ebc`)
 
-#### 9.2.4. Implementation Fix (17/05/2026)
+### 8.6. Files Quan trọng (Code Reference)
 
-**Bước 1**: Tạo [scripts/compute_slat_stats.py](scripts/compute_slat_stats.py) — 2-pass streaming compute mean/std từ toàn bộ 20,369 samples → `data/slat_stats.pt`:
+**Architecture & Loss:**
 
-```python
-{
-    "mean": torch.Tensor[32],  # range [-0.048, +0.053], near zero
-    "std":  torch.Tensor[32],  # range [0.258, 0.431], mean 0.364
-    "n_samples": 20369,
-    "n_total_tokens": 83,431,424,
-}
-```
+| File | Vai trò |
+|------|---------|
+| [src/config.py:196-310](src/config.py#L196) | `IMFConfig` — tất cả hyperparams (LR, scheduler, t_sampler, phase config) |
+| [src/models/voxel_mamba.py:144-287](src/models/voxel_mamba.py#L144) | `BidirectionalMambaBlock` — 12× block với time AdaLN + ctx AdaLN + FFN |
+| [src/models/voxel_mamba.py:290-700](src/models/voxel_mamba.py#L290) | `VoxelMamba` v7 — input embed + Hilbert + prefix tokens + ctx_layer_projs |
+| [src/models/voxel_mamba.py:503-510](src/models/voxel_mamba.py#L503) | `output_proj` init (iMF Appendix A: $\sigma = \sqrt{0.1/\text{fan\_in}}$) |
+| [src/models/voxel_mamba.py:569-581](src/models/voxel_mamba.py#L569) | `_scale_context_segments` — (Arc×1.5, FLAME×1.0, DINO×0.5) |
+| [src/models/imf_diffusion.py:113-294](src/models/imf_diffusion.py#L113) | `ImprovedMeanFlow` init + `_sample_t_r` (multi-way) |
+| [src/models/imf_diffusion.py:413-445](src/models/imf_diffusion.py#L413) | `_compute_dudt_jvp` — JVP via forward-mode autodiff |
+| [src/models/imf_diffusion.py:447-888](src/models/imf_diffusion.py#L447) | `compute_loss` — main flow (boundary/JVP + v-head + contrastive) |
+| [src/models/sc_vae.py:500-717](src/models/sc_vae.py#L500) | `SC_VAE` — Stage 1 architecture |
+| [src/models/sc_vae_loss.py:26-208](src/models/sc_vae_loss.py#L26) | SC-VAE losses (MSE/BCE/L1/KL + render) |
 
-**Bước 2**: Update [src/config.py:215](src/config.py#L215) — thay `slat_scale: float` (scalar) bằng `slat_stats_path: Optional[str] = "data/slat_stats.pt"`.
+**Training Scripts:**
 
-**Bước 3**: Update [src/train_imf.py:1344-1357](src/train_imf.py#L1344) — load stats khi training start, [src/train_imf.py:1374-1378](src/train_imf.py#L1374) — apply `(slat - mean) / std` trong batch loop.
+| Script | Vai trò |
+|--------|---------|
+| [scripts/train_imf_v7.sh](scripts/train_imf_v7.sh) | Phase A — boundary-only training |
+| [scripts/train_imf_v7_phaseB.sh](scripts/train_imf_v7_phaseB.sh) | Phase B+C — JVP + v-head + contrastive (resume từ Phase A) |
+| [scripts/train_imf.sh](scripts/train_imf.sh) | Generic recommended (CLAUDE.md mặc định) |
+| [src/train_imf.py](src/train_imf.py) | Main training loop với CLI args |
 
-**Bước 4**: Save `slat_stats_path` vào `stage2_model_config` ([train_imf.py:794](src/train_imf.py#L794), [813](src/train_imf.py#L813)) để inference reverse normalize.
+**Diagnostic & Data Pipeline:**
 
-#### 9.2.5. Kết quả Verify Fix (17/05/2026, training mới chạy lại)
+| Script | Vai trò |
+|--------|---------|
+| [scripts/test/test_imf_identity_t0.py](scripts/test/test_imf_identity_t0.py) | Identity + time + context conditioning diagnostic (cos_sim test) |
+| [scripts/test/test_imf_sample.py](scripts/test/test_imf_sample.py) | 1-step + N-step sampling test |
+| [scripts/data/precompute_slat_cache.py](scripts/data/precompute_slat_cache.py) | Encode mesh → slat tokens (offline) |
+| [scripts/data/pack_slat_lmdb.py](scripts/data/pack_slat_lmdb.py) | Pack .pt → merged LMDB |
+| [scripts/data/build_context_lmdb.py](scripts/data/build_context_lmdb.py) | Hybrid context (Arc+FLAME+DINO) LMDB |
 
-So sánh OLD (broken) vs NEW (sau fix, ở từng epoch):
+**Documentation:**
 
-| Metric | OLD ep16 | NEW ep2 | NEW ep5 |
-|--------|----------|---------|---------|
-| `cos(u_pred, z_1)` — identity check | **0.9973** | 0.79 | 0.96 (gần noise correct) |
-| Boundary cos_sim @ t=0.5 | 0.90 (giả) | 0.88 (thật) | **0.91** |
-| Boundary cos_sim @ t=0.1 | — | 0.91 | **0.93** |
-| 1-step sample cos_sim | 0.07 (random) | 0.007 | **0.048** (cải thiện 7x) |
-| Epoch loss | 0.21 (plateau) | 0.64 | **0.44** (giảm đều) |
-
-**Kết luận**: Fix hoạt động đúng. Identity collapse đã thoát, model học conditional velocity field thật sự.
-
----
-
-### 9.3. Quan sát Khác biệt 2 Datasets (FaceScape vs FaceVerse)
-
-User phát hiện 2 datasets không đồng nhất về độ chi tiết khi visual inspect mesh:
-
-| Aspect | FaceScape | FaceVerse |
-|--------|-----------|-----------|
-| Số meshes | **18,298** (90% data) | **2,100** (10% data) |
-| Identities | 837 train | 100 train |
-| Vertex/mesh | 200K–400K | 5K–20K |
-| **Vai (shoulders)** | ❌ Không có | ✅ **Có** |
-| **Tròng mắt (iris)** | ❌ Không có | ✅ **Có** |
-| **Miệng (mouth)** | ❌ Có lỗ rỗng | ✅ **Đầy đủ** |
-| Texture | UV 2048×2048 | Per-vertex RGB |
-| Topology | Registered (TU) | Registered (FaceVerse template) |
-
-**Hệ quả của bias 90/10**:
-- Joint training hiện tại bị **dominate bởi FaceScape**
-- Model có xu hướng sinh output **thiếu vai, thiếu mắt, miệng có lỗ** (theo dominant pattern)
-- Capacity để học các structures phức tạp hơn của FaceVerse (vai/mắt) bị "trộn loãng"
-
-→ **Cần chiến lược để model học được high-detail topology của FaceVerse**.
+| File | Nội dung |
+|------|----------|
+| [CLAUDE.md](CLAUDE.md) | Project context, common commands, architecture v7 + Phase A/B/C protocol |
+| [docs/STAGE2_GUIDE.md](docs/STAGE2_GUIDE.md) | Compact Stage 2 training guide (quick reference) |
+| [docs/AUDIT_FINDINGS.md](docs/AUDIT_FINDINGS.md) | 8 phát hiện chính từ session 22-23/05/2026 |
+| [scripts/README.md](scripts/README.md) | Index của scripts/ folder (data, training, test, inference, viz, setup) |
 
 ---
 
-### 9.4. Đề xuất Chiến lược 2-Stage Training
-
-#### 9.4.1. Strategy: Joint Pretrain → FaceVerse Finetune
-
-```
-[ Stage A ]  Joint Pretrain trên cả 2 datasets (current)
-              ↓
-[ Switch ]   Phase D test gate (epoch 10) — confirm slat fix OK
-              ↓
-[ Stage A+ ] Train tiếp cho đến khi joint loss plateau (~epoch 100-200)
-              ↓
-[ Stage B ]  Finetune FaceVerse-only, lower LR, shorter
-              ↓
-[ Output ]   Model chuyên cho FaceVerse-style: có vai, mắt, miệng đầy
-```
-
-#### 9.4.2. Lý do hợp lý
-
-| Lý do | Chi tiết |
-|-------|----------|
-| Pattern chuẩn | Pretrain on large → finetune on quality (BERT, GPT, vision foundation models) |
-| Joint warmup | Model học general face geometry từ 20K+ samples (variance lớn) |
-| Specialize | Finetune chuyên môn hoá high-detail topology của FaceVerse |
-| Code sẵn | CLI `--dataset {faceverse,facescape,both}` ([train_imf.py:1566](src/train_imf.py#L1566)) |
-| SC-VAE generic | Decoder train trên cả 2 → không bias, decode FaceVerse-rich slat OK |
-| Context generic | ArcFace+FLAME+DINOv2 không phụ thuộc dataset |
-
-#### 9.4.3. So sánh với Alternatives
-
-| Strategy | Pros | Cons | Verdict |
-|----------|------|------|---------|
-| **Joint → FaceVerse finetune** | Tận dụng pretrain, specialize cuối | Catastrophic forgetting FaceScape | ✅ **Đề xuất** |
-| Joint-only (400 ep) | Đơn giản, không multi-stage | Bias 90/10, model thiếu chi tiết | ❌ Vấn đề hiện tại |
-| FaceVerse-only from scratch | Specialize từ đầu | Quá ít data (2.1K), khó học general | ❌ Underfit |
-| Weighted sampler (70% FaceVerse) | Tránh forgetting | Implementation phức tạp, training chậm hơn | ⚠️ Backup option |
-
-User chọn: **100% FaceVerse finetune** (catastrophic forgetting chấp nhận được vì target là FaceVerse-style).
-
----
-
-### 9.5. Cấu hình Chi tiết Stage B Finetune
-
-| Hyperparam | Joint (Stage A) | Finetune (Stage B) | Lý do |
-|------------|-----------------|---------------------|-------|
-| `--dataset` | `both` | **`faceverse`** | 100% FaceVerse |
-| `--resume` | (none) | `checkpoints/imf_unet/best.pt` | Load joint weights |
-| `--lr` | 2e-4 | **2e-5** | 10x lower, tránh overfit + catastrophic |
-| `--epochs` | 400 | **100** | 2.1K × 100 ep = 210K iterations |
-| `lr_warmup_steps` | 1000 | **100** | Warmup ngắn |
-| `cfg_context_dropout` | 0.1 | **0.05** | Ít data → ít cần context augment |
-| `ema_decay` | 0.9995 | **0.999** | Adapt nhanh hơn |
-| `save_every_steps` | 500 | **100** | Save dày để pick best |
-| `checkpoint_dir` | `imf_unet/` | **`imf_unet_ft_faceverse/`** | Tránh overwrite joint |
-| `slat_stats_path` | `data/slat_stats.pt` | **(giữ nguyên)** | Tránh distribution shift |
-
-**Thời gian dự kiến Stage B**: ~6-8 giờ (vs ~7 ngày cho Stage A từ epoch 0 đến hết).
-
-**Launch command** (khi đến lúc, sau khi joint converge):
-
-```bash
-BATCH_SIZE=2 GRAD_ACCUM=32 \
-LR=2e-5 EPOCHS=100 \
-RESUME=checkpoints/imf_unet/best.pt \
-CHECKPOINT_DIR=checkpoints/imf_unet_ft_faceverse \
-bash scripts/train_imf.sh --dataset faceverse \
-    --cfg-context-dropout 0.05 --ema-decay 0.999 --lr-warmup-steps 100
-```
-
-**Code changes cần thiết khi launch**:
-
-| File | Change |
-|------|--------|
-| [scripts/train_imf.sh](scripts/train_imf.sh) | Thêm `${DATASET_ARG}`, `${CHECKPOINT_DIR_ARG}` pass-through (default empty) |
-| [src/config.py](src/config.py) | (optional) Verify `cfg_context_dropout`, `ema_decay`, `lr_warmup_steps` đã có CLI flag |
-
-**Không cần** đổi: data loading, slat normalization, model architecture, SC-VAE — tất cả generic.
-
----
-
-### 9.6. Switch Decision Gate (sau Phase D test)
-
-Quyết định khi nào switch sang Stage B dựa trên Phase D test (sau epoch 10 của Stage A):
-
-| Phase D outcome | Action |
-|-----------------|--------|
-| Boundary cos_sim ≥ 0.93 AND 1-step ≥ 0.1 | ✅ Tiếp tục train joint đến plateau (epoch 100-200) → Stage B |
-| Boundary cos_sim < 0.93 | ⚠️ Train thêm 10-20 epochs, re-test |
-| 1-step cos_sim vẫn ~0 sau epoch 20 | ⚠️ Considering `curriculum_switch_ratio`: 0.6 → 0.2 (cho t=1 training sớm hơn) |
-
-**Plateau detection**: 5 epochs liên tiếp loss không cải thiện >0.5%.
-
----
-
-### 9.7. Curriculum Switch Ratio Adjustment (Phase D Decision)
-
-Phase D test (epoch 10) cho kết quả:
-- Boundary cos_sim @ t=0.1: **0.929** (đạt threshold 0.93)
-- Boundary cos_sim @ t=0.5: 0.914
-- **1-step cos_sim: 0.052** (fail threshold 0.1)
-
-**Phân tích bottleneck:** Model học rất tốt ở training-distribution t (0.1–0.5) nhưng kém ở t cực trị (t≈1). Lý do: curriculum t-sampler ban đầu (`curriculum_switch_ratio=0.6`) keep logit-normal centered t=0.4 đến epoch 240/400 → model **hầu như không thấy t=1** → không học được 1-step sampling case.
-
-**Quyết định:** Giảm `curriculum_switch_ratio: 0.6 → 0.3` ([src/config.py:262](src/config.py#L262)) — chuyển sang uniform t-sampling ở epoch 120 (30% progress) thay vì epoch 240. Đây là compromise giữa:
-- Quá aggressive (0.15 = epoch 60): JVP instability khi model chưa học đủ boundary
-- Default (0.6 = epoch 240): 1-step không học được sớm, training tốn 7+ ngày
-
-**Rủi ro của quyết định (theo iMF paper section 4.1):**
-
-| Rủi ro | Cơ chế | Mitigation |
-|--------|--------|------------|
-| JVP instability ở t cực trị | `V = u + (t-r)·du/dt`. Khi (t-r)≈1, JVP gradient bùng | `grad_clip=1.0`, `adaptive_loss_weighting=True` |
-| Loss spike sau switch | Target velocity `e−x` có magnitude √2 lớn hơn ở t mid-range | EMA decay 0.9995 smooth sampling |
-| Boundary cos_sim @ t=0.5 giảm | Capacity bị spread mỏng qua all t | Vẫn còn 70% logit-normal sau switch (20% uniform) |
-| JVP variance tại t→0 | `du/dt` gần data manifold variance cao | adaptive_loss_weighting tự down-weight |
-
-**Rollback plan:** `best.pt` epoch 10 đã save trước khi resume với curriculum mới → nếu loss diverge sau epoch 120, có thể revert.
-
-### 9.8. Risks & Mitigations cho Stage B Finetune
-
-| Rủi ro | Mức độ | Mitigation |
-|--------|--------|------------|
-| Catastrophic forgetting FaceScape | Medium | Chấp nhận (target FaceVerse-style only) |
-| Overfit 2,100 samples | Medium | LR 2e-5 (10x lower), epochs 100 (vs 400), EMA decay 0.999 |
-| Distribution shift trong normalized slat space | Low | Giữ `data/slat_stats.pt` của joint, không recompute |
-| Joint chưa converge khi switch sang Stage B | Medium | Phase D + Phase E test gates, plateau detection |
-| FaceVerse có structures (vai/mắt) mà SC-VAE chưa encode tốt | Low | SC-VAE đã train trên cả 2 datasets → encoder thấy đủ |
-
----
-
-### 9.9. Verification Protocol
-
-#### Phase E test (Stage A, ~epoch 130 — 10 epochs sau curriculum switch):
-- Re-run `scripts/test_imf_at_training_t.py` + `scripts/test_imf_sample.py`
-- **CRITERIA**: 1-step cos_sim ≥ 0.15 (tăng từ 0.052), boundary cos_sim @ t=0.5 không tụt dưới 0.85
-- Nếu fail: rollback về best.pt epoch 10, revert curriculum_switch_ratio
-
-#### Tại epoch 10 của Stage B:
-- Re-run `scripts/test_imf_sample.py --ckpt checkpoints/imf_unet_ft_faceverse/latest_step.pt`
-- Expect boundary cos_sim tăng (vs joint best.pt)
-- Expect 1-step cos_sim tăng trên FaceVerse test samples
-
-#### Tại epoch 50 của Stage B:
-- **Visual inspection**: decode 5 random FaceVerse-style samples → mesh, check:
-  - Có vai không?
-  - Có tròng mắt không?
-  - Miệng có đầy không (không có lỗ)?
-- So sánh visual với output Stage A best.pt cùng context
-
-#### Tại epoch 100 của Stage B (final):
-- Compute cos_sim trên cả FaceVerse test (10 ID) và FaceScape test (10 ID):
-  - FaceVerse: kỳ vọng tăng đáng kể vs joint
-  - FaceScape: chấp nhận giảm (catastrophic forgetting)
-- Pick best.pt theo FaceVerse test metric, không joint metric
-
----
-
-### 9.10. Trạng thái Pipeline Hiện tại (17/05/2026, post-Phase D)
-
-| Component | Trạng thái | Chi tiết |
-|-----------|-----------|----------|
-| SC-VAE epoch 500 | ✅ Done | `checkpoints/sc_vae_shape/epoch_500.pt` (recon=0.0213, KL=14.58) |
-| Slat+Context LMDB | ✅ Done | 20,369 entries |
-| Slat normalization stats | ✅ Done | `data/slat_stats.pt` (32-dim mean+std, từ 83.4M tokens) |
-| Identity collapse fix | ✅ Verified | Per-channel normalize → loss 1.64 → 0.41 (ep10), boundary cos 0.93 |
-| Phase D test (ep10) | ✅ Done | Boundary cos 0.93 ✓, 1-step cos 0.052 ❌ → curriculum adjusted |
-| **Curriculum adjustment** | ✅ **Applied** | `switch_ratio: 0.6 → 0.3` (switch ở epoch 120 thay vì 240) |
-| Stage A joint training | 🟢 **Resumed** | PID 60512, resumed từ ep10 best.pt, curriculum mới |
-| Phase E test | ⏳ Chờ | ~epoch 130 (10 epochs sau curriculum switch) |
-| Stage B finetune | ⏳ Chờ | Sau Phase E pass + joint plateau |
-
-**Project cleanup (17/05):** Tinh gọn báo cáo 2,681 → 1,476 dòng (45%), xóa ~8.6 GB legacy outputs/checkpoints/scripts, remove IMFUNet1D + deprecated config fields. Chỉ giữ VoxelMamba backbone duy nhất.
-
----
-
-*(Cập nhật: 17/05/2026 — Revision 16: Identity-collapse fix bằng per-channel slat normalization + chiến lược 2-stage + curriculum_switch_ratio adjustment 0.6→0.3 + project cleanup.)*
-
----
-
-## 10. Revision 17 — Architecture Audit + CFG VRAM Optimization (18/05/2026)
-
-### 10.1. Tóm tắt Revision 17
-
-Section này ghi lại 3 đóng góp lớn ngày 18/05:
-1. **MediaPipe FLAME fix** — recompute toàn bộ `hybrid_context.lmdb` với MediaPipe FaceLandmarker V2 (vì FLAME cũ output constant do CNN random-init)
-2. **Architecture audit** — đối chiếu kỹ với 2 paper (iMF arXiv:2512.02012v1 + DiM-3D arXiv:2406.05038v1), xác nhận FaceDiff design đúng ý đồ paper iMF
-3. **CFG VRAM optimization** — refactor batch-doubling CFG thành 2 forward passes riêng (1 với grad, 1 với `no_grad`), tiết kiệm ~50% activation memory → tăng batch 3 → 4 → speedup 38%
-
-### 10.2. FLAME Fix với MediaPipe (sáng 18/05)
-
-**Bug phát hiện qua context visualization:**
-- FLAME context cho 5 mesh khác nhau có pairwise max_diff chỉ **0.0003** (= noise floor)
-- ArcFace varies properly (cos_sim same-ID=0.84, diff-ID=0.05)
-- DINOv2 varies properly (cos_sim FV-FV=0.86, FV-FS=0.43)
-- **FLAME hoàn toàn không vary** → model 14 epoch đã train với expression conditioning = constant
-
-**Root cause:** [src/data/flame_adapter.py](src/data/flame_adapter.py) cũ là CNN random-init không có pretrained weights. Output bị saturated bởi Tanh → tất cả input cho output gần như identical.
-
-**Fix:** Thay bằng **MediaPipe FaceLandmarker V2** (3.7 MB model, 52 ARKit blendshapes):
-- Drop 2 redundant (`_neutral` + `browDownLeft`) → 50-dim giữ `context_dim=946`
-- Verify: cùng identity khác expression (`001_01` vs `001_02`) → max_diff **0.81**, cos_sim 0.72
-- Different IDs → cos_sim 0.45-0.67 (proper variation)
-
-**Recompute pipeline (auto):**
-- `scripts/auto_fix_flame_and_retrain.sh` — tự động backup + recompute hybrid_context.lmdb (~10.8h)
-- `scripts/remix_slat_lmdb_with_new_context.py` — merge new context với slat cũ (slat unchanged) trong ~5 phút
-- Training restart từ epoch 0 với context đầy đủ thông tin
-
-### 10.3. Audit Architecture vs Papers (cập nhật revision 18)
-
-**So sánh với iMF paper (arXiv:2512.02012v1):**
-
-| Aspect | iMF Paper | FaceDiff v4 (22/05/2026) | Ghi chú |
-|--------|-----------|--------------------------|---------|
-| Conditioning | In-context prefix tokens | **Dual AdaLN broadcast** (0 prefix) | Deviate có chủ đích: prefix không ảnh hưởng slat positions trong SSM scan; AdaLN ctx đổi được output tại mọi index |
-| $(t,r,|t-r|,\omega)$ | Tokenized | `time_guidance_mlp` vector | Cùng thông tin, khác mechanism |
-| CFG training | Algorithm 2 | **Tắt** trong production train | Tránh VRAM + collapse sau ep30 audit |
-| Objective + JVP | iMF | Giữ (boundary 50% + JVP 50%) | |
-| FFN | Transformer blocks | **Có** per Mamba block | Khớp DiT-style capacity |
-
-**Lịch sử lỗi conditioning (ep≤30):** `cond_fusion` concat làm `time_cond` giống nhau khi $t$ giống nhau → cos_sim output ~0.99 (identity collapse). Đã bỏ; train lại scratch.
-
-**So sánh DiM-3D:**
-
-| Aspect | DiM-3D | FaceDiff v4 |
-|--------|--------|-------------|
-| BiMamba + FFN | Có | ✅ Có |
-| Hilbert | Raster | ✅ Hilbert |
-| Output init | Standard | Xavier gain=0.02 (không zero backbone out) |
-
-**Verdict:** FaceDiff v4 = Mamba+FFN backbone + **AdaLN conditioning** (trade-off vs paper in-context) + iMF loss + contrastive auxiliary. Checkpoint `c92ba00` trở đi dùng `adaLN_time` / `adaLN_ctx` — không load ckpt `cond_fusion` / `adaLN_modulation`.
-
-### 10.4. CFG VRAM Optimization
-
-**Hypothesis (user identify):** Batch doubling `[cond, uncond]` thành batch=2B với gradient → lưu activations cho uncond pass vô ích (vì `.detach()` trước khi vào loss).
-
-**Verify từ Algorithm 2 paper iMF** (page 6-7):
-```python
-v_c = fn(z, t, t, w, c)          # conditional v
-v_u = fn(z, t, t, w, None)       # unconditional v (RIÊNG, có thể no_grad)
-v_g = (e - x) + (1 - 1/w) * (v_c - v_u)
-u, dudt = jvp(fn, (z, r, t, w, c), (v_c, 0, 1, 0, 0))
-V = u + (t - r) * stopgrad(dudt)
-error = V - v_g       # paper KHÔNG stopgrad v_g (Eq. 12 intend grad flow)
-loss = metric(error)
-```
-
-→ Paper chạy v_c, v_u RIÊNG. FaceDiff old code gộp batch=2B → tốn VRAM.
-
-**Refactor ([src/models/imf_diffusion.py:407-439](src/models/imf_diffusion.py#L407)):**
-```python
-# Forward #1: Conditional (CÓ gradient — cần cho v-head + JVP)
-v_theta = model(z_t, t, context_cond, ...)
-
-# Forward #2: Unconditional (KHÔNG gradient — v_uncond luôn .detach())
-with torch.no_grad():
-    v_uncond = model(z_t, t, torch.zeros_like(context_cond), ...)
-
-v_target = (e - x) + coeff * (v_theta.detach() - v_uncond.detach())
-```
-
-✅ Mathematically identical với code cũ.
-✅ Activation VRAM tiết kiệm ~50% trên CFG branch.
-
-### 10.5. Speedup từ Batch Size Increase
-
-**Throughput experiment:**
-
-| Config | VRAM (process) | Batch/s | Samples/s | ETA/epoch | Total Stage A |
-|--------|----------------|---------|-----------|-----------|---------------|
-| OLD (batch=2, batch doubling) | 11.3 GB | 4.1 | 8.2 | 41 min | 11.4 ngày |
-| Batch=3, batch doubling | 17 GB | 2.9 | 8.7 | 39 min | 9.7 ngày |
-| **Batch=4, refactored CFG** | **17.9 GB** | **3.1** | **12.4** | **25 min** | **6.9 ngày** |
-| Batch=5, refactored CFG | OOM (peak 17.6 GB + 5.2 other = 22.8) | — | — | — | — |
-
-**Net speedup:** Total ~40% throughput improvement, save **~4.5 ngày** training time.
-
-**Configuration final:**
-- `batch_size=4`, `gradient_accumulation_steps=16` (effective 64)
-- TF32 + cudnn.benchmark enabled
-- NUM_WORKERS=4
-- VRAM margin ~1 GB (acceptable)
-
-### 10.6. Decision Gates (Phase F & Beyond)
-
-Sau ep200 (~3 ngày từ 18/05), test boundary cos_sim + 1-step cos_sim:
-
-| cos_sim @ ep200 | Action |
-|-----------------|--------|
-| **> 0.7** | ✅ Architecture OK, skip Stage B refactor, finetune FaceVerse |
-| **0.5-0.7** | ⚠️ Train thêm đến ep300, hoặc add FFN nếu plateau |
-| **0.3-0.5** | 🟡 **Add FFN sub-block** + restart từ epoch 0 (cost 3-4 ngày extra) |
-| **< 0.3** | 🔴 Full refactor (FFN + size up 12→16 layers) |
-
-### 10.7. Trạng thái Pipeline Hiện tại (18/05/2026, 15:00)
-
-| Component | Trạng thái | Chi tiết |
-|-----------|-----------|----------|
-| FLAME context (MediaPipe) | ✅ Done | 20,939 entries trong hybrid_context.lmdb |
-| Slat normalization | ✅ Done | data/slat_stats.pt (32-dim mean+std) |
-| CFG VRAM optimization | ✅ Applied | 2 forward passes (cond grad + uncond no_grad) |
-| Speedup config | ✅ Applied | batch=4 + grad_accum=16 + TF32 + cudnn.benchmark |
-| Training process | 🟢 **Running** | PID 249025, resume ep7 (loss=0.4184), 3.1 batch/s, ETA epoch 25 min |
-| Stage A ETA | ⏳ 7 ngày | 400 epochs × 25 min = ~170h |
-| Stage B finetune | ⏳ Pending | Sau Phase F gate |
-
-### 10.8. Files đã Sửa Revision 17
-
-| File | Change |
-|------|--------|
-| [src/data/flame_adapter.py](src/data/flame_adapter.py) | Rewrite với MediaPipe FaceLandmarker V2 |
-| [src/models/imf_diffusion.py](src/models/imf_diffusion.py) | Refactor CFG: 2 forward passes thay batch doubling |
-| [src/train_imf.py](src/train_imf.py) | Add TF32 + cudnn.benchmark flags |
-| [scripts/train_imf.sh](scripts/train_imf.sh) | Default NUM_WORKERS=4 |
-| [scripts/auto_fix_flame_and_retrain.sh](scripts/auto_fix_flame_and_retrain.sh) | **NEW** — full automation |
-| [scripts/remix_slat_lmdb_with_new_context.py](scripts/remix_slat_lmdb_with_new_context.py) | **NEW** — merge slat cũ + context mới |
-| [scripts/visualize_test_context.py](scripts/visualize_test_context.py) | **NEW** — inspect context vectors |
-| [src/mesh_gpu.py](src/mesh_gpu.py) | **NEW** — GPU KNN + Taubin smoothing helpers |
-
----
-
-*(Cập nhật: 18/05/2026 — Revision 17: MediaPipe FLAME + CFG VRAM optimization + batch=4 speedup + architecture audit vs iMF/DiM-3D papers. ETA Stage A: 7 ngày.)*
-
----
-
-## 11. Revision 18 — v7 Architecture + Phase A/B/C Training (22-23/05/2026)
-
-### 11.1. Bối cảnh và Động lực
-
-Sau Revision 17, Stage A v4 chạy được vài epochs nhưng gặp **plateau nghiêm trọng**:
-- Loss giảm 4.17 → 2.14 ở ep6, sau đó dừng giảm
-- Identity diagnostic: `cos_sim(u_correct_ctx, u_wrong_ctx) = 1.0` — context bị **hoàn toàn ignore**
-- Mô hình đoán "trung bình" velocity field, không quan tâm danh tính
-
-→ Cần audit **toàn diện** kiến trúc + hyperparams. Đọc kỹ lại 2 paper nền tảng:
-- **iMF (Geng et al. 2025, arXiv:2512.02012)** — Improved Mean Flow
-- **DiM-3D (Mo et al. 2024, arXiv:2406.05038)** — Bidirectional SSM for 3D
-
-### 11.2. Pre-Training Risk Audit (22/05 sáng)
-
-Phát hiện **8 risks** trước khi train v7:
-
-| # | Risk | Severity | Vấn đề | Fix |
-|---|------|----------|--------|-----|
-| 1 | `context_velocity_separation_loss` | **CRITICAL** | 2 extra forward passes qua 122M params → OOM (3× memory). Default ON với weight=0.25 | Set `weight=0.0`, để dùng riêng sau khi hội tụ |
-| 2 | Double normalization context | **CRITICAL** | Balanced LMDB đã L2-norm, code lại scale × (3.0, 2.0, 0.5) → ArcFace chiếm 84% energy | Đổi weights → (1.5, 1.0, 0.5) |
-| 3 | 24 prefix tokens incompat v4 ckpt | HIGH | Config default tokens=8/4/4/4/4 vs v4 ckpt no prefix | Train v7 from scratch |
-| 4 | Diagnostic config có aux losses active | HIGH | Diagnostic intent là "clean" nhưng contrastive=0.2 + ctx_sep=0.25 vẫn ON | Phase A: tắt all aux losses |
-| 5 | Per-layer ctx projs thêm 3.15M params | MEDIUM | 12× Linear(512, 512) | Keep, init std=0.02 + bias=0 |
-| 6 | adaLN_ctx scale init 0.02 → 0.1 | MEDIUM | 5x increase modulation, có thể unstable epoch đầu | Monitor loss ep0-1, có thể rollback nếu diverge |
-| 7 | ctx_classifier output dim thay đổi 946 → 512 | MEDIUM | Arcface mode shrink output | OK fresh training |
-| 8 | num_workers=8 LMDB crash | LOW | EGL crash khi multiprocessing nhiều workers | Reduce to 4 |
-
-### 11.3. Paper-Aligned Hyperparameter Fixes
-
-| Param | Old (v4) | New (v7) | Lý do |
-|-------|----------|----------|-------|
-| `learning_rate` | 3e-5 | **1e-4** | iMF paper Table 4. 3e-5 quá nhỏ cho 20K dataset → plateau ep6 |
-| `lr_warmup_steps` | 500 | **5000** | Proportional với dataset size (20K samples / batch 4 ≈ 5K iters per epoch) |
-| `lr_scheduler` | "cosine" | **"constant"** | iMF paper Table 4. Cosine decay → LR drop premature, làm plateau ep6 |
-| `t_sampler` | "uniform" | **"logit_normal"** | Paper: focus capacity vào t∈[0.2, 0.6] (mean=-0.4, scale=1.0) — vùng signal mạnh nhất. Dataset nhỏ càng cần focus. |
-| `output_proj` init | `xavier_uniform_(0.02)` σ≈0.0009 | **`normal_(std=√(0.1/fan_in))`** σ≈0.014 | iMF Appendix A. 16x too small → starved backbone gradients |
-
-### 11.4. v7 Architecture Changes (vs v4)
-
-```
-v4 (Revision 17, May 2026):
-  - 12× BiMamba+FFN blocks
-  - Dual AdaLN (time pre-Mamba, context post-Mamba)
-  - 0 prefix tokens (conditioning via AdaLN broadcast)
-  - Single context_cond_mlp → broadcast to all layers
-  - output_proj: xavier_uniform_(0.02)
-  - Total: ~94M params (backbone) + 16.8M (v-head)
-
-v7 (Revision 18, 22-23/05/2026):
-  - 12× BiMamba+FFN blocks (UNCHANGED)
-  - Dual AdaLN (UNCHANGED)
-  + 24 prefix tokens at END of sequence (ctx=8, time=4, r=4, interval=4, guidance=4)
-  + Per-layer context projections (12× Linear(512, 512)) — separate projection per block
-  + adaLN_ctx scale init = N(0, 0.1) — 5x stronger context modulation
-  + context_segment_weights = (1.5, 1.0, 0.5) — moderate identity bias (post balanced LMDB norm)
-  + output_proj init = normal_(std=sqrt(0.1/fan_in)) ≈ 0.014 [iMF Appendix A]
-  
-  Total: 105.4M (backbone) + 16.8M (v-head, depth=8) + 0.5M (ctx_classifier) = 122.7M params
-```
-
-### 11.5. Phase A — Clean Boundary Training (22/05 15:20 - 21:38, ~5.5h)
-
-**Config (tất cả aux losses OFF):**
-```bash
-ratio_r_neq_t=0.0          # No JVP samples
-use_auxiliary_v_head=False # No v-head
-contrastive_loss_weight=0.0
-context_velocity_sep_weight=0.0
-batch_size=4
-grad_accum=8               # Effective batch=32
-```
-
-**Trajectory (20 epochs, ~16 min/epoch):**
-
-| Epoch | Loss | Notes |
-|-------|------|-------|
-| 1 | 3.02 | Start (was 4.17 in v4 — better init từ paper fixes) |
-| 5 | 1.64 | Fast initial drop (paper-aligned LR working) |
-| 9 | **1.5072** | `best.pt` saved |
-| 15 | 1.49 | Stable progress |
-| 20 | **1.4155** | Phase A end ✅ |
-
-**Diagnostic at ep20:**
-- Time cos@t0vs1 = **-0.008** ✅ (excellent time conditioning, target <0.3)
-- Context cos = 0.9994 (dormant, **EXPECTED** — boundary loss không cần context)
-- ‖u‖(t) profile: high at edges (t=0, t=1), low at middle — **flow matching pattern correct**
-- VRAM: 10.3GB / 24GB (safe margin 13.7GB)
-
-**Verdict:** Phase A SUCCESS. Time conditioning learned, velocity shape correct, context dormant là EXPECTED behavior (sẽ activate ở Phase C).
-
-### 11.6. Phase B — Enable JVP + v-head (22/05 21:38 - 23/05 01:54, ~4h)
-
-**Config thêm:**
-```bash
-ratio_r_neq_t=0.5          # 50% JVP samples (paper Table 4)
-use_auxiliary_v_head=True  # v-head depth=8 (iMF Appendix A)
-# Resume from imf_v7/epoch_20.pt
-```
-
-**First attempt với batch=4 → OOM crash:**
-```
-torch.OutOfMemoryError: CUDA out of memory.
-Tried to allocate 34.00 MiB. GPU 0 has a total capacity of 23.54 GiB
-of which 48.06 MiB is free.
-```
-
-→ JVP yêu cầu 2× forward passes (1 main + 1 dudt). Phase A đã dùng 10.3GB; JVP doubles ≈ 20.6GB; + v-head (16.8M activation) → 24GB OOM.
-
-**Successful với batch=2, grad_accum=16:**
-- VRAM stable 19.3GB / 24GB (safe margin 4.7GB)
-- Speed 4.0 batch/s (~40 min/epoch, 2.5x slower than Phase A)
-
-**Trajectory (6 epochs, ep21-26):**
-
-| Epoch | Total Loss | Boundary | LR | Notes |
-|-------|-----------|----------|-----|-------|
-| 22 | 3.36 | 1.74 | 2.62e-5 | First JVP epoch (v-head random init) |
-| 23 | 2.94 | 1.74 | 3.88e-5 | v-head warm-up |
-| 24 | 2.93 | 1.74 | 5.15e-5 | Stable |
-| 25 | 2.96 | 1.78 | 6.41e-5 | LR ramping |
-| 26 | 2.92 | 1.74 | 7.67e-5 | Plateau |
-
-**Diagnostic at ep26:**
-- Time cos@t0vs1 = 0.022 ✅
-- Context cos = **0.9998** ❌ (WORSE than Phase A 0.9994!)
-- ArcFace shuffle cos = 0.9999 ❌
-
-**Verdict:** **JVP alone INSUFFICIENT để force context dependency.** Model tìm local minimum: predict context-agnostic velocity that satisfies JVP via constant tangent vector. Đây không phải bug mà là **local optimum bypass** — JVP loss có thể minimize được mà không cần context.
-
-### 11.7. Deep Investigation — Why Mamba Absorbs Context (23/05 01:30)
-
-Khai mở model qua từng layer để tìm root cause:
-
-**Test 1 — Gradient flow:**
-```
-‖∂out/∂ctx‖ = 1689.9   ← context CÓ trong computation graph
-‖∂out/∂t‖   = 46.7     ← time gradient comparable
-```
-→ Context IS in gradient path. Vấn đề KHÔNG phải gradient flow.
-
-**Test 5 — Context flow phân rã từng tầng (random ctx_a vs ctx_b):**
-```
-context_cond_mlp(ctx_a, ctx_b):    cos = 0.118  ← MLP discriminate TỐT (98% khác)
-per_layer_ctx_proj output:          cos = 0.21   ← still discriminative
-adaLN(scale+shift):                  cos = 0.24-0.45 ← starting to blend
-mamba_out activation (layer 11):     cos = 0.999  ← gần IDENTICAL!
-```
-
-→ Mamba SSM **"nuốt" context signal** ở giai đoạn cuối layer. Context vẫn discriminative ở adaLN output, nhưng hidden state ra giống nhau.
-
-**Test 4 — adaLN_ctx output magnitudes:**
-```
-||scale||  = 1.75   →  mean(scale) ≈ 0.08
-||shift||  = 0.17   →  mean(shift) ≈ 0.008
-max|scale| = 0.22   →  modulation max ±22% per element
-
-mamba_out activation:
-||out||    = 700    →  mean(activation) ≈ 0.32 per element
-```
-
-**Effective modulation:**
-```
-out_new = activation × (1 + 0.08) + 0.008
-        ≈ 0.32 × 1.08 + 0.008
-        ≈ 0.353
-
-vs context-free: 0.32
-→ Khác chỉ ~10% per element, GET ABSORBED bởi nonlinearity (SiLU + Mamba dynamics)
-```
-
-**Tệ hơn:** ‖scale‖ = 1.75 đang **THẤP HƠN init value** (~2.26 nếu init N(0, 0.1)). Model đã **ACTIVELY DECREASE** context modulation magnitude vì:
-1. Boundary loss (50% samples) không cần context → pull weights toward identity transformation
-2. JVP loss (50% samples) cũng satisfy được mà không cần context → constant tangent OK
-3. → Local min: ignore context, predict average velocity
-
-### 11.8. Phase C — Add Contrastive Loss (BREAKTHROUGH) (23/05 01:54+)
-
-**Hypothesis:** Context_cond_mlp đã discriminate (cos=0.118) — vấn đề là Mamba nuốt. Cần **direct loss force pooled hidden state phải predict context**.
-
-→ Enable contrastive InfoNCE:
-
-**Config thêm vào Phase B:**
-```bash
-contrastive_loss_weight=0.2      # Force context discrimination
-contrastive_mode="arcface"        # ctx_classifier output 512-d (predicts arc identity)
-contrastive_temperature=0.1
-# Resume from latest_step.pt (ep26)
-```
-
-**Trajectory (11 epochs, ep27-38):**
-
-| Epoch | Total Loss | Boundary | LR | Notes |
-|-------|-----------|----------|-----|-------|
-| 27 | 3.01 | 1.74 | 1.36e-5 | Restart, ctx_classifier random init |
-| 28 | 2.95 | 1.74 | 2.62e-5 | LR warmup |
-| 30 | 2.92 | 1.74 | 5.15e-5 | |
-| 34 | 2.93 | 1.76 | 1.00e-4 | LR fully ramped |
-| 38 | 2.92 | 1.76 | 1.00e-4 | Loss plateau (nhưng context activated!) |
-
-**🎉 Diagnostic at ep38 (random input):**
-
-| Metric | Ep20 (Phase A) | Ep26 (Phase B no contrast) | **Ep38 (Phase B+C)** |
-|--------|----------------|------------------------------|----------------------|
-| Hidden state cos | ~0.999 | ~0.994 | **0.772** ⬇️ |
-| Velocity output cos | ~0.999 | ~0.999 | **0.804** ⬇️ |
-| Δ from Phase A baseline | — | -0.005 | **-0.195** 🚀 |
-
-**Layer-by-layer discrimination buildup:**
-```
-Layer  0:  cos = 0.990  (start to differentiate)
-Layer  5:  cos = 0.888  ✓ significantly discriminated
-Layer 11:  cos = 0.822  ✓ strong discrimination
-Output:    cos = 0.804  ✓ velocity differentiates!
-```
-
-**Verdict:** Contrastive WORKS! Context discriminative information **builds up qua từng layer**. Mamba KHÔNG còn nuốt signal nữa — hidden state encodes identity through layers.
-
-**Note quan trọng:** test_imf_identity_t0.py với **real slat data** vẫn cho cos=0.997 — vì slat input dominates velocity prediction. Context perturbation thật nhưng proportionally nhỏ so với slat structure. Cần test sampling/decode để verify identity preservation thực sự.
-
-### 11.9. Memory Budget Summary (RTX 4090, 24GB)
-
-| Mode | Batch | VRAM | Notes |
-|------|-------|------|-------|
-| Phase A (boundary only) | 4 | **10.3GB** | Safe margin 13GB |
-| Phase B (+ JVP + v-head) | 4 | **24GB OOM** | First attempt crashed |
-| Phase B (+ JVP + v-head) | 2 | **19.3GB** | Safe margin 4.7GB |
-| Phase B+C (+ contrastive) | 2 | **19.5GB** | Safe margin 4.5GB |
-| Phase B + ctx_sep loss | 2 | est. **23+ GB** | **DO NOT enable — OOM risk** |
-
-### 11.10. Training Phases Protocol (Recommended)
-
-| Phase | Epochs | Active Losses | Batch | Time/epoch | Decision Gate |
-|-------|--------|---------------|-------|------------|---------------|
-| **A** | 0-20 | boundary | 4 | 16 min | Loss < 1.5? → Phase B |
-| **B** | 20-26 | + JVP + v-head | 2 | 40 min | Context activated? No → Phase C |
-| **C** | 26-? | + contrastive 0.2 | 2 | 43 min | Hidden cos < 0.7? → Phase D |
-| **D?** | future | Sampling tests | 1-4 | TBD | Mesh quality OK? |
-
-### 11.11. Files Modified Revision 18
-
-| File | Change | Reason |
-|------|--------|--------|
-| [src/config.py](src/config.py) | `lr=1e-4`, `lr_scheduler="constant"`, `t_sampler="logit_normal"`, `lr_warmup_steps=5000`, `context_segment_weights=(1.5, 1.0, 0.5)`, `use_auxiliary_v_head=True` (Phase B) | Paper-aligned + Phase A/B/C config |
-| [src/models/voxel_mamba.py](src/models/voxel_mamba.py) | `output_proj` init: `normal_(std=sqrt(0.1/fan_in))` thay xavier(0.02) | iMF Appendix A — fix 16x too small init |
-| [scripts/train_imf_v7.sh](scripts/train_imf_v7.sh) | **NEW** — Phase A boundary-only training | Clean baseline |
-| [scripts/train_imf_v7_phaseB.sh](scripts/train_imf_v7_phaseB.sh) | **NEW** — Phase B+C training (JVP + v-head + contrastive) | Resume Phase A → activate context |
-| [CLAUDE.md](CLAUDE.md) | Architecture v4 → v7 + Phase A/B/C protocol section | Project context for future sessions |
-| [docs/STAGE2_GUIDE.md](docs/STAGE2_GUIDE.md) | **NEW** — Compact Stage 2 training guide | Quick reference |
-| [docs/AUDIT_FINDINGS.md](docs/AUDIT_FINDINGS.md) | **NEW** — 8 findings từ session | Knowledge persistence |
-
-### 11.12. Trạng thái Pipeline (23/05/2026, 10:30)
-
-| Component | Trạng thái | Chi tiết |
-|-----------|-----------|----------|
-| Stage 1 SC-VAE | ✅ Done | `checkpoints/sc_vae_shape/epoch_500.pt` (8.3GB) |
-| Stage 2 v7 Phase A | ✅ Done ep20 | `checkpoints/imf_v7/epoch_20.pt` (loss=1.4155) |
-| Stage 2 v7 Phase B+C | 🟢 **Running ep38** | PID 1364952, loss=2.92, VRAM 19.5GB |
-| Stage 3 Decode | ⏳ Pending | Sau Phase C ổn định |
-
-### 11.13. Decision Gates (Phase C → D)
-
-Sau ep50 (~10h từ ep38), test cos_sim diagnostic:
-
-| Hidden state cos @ ep50 | Action |
-|--------------------------|--------|
-| **< 0.5** | ✅ Context strongly active → setup Stage 3 decode + sampling test |
-| **0.5 - 0.7** | ⚠️ Train tiếp đến ep80, monitor |
-| **0.7 - 0.85** | 🟡 Increase `contrastive_loss_weight` 0.2 → 0.5 |
-| **> 0.85** | 🔴 Architectural problem — post-hoc boost `adaLN_ctx.weight × 3` hoặc enable `ctx_sep` với batch=1 |
-
----
-
-*(Cập nhật: 23/05/2026 — Revision 18: v7 architecture (24 prefix + per-layer ctx) + Phase A/B/C training protocol + paper-aligned hyperparams + BREAKTHROUGH "Mamba absorbs context, fix với contrastive InfoNCE". ETA Phase C end: ~10h.)*
+*(Cập nhật: 23/05/2026 — Snapshot v7 architecture sau Phase A/B/C training. Báo cáo này mô tả trạng thái hiện tại của project, đối chiếu chính xác với source code. Lịch sử revision đã được loại bỏ để tập trung vào best practices và phương pháp tốt nhất.)*
 
 ---
 
