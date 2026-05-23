@@ -1590,6 +1590,283 @@ Sau ep200 (~3 ngày từ 18/05), test boundary cos_sim + 1-step cos_sim:
 
 ---
 
+## 11. Revision 18 — v7 Architecture + Phase A/B/C Training (22-23/05/2026)
+
+### 11.1. Bối cảnh và Động lực
+
+Sau Revision 17, Stage A v4 chạy được vài epochs nhưng gặp **plateau nghiêm trọng**:
+- Loss giảm 4.17 → 2.14 ở ep6, sau đó dừng giảm
+- Identity diagnostic: `cos_sim(u_correct_ctx, u_wrong_ctx) = 1.0` — context bị **hoàn toàn ignore**
+- Mô hình đoán "trung bình" velocity field, không quan tâm danh tính
+
+→ Cần audit **toàn diện** kiến trúc + hyperparams. Đọc kỹ lại 2 paper nền tảng:
+- **iMF (Geng et al. 2025, arXiv:2512.02012)** — Improved Mean Flow
+- **DiM-3D (Mo et al. 2024, arXiv:2406.05038)** — Bidirectional SSM for 3D
+
+### 11.2. Pre-Training Risk Audit (22/05 sáng)
+
+Phát hiện **8 risks** trước khi train v7:
+
+| # | Risk | Severity | Vấn đề | Fix |
+|---|------|----------|--------|-----|
+| 1 | `context_velocity_separation_loss` | **CRITICAL** | 2 extra forward passes qua 122M params → OOM (3× memory). Default ON với weight=0.25 | Set `weight=0.0`, để dùng riêng sau khi hội tụ |
+| 2 | Double normalization context | **CRITICAL** | Balanced LMDB đã L2-norm, code lại scale × (3.0, 2.0, 0.5) → ArcFace chiếm 84% energy | Đổi weights → (1.5, 1.0, 0.5) |
+| 3 | 24 prefix tokens incompat v4 ckpt | HIGH | Config default tokens=8/4/4/4/4 vs v4 ckpt no prefix | Train v7 from scratch |
+| 4 | Diagnostic config có aux losses active | HIGH | Diagnostic intent là "clean" nhưng contrastive=0.2 + ctx_sep=0.25 vẫn ON | Phase A: tắt all aux losses |
+| 5 | Per-layer ctx projs thêm 3.15M params | MEDIUM | 12× Linear(512, 512) | Keep, init std=0.02 + bias=0 |
+| 6 | adaLN_ctx scale init 0.02 → 0.1 | MEDIUM | 5x increase modulation, có thể unstable epoch đầu | Monitor loss ep0-1, có thể rollback nếu diverge |
+| 7 | ctx_classifier output dim thay đổi 946 → 512 | MEDIUM | Arcface mode shrink output | OK fresh training |
+| 8 | num_workers=8 LMDB crash | LOW | EGL crash khi multiprocessing nhiều workers | Reduce to 4 |
+
+### 11.3. Paper-Aligned Hyperparameter Fixes
+
+| Param | Old (v4) | New (v7) | Lý do |
+|-------|----------|----------|-------|
+| `learning_rate` | 3e-5 | **1e-4** | iMF paper Table 4. 3e-5 quá nhỏ cho 20K dataset → plateau ep6 |
+| `lr_warmup_steps` | 500 | **5000** | Proportional với dataset size (20K samples / batch 4 ≈ 5K iters per epoch) |
+| `lr_scheduler` | "cosine" | **"constant"** | iMF paper Table 4. Cosine decay → LR drop premature, làm plateau ep6 |
+| `t_sampler` | "uniform" | **"logit_normal"** | Paper: focus capacity vào t∈[0.2, 0.6] (mean=-0.4, scale=1.0) — vùng signal mạnh nhất. Dataset nhỏ càng cần focus. |
+| `output_proj` init | `xavier_uniform_(0.02)` σ≈0.0009 | **`normal_(std=√(0.1/fan_in))`** σ≈0.014 | iMF Appendix A. 16x too small → starved backbone gradients |
+
+### 11.4. v7 Architecture Changes (vs v4)
+
+```
+v4 (Revision 17, May 2026):
+  - 12× BiMamba+FFN blocks
+  - Dual AdaLN (time pre-Mamba, context post-Mamba)
+  - 0 prefix tokens (conditioning via AdaLN broadcast)
+  - Single context_cond_mlp → broadcast to all layers
+  - output_proj: xavier_uniform_(0.02)
+  - Total: ~94M params (backbone) + 16.8M (v-head)
+
+v7 (Revision 18, 22-23/05/2026):
+  - 12× BiMamba+FFN blocks (UNCHANGED)
+  - Dual AdaLN (UNCHANGED)
+  + 24 prefix tokens at END of sequence (ctx=8, time=4, r=4, interval=4, guidance=4)
+  + Per-layer context projections (12× Linear(512, 512)) — separate projection per block
+  + adaLN_ctx scale init = N(0, 0.1) — 5x stronger context modulation
+  + context_segment_weights = (1.5, 1.0, 0.5) — moderate identity bias (post balanced LMDB norm)
+  + output_proj init = normal_(std=sqrt(0.1/fan_in)) ≈ 0.014 [iMF Appendix A]
+  
+  Total: 105.4M (backbone) + 16.8M (v-head, depth=8) + 0.5M (ctx_classifier) = 122.7M params
+```
+
+### 11.5. Phase A — Clean Boundary Training (22/05 15:20 - 21:38, ~5.5h)
+
+**Config (tất cả aux losses OFF):**
+```bash
+ratio_r_neq_t=0.0          # No JVP samples
+use_auxiliary_v_head=False # No v-head
+contrastive_loss_weight=0.0
+context_velocity_sep_weight=0.0
+batch_size=4
+grad_accum=8               # Effective batch=32
+```
+
+**Trajectory (20 epochs, ~16 min/epoch):**
+
+| Epoch | Loss | Notes |
+|-------|------|-------|
+| 1 | 3.02 | Start (was 4.17 in v4 — better init từ paper fixes) |
+| 5 | 1.64 | Fast initial drop (paper-aligned LR working) |
+| 9 | **1.5072** | `best.pt` saved |
+| 15 | 1.49 | Stable progress |
+| 20 | **1.4155** | Phase A end ✅ |
+
+**Diagnostic at ep20:**
+- Time cos@t0vs1 = **-0.008** ✅ (excellent time conditioning, target <0.3)
+- Context cos = 0.9994 (dormant, **EXPECTED** — boundary loss không cần context)
+- ‖u‖(t) profile: high at edges (t=0, t=1), low at middle — **flow matching pattern correct**
+- VRAM: 10.3GB / 24GB (safe margin 13.7GB)
+
+**Verdict:** Phase A SUCCESS. Time conditioning learned, velocity shape correct, context dormant là EXPECTED behavior (sẽ activate ở Phase C).
+
+### 11.6. Phase B — Enable JVP + v-head (22/05 21:38 - 23/05 01:54, ~4h)
+
+**Config thêm:**
+```bash
+ratio_r_neq_t=0.5          # 50% JVP samples (paper Table 4)
+use_auxiliary_v_head=True  # v-head depth=8 (iMF Appendix A)
+# Resume from imf_v7/epoch_20.pt
+```
+
+**First attempt với batch=4 → OOM crash:**
+```
+torch.OutOfMemoryError: CUDA out of memory.
+Tried to allocate 34.00 MiB. GPU 0 has a total capacity of 23.54 GiB
+of which 48.06 MiB is free.
+```
+
+→ JVP yêu cầu 2× forward passes (1 main + 1 dudt). Phase A đã dùng 10.3GB; JVP doubles ≈ 20.6GB; + v-head (16.8M activation) → 24GB OOM.
+
+**Successful với batch=2, grad_accum=16:**
+- VRAM stable 19.3GB / 24GB (safe margin 4.7GB)
+- Speed 4.0 batch/s (~40 min/epoch, 2.5x slower than Phase A)
+
+**Trajectory (6 epochs, ep21-26):**
+
+| Epoch | Total Loss | Boundary | LR | Notes |
+|-------|-----------|----------|-----|-------|
+| 22 | 3.36 | 1.74 | 2.62e-5 | First JVP epoch (v-head random init) |
+| 23 | 2.94 | 1.74 | 3.88e-5 | v-head warm-up |
+| 24 | 2.93 | 1.74 | 5.15e-5 | Stable |
+| 25 | 2.96 | 1.78 | 6.41e-5 | LR ramping |
+| 26 | 2.92 | 1.74 | 7.67e-5 | Plateau |
+
+**Diagnostic at ep26:**
+- Time cos@t0vs1 = 0.022 ✅
+- Context cos = **0.9998** ❌ (WORSE than Phase A 0.9994!)
+- ArcFace shuffle cos = 0.9999 ❌
+
+**Verdict:** **JVP alone INSUFFICIENT để force context dependency.** Model tìm local minimum: predict context-agnostic velocity that satisfies JVP via constant tangent vector. Đây không phải bug mà là **local optimum bypass** — JVP loss có thể minimize được mà không cần context.
+
+### 11.7. Deep Investigation — Why Mamba Absorbs Context (23/05 01:30)
+
+Khai mở model qua từng layer để tìm root cause:
+
+**Test 1 — Gradient flow:**
+```
+‖∂out/∂ctx‖ = 1689.9   ← context CÓ trong computation graph
+‖∂out/∂t‖   = 46.7     ← time gradient comparable
+```
+→ Context IS in gradient path. Vấn đề KHÔNG phải gradient flow.
+
+**Test 5 — Context flow phân rã từng tầng (random ctx_a vs ctx_b):**
+```
+context_cond_mlp(ctx_a, ctx_b):    cos = 0.118  ← MLP discriminate TỐT (98% khác)
+per_layer_ctx_proj output:          cos = 0.21   ← still discriminative
+adaLN(scale+shift):                  cos = 0.24-0.45 ← starting to blend
+mamba_out activation (layer 11):     cos = 0.999  ← gần IDENTICAL!
+```
+
+→ Mamba SSM **"nuốt" context signal** ở giai đoạn cuối layer. Context vẫn discriminative ở adaLN output, nhưng hidden state ra giống nhau.
+
+**Test 4 — adaLN_ctx output magnitudes:**
+```
+||scale||  = 1.75   →  mean(scale) ≈ 0.08
+||shift||  = 0.17   →  mean(shift) ≈ 0.008
+max|scale| = 0.22   →  modulation max ±22% per element
+
+mamba_out activation:
+||out||    = 700    →  mean(activation) ≈ 0.32 per element
+```
+
+**Effective modulation:**
+```
+out_new = activation × (1 + 0.08) + 0.008
+        ≈ 0.32 × 1.08 + 0.008
+        ≈ 0.353
+
+vs context-free: 0.32
+→ Khác chỉ ~10% per element, GET ABSORBED bởi nonlinearity (SiLU + Mamba dynamics)
+```
+
+**Tệ hơn:** ‖scale‖ = 1.75 đang **THẤP HƠN init value** (~2.26 nếu init N(0, 0.1)). Model đã **ACTIVELY DECREASE** context modulation magnitude vì:
+1. Boundary loss (50% samples) không cần context → pull weights toward identity transformation
+2. JVP loss (50% samples) cũng satisfy được mà không cần context → constant tangent OK
+3. → Local min: ignore context, predict average velocity
+
+### 11.8. Phase C — Add Contrastive Loss (BREAKTHROUGH) (23/05 01:54+)
+
+**Hypothesis:** Context_cond_mlp đã discriminate (cos=0.118) — vấn đề là Mamba nuốt. Cần **direct loss force pooled hidden state phải predict context**.
+
+→ Enable contrastive InfoNCE:
+
+**Config thêm vào Phase B:**
+```bash
+contrastive_loss_weight=0.2      # Force context discrimination
+contrastive_mode="arcface"        # ctx_classifier output 512-d (predicts arc identity)
+contrastive_temperature=0.1
+# Resume from latest_step.pt (ep26)
+```
+
+**Trajectory (11 epochs, ep27-38):**
+
+| Epoch | Total Loss | Boundary | LR | Notes |
+|-------|-----------|----------|-----|-------|
+| 27 | 3.01 | 1.74 | 1.36e-5 | Restart, ctx_classifier random init |
+| 28 | 2.95 | 1.74 | 2.62e-5 | LR warmup |
+| 30 | 2.92 | 1.74 | 5.15e-5 | |
+| 34 | 2.93 | 1.76 | 1.00e-4 | LR fully ramped |
+| 38 | 2.92 | 1.76 | 1.00e-4 | Loss plateau (nhưng context activated!) |
+
+**🎉 Diagnostic at ep38 (random input):**
+
+| Metric | Ep20 (Phase A) | Ep26 (Phase B no contrast) | **Ep38 (Phase B+C)** |
+|--------|----------------|------------------------------|----------------------|
+| Hidden state cos | ~0.999 | ~0.994 | **0.772** ⬇️ |
+| Velocity output cos | ~0.999 | ~0.999 | **0.804** ⬇️ |
+| Δ from Phase A baseline | — | -0.005 | **-0.195** 🚀 |
+
+**Layer-by-layer discrimination buildup:**
+```
+Layer  0:  cos = 0.990  (start to differentiate)
+Layer  5:  cos = 0.888  ✓ significantly discriminated
+Layer 11:  cos = 0.822  ✓ strong discrimination
+Output:    cos = 0.804  ✓ velocity differentiates!
+```
+
+**Verdict:** Contrastive WORKS! Context discriminative information **builds up qua từng layer**. Mamba KHÔNG còn nuốt signal nữa — hidden state encodes identity through layers.
+
+**Note quan trọng:** test_imf_identity_t0.py với **real slat data** vẫn cho cos=0.997 — vì slat input dominates velocity prediction. Context perturbation thật nhưng proportionally nhỏ so với slat structure. Cần test sampling/decode để verify identity preservation thực sự.
+
+### 11.9. Memory Budget Summary (RTX 4090, 24GB)
+
+| Mode | Batch | VRAM | Notes |
+|------|-------|------|-------|
+| Phase A (boundary only) | 4 | **10.3GB** | Safe margin 13GB |
+| Phase B (+ JVP + v-head) | 4 | **24GB OOM** | First attempt crashed |
+| Phase B (+ JVP + v-head) | 2 | **19.3GB** | Safe margin 4.7GB |
+| Phase B+C (+ contrastive) | 2 | **19.5GB** | Safe margin 4.5GB |
+| Phase B + ctx_sep loss | 2 | est. **23+ GB** | **DO NOT enable — OOM risk** |
+
+### 11.10. Training Phases Protocol (Recommended)
+
+| Phase | Epochs | Active Losses | Batch | Time/epoch | Decision Gate |
+|-------|--------|---------------|-------|------------|---------------|
+| **A** | 0-20 | boundary | 4 | 16 min | Loss < 1.5? → Phase B |
+| **B** | 20-26 | + JVP + v-head | 2 | 40 min | Context activated? No → Phase C |
+| **C** | 26-? | + contrastive 0.2 | 2 | 43 min | Hidden cos < 0.7? → Phase D |
+| **D?** | future | Sampling tests | 1-4 | TBD | Mesh quality OK? |
+
+### 11.11. Files Modified Revision 18
+
+| File | Change | Reason |
+|------|--------|--------|
+| [src/config.py](src/config.py) | `lr=1e-4`, `lr_scheduler="constant"`, `t_sampler="logit_normal"`, `lr_warmup_steps=5000`, `context_segment_weights=(1.5, 1.0, 0.5)`, `use_auxiliary_v_head=True` (Phase B) | Paper-aligned + Phase A/B/C config |
+| [src/models/voxel_mamba.py](src/models/voxel_mamba.py) | `output_proj` init: `normal_(std=sqrt(0.1/fan_in))` thay xavier(0.02) | iMF Appendix A — fix 16x too small init |
+| [scripts/train_imf_v7.sh](scripts/train_imf_v7.sh) | **NEW** — Phase A boundary-only training | Clean baseline |
+| [scripts/train_imf_v7_phaseB.sh](scripts/train_imf_v7_phaseB.sh) | **NEW** — Phase B+C training (JVP + v-head + contrastive) | Resume Phase A → activate context |
+| [CLAUDE.md](CLAUDE.md) | Architecture v4 → v7 + Phase A/B/C protocol section | Project context for future sessions |
+| [docs/STAGE2_GUIDE.md](docs/STAGE2_GUIDE.md) | **NEW** — Compact Stage 2 training guide | Quick reference |
+| [docs/AUDIT_FINDINGS.md](docs/AUDIT_FINDINGS.md) | **NEW** — 8 findings từ session | Knowledge persistence |
+
+### 11.12. Trạng thái Pipeline (23/05/2026, 10:30)
+
+| Component | Trạng thái | Chi tiết |
+|-----------|-----------|----------|
+| Stage 1 SC-VAE | ✅ Done | `checkpoints/sc_vae_shape/epoch_500.pt` (8.3GB) |
+| Stage 2 v7 Phase A | ✅ Done ep20 | `checkpoints/imf_v7/epoch_20.pt` (loss=1.4155) |
+| Stage 2 v7 Phase B+C | 🟢 **Running ep38** | PID 1364952, loss=2.92, VRAM 19.5GB |
+| Stage 3 Decode | ⏳ Pending | Sau Phase C ổn định |
+
+### 11.13. Decision Gates (Phase C → D)
+
+Sau ep50 (~10h từ ep38), test cos_sim diagnostic:
+
+| Hidden state cos @ ep50 | Action |
+|--------------------------|--------|
+| **< 0.5** | ✅ Context strongly active → setup Stage 3 decode + sampling test |
+| **0.5 - 0.7** | ⚠️ Train tiếp đến ep80, monitor |
+| **0.7 - 0.85** | 🟡 Increase `contrastive_loss_weight` 0.2 → 0.5 |
+| **> 0.85** | 🔴 Architectural problem — post-hoc boost `adaLN_ctx.weight × 3` hoặc enable `ctx_sep` với batch=1 |
+
+---
+
+*(Cập nhật: 23/05/2026 — Revision 18: v7 architecture (24 prefix + per-layer ctx) + Phase A/B/C training protocol + paper-aligned hyperparams + BREAKTHROUGH "Mamba absorbs context, fix với contrastive InfoNCE". ETA Phase C end: ~10h.)*
+
+---
+
 ## Tài liệu Tham khảo
 
 1. Geng, Z., Lu, Y., Wu, Z., Shechtman, E., Kolter, J. Z., & He, K. (2025). *Improved Mean Flows: On the Challenges of Fastforward Generative Models*. arXiv:2512.02012v1.

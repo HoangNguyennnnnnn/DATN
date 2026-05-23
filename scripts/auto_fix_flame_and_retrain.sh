@@ -70,7 +70,7 @@ echo ""
 echo "[3/5] Recomputing hybrid_context.lmdb (~25-30 min, 20K samples)..."
 echo "       Output: data/hybrid_context.lmdb"
 START_T=$(date +%s)
-python scripts/build_context_lmdb.py \
+python scripts/data/build_context_lmdb.py \
     --out-lmdb data/hybrid_context.lmdb \
     --dirs /mnt/16TData/Datasets/FaceVerse_3D/FaceVerse /mnt/16TData/Datasets/FaceScape \
     --device cuda:0
@@ -116,7 +116,7 @@ if [ ! -d "${OLD_SLAT_LMDB}" ]; then
     echo "  ✗ Backup slat LMDB not found at ${OLD_SLAT_LMDB}. Aborting."
     exit 1
 fi
-python scripts/remix_slat_lmdb_with_new_context.py \
+python scripts/data/remix_slat_lmdb_with_new_context.py \
     --old-slat-lmdb "${OLD_SLAT_LMDB}" \
     --new-context-lmdb data/hybrid_context.lmdb \
     --out-lmdb data/slat_context.lmdb

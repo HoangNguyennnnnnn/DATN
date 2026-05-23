@@ -14,10 +14,10 @@ import sys
 import torch
 import numpy as np
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
 
 # Reuse functions from test script
-from scripts.test_sc_vae_recon_v2 import (
+from scripts.test.test_sc_vae_recon_v2 import (
     extract_ovoxel_mesh,
     export_colored_ply,
     export_colored_mesh_ply,

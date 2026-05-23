@@ -23,7 +23,7 @@ import lmdb
 import torch
 from tqdm import tqdm
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
 from src.data.flame_adapter import balance_hybrid_context_segments
 
 

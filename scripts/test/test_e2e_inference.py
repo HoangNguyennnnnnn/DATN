@@ -19,7 +19,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
 
 from src.config import TrainConfig
 from src.models.imf_diffusion import ImprovedMeanFlow
@@ -99,7 +99,7 @@ def slat_to_mesh(
     )
 
     # Extract mesh via DC (sử dụng helper từ test_sc_vae_recon_v2)
-    from scripts.test_sc_vae_recon_v2 import extract_ovoxel_mesh
+    from scripts.test.test_sc_vae_recon_v2 import extract_ovoxel_mesh
 
     coords_dec = out_indices[:, 1:].int()  # drop batch column, must be int32 for o_voxel DC
     aabb = [[-1.0, -1.0, -1.0], [1.0, 1.0, 1.0]]

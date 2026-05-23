@@ -24,13 +24,13 @@ import time
 import numpy as np
 import torch
 
-sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..")))
 
 from src.config import TrainConfig
 from src.data.image_preprocessor import ImagePreprocessor
 from src.models.sc_vae import SC_VAE
 from src.models.voxel_mamba import VoxelMamba
-from scripts.test_e2e_inference import sample_n_step, slat_to_mesh, save_ply
+from scripts.test.test_e2e_inference import sample_n_step, slat_to_mesh, save_ply
 
 
 def _load_imf(ckpt_path: str, device: torch.device):

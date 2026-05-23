@@ -7,7 +7,7 @@ FaceDiff generates high-quality 3D face meshes (200K+ vertices, 10-channel O-Vox
 ## Architecture (3 Stages)
 
 1. **SC-VAE** (35M params) — Sparse Convolution VAE. Compresses O-Voxel (256^3 grid, 10ch) to Slat tokens [4096, 32]. Uses spconv for sparse 3D convolutions.
-2. **VoxelMamba + iMF** (~94M backbone + ~17M v-head + optional contrastive) — 12× BiMamba+FFN blocks, dual AdaLN conditioning (context + time), Hilbert ordering. Generates Slat via Improved Mean Flow (1-step). **No prefix tokens** (conditioning via AdaLN broadcast to all 4096 positions).
+2. **VoxelMamba + iMF v7** (105.4M backbone + 16.8M v-head + 0.5M contrastive = 122.7M total) — 12× BiMamba+FFN blocks, dual AdaLN conditioning (context + time), Hilbert ordering, **24 prefix tokens at END of sequence**, **per-layer context projections**. Generates Slat via Improved Mean Flow (1-step).
 3. **Decode** — SC-VAE decoder + Dual Contouring → polygon mesh with vertex colors.
 
 ## Key Data Formats
@@ -43,17 +43,32 @@ src/
     render.py            # Point cloud splatting for stage2 render loss
     metrics.py           # TRELLIS.2-aligned metrics
 scripts/
-  precompute_slat_cache.py    # Precompute slat+context .pt files
-  pack_slat_lmdb.py           # Convert .pt → merged LMDB
-  pack_lmdb_fast.py           # Pack O-Voxel cache → LMDB
-  build_context_lmdb.py       # Build hybrid context LMDB
   train_imf.sh                # Launch Stage 2 (nohup + LMDB auto-detect)
-  test_pure_t1.py             # Memorization gate test (1 sample, t≈1)
-  test_imf_identity_t0.py     # Multi-ID identity diagnostic at t=0
-  test_imf_memorization.py    # Memorization / conditioning diagnostics
+  train_imf_v7.sh             # Stage 2 v7 Phase A (boundary-only)
+  train_imf_v7_phaseB.sh      # Stage 2 v7 Phase B+C (JVP + v-head + contrastive)
+  train_imf_balanced.sh       # Stage 2 with balanced context LMDB
+  auto_fix_flame_and_retrain.sh  # FLAME refresh + retrain automation
+  eval_checkpoints.sh         # Checkpoint evaluation harness
   eval_scvae_checkpoints.py   # Evaluate SC-VAE checkpoints
-  test_sc_vae_recon_v2.py     # Reconstruction testing + mesh extraction
-  generate_ovoxel_cache.py    # Generate O-Voxel cache
+  data/                       # Data pipeline (precompute, pack, build LMDBs)
+    precompute_slat_cache.py    # Precompute slat+context .pt files
+    pack_slat_lmdb.py           # Convert .pt → merged LMDB
+    pack_lmdb_fast.py           # Pack O-Voxel cache → LMDB
+    build_context_lmdb.py       # Build hybrid context LMDB
+    generate_ovoxel_cache.py    # Generate O-Voxel cache
+    compute_slat_stats.py       # Slat normalization stats
+    + 5 more (manifest, split, rebalance, remix, audit)
+  test/                       # Diagnostic + memorization tests
+    test_imf_identity_t0.py     # Multi-ID identity diagnostic at t=0
+    test_imf_memorization.py    # Memorization / conditioning diagnostics
+    test_sc_vae_recon_v2.py     # Reconstruction testing + mesh extraction
+    test_pure_t1.py             # Memorization gate test (1 sample, t≈1)
+    + 7 more (e2e_inference, sample, training_t, etc.)
+  inference/                  # Image → mesh inference pipeline
+    inference_from_image.py
+    preprocess_image.py
+  viz/                        # Visualization helpers
+  setup/                      # Install scripts (mamba, o_voxel)
 third_party/
   TRELLIS.2/                  # Reference implementation (o-voxel library, configs)
 data/                         # (gitignored) LMDB caches, slat caches
@@ -75,12 +90,12 @@ Activate: `source miniconda3/etc/profile.d/conda.sh && conda activate facediff`
 python src/train_sc_vae.py --resume checkpoints/sc_vae_shape/epoch_500.pt --epochs 700
 
 # Precompute slat cache (offline iMF data)
-python scripts/precompute_slat_cache.py \
+python scripts/data/precompute_slat_cache.py \
   --sc-vae-ckpt checkpoints/sc_vae_shape/epoch_500.pt \
   --dataset both --context-lmdb data/hybrid_context.lmdb --skip-existing
 
 # Pack slat cache → LMDB
-python scripts/pack_slat_lmdb.py
+python scripts/data/pack_slat_lmdb.py
 
 # iMF training (recommended: script + LMDB)
 bash scripts/train_imf.sh
@@ -93,12 +108,12 @@ python src/train_imf.py --offline-data \
   --disable-cfg-conditioning --disable-id-filters
 
 # Evaluate SC-VAE reconstruction
-python scripts/test_sc_vae_recon_v2.py --checkpoint checkpoints/sc_vae_shape/epoch_500.pt
+python scripts/test/test_sc_vae_recon_v2.py --checkpoint checkpoints/sc_vae_shape/epoch_500.pt
 ```
 
-## Stage 2 Architecture (VoxelMamba v4, May 2026)
+## Stage 2 Architecture (VoxelMamba v7, May 2026)
 
-**Sequence:** `[4096 slat tokens]` only (Hilbert-ordered). **No** 24 prefix tokens (`mamba_num_*_tokens=0`).
+**Sequence:** `[4096 slat tokens (Hilbert-ordered) + 24 prefix tokens at END]` = 4120 tokens. Prefix tokens: `ctx=8, time=4, r=4, interval=4, guidance=4`.
 
 **Per `BidirectionalMambaBlock` (×12):**
 1. **Time AdaLN** → modulate pre-Mamba: `x' = norm(x)·(1+scale_t)+shift_t`
@@ -107,15 +122,50 @@ python scripts/test_sc_vae_recon_v2.py --checkpoint checkpoints/sc_vae_shape/epo
 4. **Gated residual:** `x = x + gate_t·out'` (`gate` bias init **1.0**, not 0)
 5. **FFN** (expand×4, GELU) + **Time AdaLN** + gated residual
 
-**Conditioning paths (separate, not concat-fusion):**
-- `ctx_cond = context_cond_mlp(context)` → AdaLN_ctx (scale+shift)
+**Conditioning paths:**
+- `ctx_cond = context_cond_mlp(context)` → **per-layer projection** `ctx_layer_projs[i]` (12× Linear(512→512)) → AdaLN_ctx (scale+shift)
 - `time_cond = time_guidance_mlp(t, r, t−r, ω, tmin, tmax)` → AdaLN_time + AdaLN_ffn
 
-**Init fixes (2026-05-21):** `output_proj` uses **Xavier gain=0.02** (NOT zero — zero starved backbone gradients). FFN last layer zero-init for safe residual.
+**Context segment scaling (`_scale_context_segments`):** weights `(1.5, 1.0, 0.5)` for `(ArcFace, FLAME, DINOv2)` — moderate identity bias for **balanced LMDB** (already L2-normalized per segment).
 
-**Training loss stack:** iMF velocity (boundary + JVP, 50/50) + v-head (weight 0.5, depth 8) + contrastive InfoNCE (weight 0.3, batch≥2). CFG **off** by default (`--disable-cfg-conditioning`). Slat **per-channel normalize** via `data/slat_stats.pt`.
+**Init fixes (2026-05-22 v7):**
+- `output_proj` uses **`normal_(std=sqrt(0.1/fan_in))` ≈ 0.014** per iMF Appendix A (was xavier(0.02) ≈ 0.0009 — 16x too small, starved backbone gradients)
+- `adaLN_ctx` scale init **N(0, 0.1)** (was 0.02 — 5x stronger context modulation)
+- FFN last layer zero-init for safe residual
 
-**Checkpoint compatibility:** Old runs with `adaLN_modulation` / `cond_fusion` / 24-prefix are **incompatible** — train scratch or use matching `stage2_model_config` in checkpoint.
+**Checkpoint compatibility:** v4 checkpoints (no prefix, no per-layer ctx) are **incompatible** — train v7 from scratch.
+
+## Stage 2 Training Protocol (Phase A/B/C — 2026-05-22/23 audit)
+
+Train in 3 sequential phases:
+
+**Phase A — Pure Boundary (ep0-20):**
+- Config: `ratio_r_neq_t=0`, `use_auxiliary_v_head=False`, `contrastive_loss_weight=0`
+- batch=4, grad_accum=8 (effective 32), ~16min/epoch, **VRAM 10.3GB**
+- Goal: Learn time conditioning + velocity field shape
+- Expected: loss → ~1.4 by ep20, time cos@t0vs1 < 0.1, context dormant (BY DESIGN)
+- Script: `scripts/train_imf_v7.sh`
+
+**Phase B — JVP + v-head (ep20-26):**
+- Config: `ratio_r_neq_t=0.5`, `use_auxiliary_v_head=True` (depth=8, weight 0.5)
+- batch=2, grad_accum=16 (effective 32), ~40min/epoch, **VRAM 19.3GB**
+- Goal: Enable JVP correction for mean velocity
+- **Warning:** batch=4 will OOM (Phase A 10GB + JVP doubles → 24GB)
+
+**Phase C — + Contrastive (ep26+):**
+- Add: `contrastive_loss_weight=0.2`, `contrastive_mode="arcface"`, temp=0.1
+- batch=2, ~43min/epoch, **VRAM 19.5GB**
+- Goal: Force context dependency (Mamba absorbs context without this!)
+- Script: `scripts/train_imf_v7_phaseB.sh` (resume from Phase A checkpoint)
+
+## Critical Findings (2026-05-22/23 audit)
+
+- **iMF paper-aligned hyperparams (REQUIRED):** `lr=1e-4 constant` (NOT cosine), `lr_warmup_steps=5000`, `t_sampler="logit_normal"` (mean=-0.4, scale=1.0), `ratio_r_neq_t=0.5` for Phase B
+- **Mamba absorbs context modulation:** AdaLN ±10-22% per element < Mamba SSM dynamics (mean activation 0.32). Without contrastive loss, hidden state cos(ctx_a, ctx_b) stays ~0.999. **Contrastive InfoNCE (weight 0.2) is REQUIRED to activate context.**
+- **`context_velocity_sep_loss` DISABLED:** 2 extra forward passes through 122M model → OOM risk. Use contrastive instead.
+- **VRAM budget (RTX 4090 24GB):** Phase A 10GB batch=4, Phase B/C 19.5GB batch=2. With ctx_sep: 23+GB risk OOM.
+- **`output_proj` init was 16x too small** (xavier σ≈0.0009). Fixed to `normal_(std=0.014)` per iMF Appendix A.
+- Full details: see `Bao_cao_FaceDiff_ChiTiet.md` Section 11 (Revision 18) + `docs/AUDIT_FINDINGS.md`.
 
 ## Important Implementation Details
 

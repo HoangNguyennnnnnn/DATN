@@ -267,7 +267,7 @@ class IMFConfig:
     
     # iMF v5.0: v-loss cùng với khối phụ trợ v-head (Chỉ số cải thiện lợi nhuận ROI cao)
     use_v_loss: bool = True              # Dùng v-loss thay vì u-loss (huấn luyện ổn định hơn)
-    use_auxiliary_v_head: bool = False   # 2026-05-22 DIAGNOSTIC: disable v-head (16.8M params + 0.5 weight phân tán gradient). Test clean main loss.
+    use_auxiliary_v_head: bool = True    # 2026-05-22 Phase B: enable v-head for JVP tangent estimation (Paper Table 4: depth=8)
     v_head_dim: int = 512               # Chiều ẩn cho khối phụ trợ v-head
     v_head_depth: int = 8                # Paper Table 4: aux-head depth = 8 (cũ: 2-layer MLP)
     v_head_mlp_ratio: int = 4            # MLP expansion ratio trong v-head block
