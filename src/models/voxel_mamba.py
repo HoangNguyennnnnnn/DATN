@@ -135,10 +135,25 @@ class FeedForward(nn.Module):
         return self.net(x)
 
 
-# NOTE: ContextCrossAttention removed in v4 (was 31.5M params = overkill).
-# Context is a single global vector, not a sequence → AdaLN scale+shift
-# is the standard approach (DiT uses this for class labels).
-# Savings: 31.5M → 7.2M params for context conditioning.
+class ContextCrossAttention(nn.Module):
+    """Cross-attn: slat tokens (Q) attend ArcFace context tokens (K/V). ~1M params/layer."""
+
+    def __init__(self, dim: int, num_heads: int = 8, dropout: float = 0.0):
+        super().__init__()
+        self.norm_q = RMSNorm(dim)
+        self.norm_kv = RMSNorm(dim)
+        self.attn = nn.MultiheadAttention(
+            dim, num_heads, dropout=dropout, batch_first=True,
+        )
+        self.proj = nn.Linear(dim, dim)
+        nn.init.zeros_(self.proj.weight)
+        nn.init.zeros_(self.proj.bias)
+
+    def forward(self, x: torch.Tensor, ctx_tokens: torch.Tensor) -> torch.Tensor:
+        q = self.norm_q(x)
+        kv = self.norm_kv(ctx_tokens)
+        out, _ = self.attn(q, kv, kv, need_weights=False)
+        return x + self.proj(out)
 
 
 class BidirectionalMambaBlock(nn.Module):
@@ -162,10 +177,25 @@ class BidirectionalMambaBlock(nn.Module):
         x_ffn = norm_ffn(x) * (1 + scale_f) + shift_f # Time AdaLN
         x = x + gate_ffn * ffn(x_ffn)                 # Gated residual
     """
-    def __init__(self, dim, time_dim, ctx_dim, d_state=16, d_conv=4, expand=2,
-                 ffn_expand=4, dropout=0.0, use_mamba=True, use_ffn=True, backend: str = "auto"):
+    def __init__(
+        self,
+        dim,
+        time_dim,
+        ctx_dim,
+        d_state=16,
+        d_conv=4,
+        expand=2,
+        ffn_expand=4,
+        dropout=0.0,
+        use_mamba=True,
+        use_ffn=True,
+        backend: str = "auto",
+        context_cond_mode: str = "cross_attn",
+        cross_attn_heads: int = 8,
+    ):
         super().__init__()
         self.dim = dim
+        self.context_cond_mode = str(context_cond_mode).strip().lower()
         self.backend = _resolve_requested_backend(backend)
         self.use_mamba = use_mamba
         self.use_ffn = use_ffn
@@ -203,18 +233,21 @@ class BidirectionalMambaBlock(nn.Module):
         nn.init.zeros_(last_linear.bias[dim : 2 * dim])   # shift bias
         nn.init.constant_(last_linear.bias[2 * dim :], 1.0)  # gate bias = 1.0
 
-        # Context AdaLN (POST-Mamba): scale+shift from context vector
-        # Much lighter than cross-attention (600K vs 2.6M per layer)
-        # Context is global vector → AdaLN is the standard approach (DiT class labels)
-        self.adaLN_ctx = nn.Sequential(
-            nn.SiLU(),
-            nn.Linear(ctx_dim, 2 * dim, bias=True),  # scale + shift only
-        )
-        # Init: scale đủ lớn để context không bị time gate áp đảo (v7: 0.02 → 0.1)
-        ctx_linear = self.adaLN_ctx[-1]
-        nn.init.normal_(ctx_linear.weight[:dim], mean=0.0, std=0.1)
-        nn.init.zeros_(ctx_linear.weight[dim:])
-        nn.init.zeros_(ctx_linear.bias)
+        if self.context_cond_mode == "cross_attn":
+            self.cross_attn = ContextCrossAttention(
+                dim, num_heads=cross_attn_heads, dropout=dropout,
+            )
+            self.adaLN_ctx = None
+        else:
+            self.cross_attn = None
+            self.adaLN_ctx = nn.Sequential(
+                nn.SiLU(),
+                nn.Linear(ctx_dim, 2 * dim, bias=True),
+            )
+            ctx_linear = self.adaLN_ctx[-1]
+            nn.init.normal_(ctx_linear.weight[:dim], mean=0.0, std=0.1)
+            nn.init.zeros_(ctx_linear.weight[dim:])
+            nn.init.zeros_(ctx_linear.bias)
 
         # ============================================================
         # SUB-BLOCK 2: FFN (Per-token nonlinear transform)
@@ -239,11 +272,18 @@ class BidirectionalMambaBlock(nn.Module):
         nn.init.zeros_(last_ffn.bias[dim : 2 * dim])
         nn.init.constant_(last_ffn.bias[2 * dim :], 1.0)
 
-    def forward(self, x: torch.Tensor, time_cond: torch.Tensor, ctx_cond: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        x: torch.Tensor,
+        time_cond: torch.Tensor,
+        ctx_cond: Optional[torch.Tensor] = None,
+        ctx_tokens: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
         """
         x: [B, L, dim] hidden states
         time_cond: [B, time_dim] time conditioning (t, r, interval, guidance)
-        ctx_cond: [B, ctx_dim] context conditioning (identity/expression)
+        ctx_cond: [B, ctx_dim] — AdaLN path only
+        ctx_tokens: [B, K, dim] — cross-attn path only
         """
         # ── Sub-block 1: Mamba + Context Cross-Attention ──
         scale_t, shift_t, gate_t = self.adaLN_time(time_cond).chunk(3, dim=-1)
@@ -266,11 +306,17 @@ class BidirectionalMambaBlock(nn.Module):
 
         out = self.dropout(out)
 
-        # Context AdaLN: modulate Mamba output with identity/expression
-        scale_c, shift_c = self.adaLN_ctx(ctx_cond).chunk(2, dim=-1)
-        scale_c = scale_c.unsqueeze(1)  # [B, 1, dim]
-        shift_c = shift_c.unsqueeze(1)
-        out = out * (1 + scale_c) + shift_c
+        if self.cross_attn is not None:
+            if ctx_tokens is None:
+                raise ValueError("cross_attn block requires ctx_tokens [B, K, dim]")
+            out = self.cross_attn(out, ctx_tokens)
+        else:
+            if ctx_cond is None:
+                raise ValueError("adaln block requires ctx_cond [B, ctx_dim]")
+            scale_c, shift_c = self.adaLN_ctx(ctx_cond).chunk(2, dim=-1)
+            scale_c = scale_c.unsqueeze(1)
+            shift_c = shift_c.unsqueeze(1)
+            out = out * (1 + scale_c) + shift_c
 
         x = residual + gate_t * out
 
@@ -287,17 +333,55 @@ class BidirectionalMambaBlock(nn.Module):
         return x
 
 
+def voxel_mamba_from_stage2_config(mcfg: dict, **overrides) -> "VoxelMamba":
+    """Build VoxelMamba from checkpoint ``stage2_model_config`` (+ optional overrides)."""
+    ctx_mode = mcfg.get("context_cond_mode", "adaln")
+    arc_only = bool(mcfg.get("context_use_arcface_only", ctx_mode == "cross_attn"))
+    seg_w = mcfg.get("context_segment_weights")
+    if seg_w is not None and len(seg_w) == 3:
+        seg_w = tuple(float(x) for x in seg_w)
+    elif arc_only:
+        seg_w = None
+    defaults = dict(
+        input_dim=mcfg["input_dim"],
+        hidden_dim=mcfg["hidden_dim"],
+        num_layers=mcfg["num_layers"],
+        slat_length=mcfg["slat_length"],
+        context_dim=mcfg["context_dim"],
+        backend=mcfg.get("backend", "auto"),
+        strict=False,
+        num_context_tokens=mcfg.get("num_context_tokens", 0 if ctx_mode == "cross_attn" else 8),
+        num_time_tokens=mcfg.get("num_time_tokens", 4),
+        num_r_tokens=mcfg.get("num_r_tokens", 4),
+        num_interval_tokens=mcfg.get("num_interval_tokens", 4),
+        num_guidance_tokens=mcfg.get("num_guidance_tokens", 4),
+        use_per_layer_context=bool(mcfg.get("use_per_layer_context", False)),
+        d_state=mcfg.get("d_state", 16),
+        d_conv=mcfg.get("d_conv", 4),
+        expand=mcfg.get("expand", 2),
+        ffn_expand=int(mcfg.get("ffn_expand", 4)),
+        dropout=mcfg.get("dropout", 0.0),
+        context_segment_weights=seg_w,
+        context_cond_mode=ctx_mode,
+        context_use_arcface_only=arc_only,
+        num_context_kv_tokens=int(mcfg.get("num_context_kv_tokens", 8)),
+        context_cross_attn_heads=int(mcfg.get("context_cross_attn_heads", 8)),
+    )
+    defaults.update(overrides)
+    return VoxelMamba(**defaults)
+
+
 class VoxelMamba(nn.Module):
     """
     Mạng cơ sở Voxel Mamba (Voxel Mamba Backbone) dành cho việc sinh token Slat.
     
     Thay thế mạng IMFUNet1D với độ phức tạp O(N).
     
-    Kiến trúc (v7 — per-layer context + prefix in-context):
+    Kiến trúc (v8 — ArcFace cross-attn, mặc định):
     1. Nhúng đầu vào + Hilbert reorder
-    2. Prefix tokens (ctx/time/r/interval/guidance) ở CUỐI sequence → backward Mamba lan context
-    3. ctx_cond_mlp(ctx) → ctx_layer_projs[i] mỗi layer (U-Net-style multi-inject)
-    4. 12× BidirectionalMambaBlock: time AdaLN + context AdaLN mỗi layer
+    2. Prefix time/r/interval/guidance (không prefix context — tránh trùng cross-attn)
+    3. ArcFace [512] → K context tokens → cross-attn sau Mamba mỗi layer
+    4. Time AdaLN trước Mamba; CFG học nhánh null context
     5. output_proj → velocity [B, 4096, input_dim]
     
     iMF yêu cầu u_θ(z_t, r, t) phải được điều kiện hóa trên CẢ HAI dấu thời gian r (bắt đầu) và t (kết thúc).
@@ -331,7 +415,7 @@ class VoxelMamba(nn.Module):
         num_r_tokens: int = 4,
         num_interval_tokens: int = 4,
         num_guidance_tokens: int = 4,
-        use_per_layer_context: bool = True,
+        use_per_layer_context: bool = False,
         dropout: float = 0.1,
         d_state: int = 16,
         d_conv: int = 4,
@@ -342,10 +426,26 @@ class VoxelMamba(nn.Module):
         context_segment_weights: Optional[Tuple[float, float, float]] = None,
         context_arc_dim: int = 512,
         context_flame_dim: int = 50,
+        context_cond_mode: str = "cross_attn",
+        context_use_arcface_only: bool = True,
+        num_context_kv_tokens: int = 8,
+        context_cross_attn_heads: int = 8,
     ):
         super().__init__()
+        self.context_cond_mode = str(context_cond_mode).strip().lower()
+        self.context_use_arcface_only = bool(context_use_arcface_only)
+        self.num_context_kv_tokens = int(num_context_kv_tokens)
+        self.context_cross_attn_heads = int(context_cross_attn_heads)
         self.context_arc_dim = int(context_arc_dim)
         self.context_flame_dim = int(context_flame_dim)
+        self._effective_arc_dim = (
+            min(self.context_arc_dim, int(context_dim))
+            if self.context_use_arcface_only
+            else int(context_dim)
+        )
+        if self.context_cond_mode == "cross_attn":
+            num_context_tokens = 0
+            use_per_layer_context = False
         if context_segment_weights is not None:
             w = torch.tensor(context_segment_weights, dtype=torch.float32)
             self.register_buffer("_context_segment_weights", w, persistent=True)
@@ -447,14 +547,25 @@ class VoxelMamba(nn.Module):
             if num_guidance_tokens > 0 else None
         )
 
-        # 2026-05-21 v4: SEPARATE context and time conditioning paths.
-        # - time_cond → AdaLN (scale, shift, gate) PRE-Mamba + FFN
-        # - ctx_cond → AdaLN (scale, shift) POST-Mamba output
-        self.context_cond_mlp = nn.Sequential(
-            nn.Linear(context_dim, hidden_dim),
-            nn.SiLU(),
-            nn.Linear(hidden_dim, hidden_dim),
-        )
+        if self.context_cond_mode == "cross_attn":
+            self.context_cond_mlp = None
+            self.arcface_tokenizer = nn.Sequential(
+                nn.Linear(self._effective_arc_dim, hidden_dim * 2),
+                nn.SiLU(),
+                nn.Linear(hidden_dim * 2, hidden_dim * self.num_context_kv_tokens),
+            )
+            self.null_ctx_tokens = nn.Parameter(
+                torch.zeros(1, self.num_context_kv_tokens, hidden_dim),
+            )
+            nn.init.normal_(self.null_ctx_tokens, mean=0.0, std=0.02)
+        else:
+            self.arcface_tokenizer = None
+            self.null_ctx_tokens = None
+            self.context_cond_mlp = nn.Sequential(
+                nn.Linear(context_dim, hidden_dim),
+                nn.SiLU(),
+                nn.Linear(hidden_dim, hidden_dim),
+            )
         self._time_guidance_in_dim = 3 * self.time_embed_dim + 3
         self.time_guidance_mlp = nn.Sequential(
             nn.Linear(self._time_guidance_in_dim, hidden_dim),
@@ -491,10 +602,18 @@ class VoxelMamba(nn.Module):
                 dropout=dropout,
                 ffn_expand=ffn_expand,
                 use_mamba=self.use_mamba,
-                use_ffn=use_ffn
+                use_ffn=use_ffn,
+                context_cond_mode=self.context_cond_mode,
+                cross_attn_heads=self.context_cross_attn_heads,
             )
             for _ in range(num_layers)
         ])
+        mode_label = (
+            f"cross_attn K={self.num_context_kv_tokens} arc_only"
+            if self.context_cond_mode == "cross_attn"
+            else "adaln"
+        )
+        print(f"[VoxelMamba] context_cond_mode={mode_label}")
         
         # Chuẩn hóa (norm) và phép chiếu (projection) cuối cùng
         self.output_norm = RMSNorm(hidden_dim)
@@ -562,12 +681,39 @@ class VoxelMamba(nn.Module):
         guidance_feat = torch.stack([omega, cfg_tmin, cfg_tmax], dim=-1)
         time_feat = torch.cat([t_emb, r_emb, interval_emb, guidance_feat], dim=-1)
         time_cond = self.time_guidance_mlp(time_feat)
-        ctx_in = self._scale_context_segments(context)
+        if self.context_cond_mlp is None:
+            return None, time_cond
+        ctx_in = self._extract_context_input(context)
         ctx_cond = self.context_cond_mlp(ctx_in)
         return ctx_cond, time_cond
 
+    def _extract_context_input(self, context: torch.Tensor) -> torch.Tensor:
+        if self.context_use_arcface_only:
+            return context[..., : self._effective_arc_dim]
+        return self._scale_context_segments(context)
+
+    def _build_ctx_tokens(self, context: torch.Tensor) -> torch.Tensor:
+        arc = self._extract_context_input(context)
+        b = arc.shape[0]
+        flat = self.arcface_tokenizer(arc)
+        tokens = flat.view(b, self.num_context_kv_tokens, self.hidden_dim)
+        if self.null_ctx_tokens is not None:
+            is_null = arc.abs().sum(dim=-1) < 1e-4
+            if is_null.any():
+                null = self.null_ctx_tokens.expand(b, -1, -1).to(
+                    device=tokens.device, dtype=tokens.dtype,
+                )
+                mask = is_null.view(b, 1, 1)
+                tokens = torch.where(mask, null, tokens)
+        return tokens
+
+    def null_context_tokens(self, batch_size: int, device: torch.device) -> torch.Tensor:
+        if self.null_ctx_tokens is None:
+            raise RuntimeError("null_context_tokens only available in cross_attn mode")
+        return self.null_ctx_tokens.expand(batch_size, -1, -1).to(device)
+
     def _scale_context_segments(self, context: torch.Tensor) -> torch.Tensor:
-        """Nhân Arc/FLAME/DINO trước MLP — giảm ảnh hưởng DINO trùng hướng (audit 2026-05-22)."""
+        """Nhân Arc/FLAME/DINO trước MLP — legacy adaln path."""
         w = self._context_segment_weights
         if w is None:
             return context
@@ -620,7 +766,12 @@ class VoxelMamba(nn.Module):
             r_emb = self.r_mlp(r)
             interval_emb = self.interval_mlp(t - r)
             guidance_input = torch.stack([omega, cfg_tmin, cfg_tmax], dim=-1)
-            ctx_tokens = self._make_prefix_tokens(self.context_tokenizer, context, self.num_context_tokens, B)
+            if self.context_tokenizer is not None and self.num_context_tokens > 0:
+                ctx_tokens = self._make_prefix_tokens(
+                    self.context_tokenizer, context, self.num_context_tokens, B,
+                )
+            else:
+                ctx_tokens = h.new_zeros((B, 0, self.hidden_dim))
             time_tokens = self._make_prefix_tokens(self.time_tokenizer, t_emb, self.num_time_tokens, B)
             r_tokens = self._make_prefix_tokens(self.r_tokenizer, r_emb, self.num_r_tokens, B)
             interval_tokens = self._make_prefix_tokens(self.interval_tokenizer, interval_emb, self.num_interval_tokens, B)
@@ -630,13 +781,16 @@ class VoxelMamba(nn.Module):
             h = torch.cat([h, prefix], dim=1)
 
         ctx_cond, time_cond = self._build_cond_emb(t, r, context, omega, cfg_tmin, cfg_tmax)
+        cross_ctx = None
+        if self.context_cond_mode == "cross_attn":
+            cross_ctx = self._build_ctx_tokens(context)
 
         for i, layer in enumerate(self.layers):
-            if self.ctx_layer_projs is not None:
-                ctx_l = self.ctx_layer_projs[i](ctx_cond)
+            if cross_ctx is not None:
+                h = layer(h, time_cond, ctx_tokens=cross_ctx)
             else:
-                ctx_l = ctx_cond
-            h = layer(h, time_cond, ctx_l)
+                ctx_l = self.ctx_layer_projs[i](ctx_cond) if self.ctx_layer_projs is not None else ctx_cond
+                h = layer(h, time_cond, ctx_cond=ctx_l)
 
         if self.total_prefix_tokens > 0:
             # Strip prefix tokens FROM END (not start)

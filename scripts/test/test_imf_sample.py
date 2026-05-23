@@ -53,24 +53,9 @@ def main():
     cfg = TrainConfig()
     imf_cfg = cfg.imf
 
-    model = VoxelMamba(
-        input_dim=mcfg["input_dim"],
-        hidden_dim=mcfg["hidden_dim"],
-        num_layers=mcfg["num_layers"],
-        slat_length=mcfg["slat_length"],
-        context_dim=mcfg["context_dim"],
-        backend=mcfg.get("backend", "auto"),
-        strict=False,
-        num_context_tokens=mcfg.get("num_context_tokens", 8),
-        num_time_tokens=mcfg.get("num_time_tokens", 4),
-        num_r_tokens=mcfg.get("num_r_tokens", 4),
-        num_interval_tokens=mcfg.get("num_interval_tokens", 4),
-        num_guidance_tokens=mcfg.get("num_guidance_tokens", 4),
-        d_state=mcfg.get("d_state", 16),
-        d_conv=mcfg.get("d_conv", 4),
-        expand=mcfg.get("expand", 2),
-        dropout=0.0,
-    ).to(device)
+    from src.models.voxel_mamba import voxel_mamba_from_stage2_config
+
+    model = voxel_mamba_from_stage2_config(mcfg, backend=mcfg.get("backend", "auto"), dropout=0.0).to(device)
 
     state = ckpt["ema_state_dict"] if (args.use_ema and "ema_state_dict" in ckpt) else ckpt["model_state_dict"]
     state = {k.replace("_orig_mod.", "").replace("module.", ""): v for k, v in state.items()}

@@ -559,12 +559,13 @@ class ImprovedMeanFlow:
 
         context_cond = context
         cfg_context_keep_ratio = torch.ones((), device=device)
-        if cfg_enabled:
-            drop_prob = float(max(0.0, min(1.0, cfg_context_dropout)))
-            if drop_prob > 0.0:
-                keep_mask = (torch.rand((b, 1), device=device) >= drop_prob).to(dtype=context.dtype)
-                context_cond = context * keep_mask
-                cfg_context_keep_ratio = keep_mask.mean()
+        # Phase A: dropout ngữ cảnh (ArcFace→0 → null_ctx_tokens) KHÔNG phụ thuộc cfg_enabled.
+        # Nếu chỉ bật dropout ở Phase B, backbone không học u_uncond → CFG sụp.
+        drop_prob = float(max(0.0, min(1.0, cfg_context_dropout)))
+        if drop_prob > 0.0:
+            keep_mask = (torch.rand((b, 1), device=device) >= drop_prob).to(dtype=context.dtype)
+            context_cond = context * keep_mask
+            cfg_context_keep_ratio = keep_mask.mean()
         
         # Bước 4: Mục tiêu vận tốc có điều kiện
         # VRAM-optimal CFG: Tách thành 2 forward passes riêng biệt thay vì batch doubling.

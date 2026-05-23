@@ -225,6 +225,8 @@ class Stage2ContractTests(unittest.TestCase):
             slat_length=8,
             context_dim=3,
             backend="gru",
+            context_cond_mode="adaln",
+            context_use_arcface_only=False,
             num_context_tokens=3,
             num_time_tokens=1,
             num_r_tokens=1,

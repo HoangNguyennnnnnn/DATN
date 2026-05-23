@@ -807,11 +807,16 @@ def _build_stage2_model_config(model: nn.Module, imf_cfg, model_input_dim: int) 
         "num_r_tokens": int(getattr(model, "num_r_tokens", getattr(imf_cfg, "mamba_num_r_tokens", 4))),
         "num_interval_tokens": int(getattr(model, "num_interval_tokens", getattr(imf_cfg, "mamba_num_interval_tokens", 4))),
         "num_guidance_tokens": int(getattr(model, "num_guidance_tokens", getattr(imf_cfg, "mamba_num_guidance_tokens", 4))),
-        "use_per_layer_context": bool(getattr(model, "use_per_layer_context", getattr(imf_cfg, "mamba_use_per_layer_context", True))),
-        "conditioning": "v7_prefix_per_layer_adaln",
+        "use_per_layer_context": bool(getattr(model, "use_per_layer_context", getattr(imf_cfg, "mamba_use_per_layer_context", False))),
+        "context_cond_mode": str(getattr(model, "context_cond_mode", getattr(imf_cfg, "context_cond_mode", "cross_attn"))),
+        "context_use_arcface_only": bool(getattr(model, "context_use_arcface_only", getattr(imf_cfg, "context_use_arcface_only", True))),
+        "num_context_kv_tokens": int(getattr(model, "num_context_kv_tokens", getattr(imf_cfg, "mamba_num_context_kv_tokens", 8))),
+        "context_cross_attn_heads": int(getattr(model, "context_cross_attn_heads", getattr(imf_cfg, "mamba_context_cross_attn_heads", 8))),
+        "conditioning": str(getattr(model, "context_cond_mode", "cross_attn")),
         "d_state": int(getattr(imf_cfg, "mamba_d_state", 16)),
         "d_conv": int(getattr(imf_cfg, "mamba_d_conv", 4)),
         "expand": int(getattr(imf_cfg, "mamba_expand", 2)),
+        "ffn_expand": int(getattr(imf_cfg, "mamba_ffn_expand", 4)),
         "dropout": float(getattr(imf_cfg, "dropout", 0.0)),
         "context_segment_weights": getattr(imf_cfg, "context_segment_weights", None),
     }
@@ -1211,6 +1216,9 @@ def train_imf(
     if seg_w is not None and len(seg_w) == 3:
         seg_w = tuple(float(x) for x in seg_w)
         print(f"  [context] segment weights Arc/FLAME/DINO = {seg_w}")
+    ctx_mode = str(getattr(imf_cfg, "context_cond_mode", "cross_attn"))
+    arc_only = bool(getattr(imf_cfg, "context_use_arcface_only", True))
+    print(f"  [context] mode={ctx_mode}, arcface_only={arc_only}")
     model = VoxelMamba(
         input_dim=model_input_dim,
         hidden_dim=imf_cfg.mamba_hidden_dim,
@@ -1219,17 +1227,22 @@ def train_imf(
         context_dim=imf_cfg.context_dim,
         backend=str(getattr(imf_cfg, "voxel_mamba_backend", "auto")),
         strict=bool(getattr(imf_cfg, "voxel_mamba_strict", False)),
-        num_context_tokens=int(getattr(imf_cfg, "mamba_num_context_tokens", 8)),
+        num_context_tokens=int(getattr(imf_cfg, "mamba_num_context_tokens", 0)),
         num_time_tokens=int(getattr(imf_cfg, "mamba_num_time_tokens", 4)),
         num_r_tokens=int(getattr(imf_cfg, "mamba_num_r_tokens", 4)),
         num_interval_tokens=int(getattr(imf_cfg, "mamba_num_interval_tokens", 4)),
         num_guidance_tokens=int(getattr(imf_cfg, "mamba_num_guidance_tokens", 4)),
-        use_per_layer_context=bool(getattr(imf_cfg, "mamba_use_per_layer_context", True)),
+        use_per_layer_context=bool(getattr(imf_cfg, "mamba_use_per_layer_context", False)),
         d_state=imf_cfg.mamba_d_state,
         d_conv=imf_cfg.mamba_d_conv,
         expand=imf_cfg.mamba_expand,
+        ffn_expand=int(getattr(imf_cfg, "mamba_ffn_expand", 4)),
         dropout=imf_cfg.dropout,
-        context_segment_weights=seg_w,
+        context_segment_weights=seg_w if not arc_only else None,
+        context_cond_mode=ctx_mode,
+        context_use_arcface_only=arc_only,
+        num_context_kv_tokens=int(getattr(imf_cfg, "mamba_num_context_kv_tokens", 8)),
+        context_cross_attn_heads=int(getattr(imf_cfg, "mamba_context_cross_attn_heads", 8)),
     ).to(device)
     print(f"  Architecture: Voxel Mamba [D={imf_cfg.mamba_hidden_dim}, L={imf_cfg.mamba_num_layers}]")
     print(f"  Backend: {getattr(model, 'backend', 'unknown')}")
@@ -1674,6 +1687,8 @@ def main():
     parser.add_argument("--context-velocity-sep-margin", type=float, default=None,
                         help="Margin for context sep loss (penalize cos above this).")
     parser.add_argument("--ratio-r-neq-t", type=float, default=None, help="Fraction of batches with r≠t (JVP). 0.5 = paper default.")
+    parser.add_argument("--mamba-num-layers", type=int, default=None, help="BidirectionalMambaBlock count (lite: 8)")
+    parser.add_argument("--mamba-ffn-expand", type=int, default=None, help="FFN expansion per block (lite: 2, default: 4)")
     parser.add_argument("--num-workers", type=int, default=0, help="Dataloader workers (0 to avoid EGL crash over caches)")
     parser.add_argument("--no-wandb", action="store_true", help="Disable WandB")
     parser.add_argument("--no-ema", action="store_true", help="Disable EMA")
@@ -1766,6 +1781,10 @@ def main():
         cfg.imf.context_velocity_sep_margin = float(args.context_velocity_sep_margin)
     if args.ratio_r_neq_t is not None:
         cfg.imf.ratio_r_neq_t = float(max(0.0, min(1.0, args.ratio_r_neq_t)))
+    if getattr(args, "mamba_num_layers", None) is not None:
+        cfg.imf.mamba_num_layers = int(max(1, args.mamba_num_layers))
+    if getattr(args, "mamba_ffn_expand", None) is not None:
+        cfg.imf.mamba_ffn_expand = int(max(1, args.mamba_ffn_expand))
     if args.num_workers is not None:
         cfg.data.num_workers = args.num_workers   # Cấu hình đè cực quan trọng chống EGL multiprocessing crash!
         

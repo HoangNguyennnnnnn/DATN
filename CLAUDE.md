@@ -44,8 +44,10 @@ src/
     metrics.py           # TRELLIS.2-aligned metrics
 scripts/
   train_imf.sh                # Launch Stage 2 (nohup + LMDB auto-detect)
-  train_imf_v7.sh             # Stage 2 v7 Phase A (boundary-only)
-  train_imf_v7_phaseB.sh      # Stage 2 v7 Phase B+C (JVP + v-head + contrastive)
+  train_imf_v8_lite.sh              # Stage 2 v8 lite Phase A (8L, cross-attn, ctx dropout 0.1)
+  train_imf_v8_phaseB_cfg.sh        # Stage 2 v8 lite Phase B CFG (400 ep)
+  train_imf_v8_lite_pipeline.sh     # Auto A→B pipeline
+  train_imf_v7_phaseB.sh            # v7 legacy Phase B+C
   train_imf_balanced.sh       # Stage 2 with balanced context LMDB
   auto_fix_flame_and_retrain.sh  # FLAME refresh + retrain automation
   eval_checkpoints.sh         # Checkpoint evaluation harness
@@ -137,7 +139,9 @@ python scripts/test/test_sc_vae_recon_v2.py --checkpoint checkpoints/sc_vae_shap
 
 ## Stage 2 Training Protocol (Phase A/B/C — 2026-05-22/23 audit)
 
-Train in 3 sequential phases:
+**v8 lite (current — 23/05/2026):** `bash scripts/train_imf_v8_lite_pipeline.sh` — 8L×FFN2, ArcFace cross-attn, JVP 0.5, `cfg_context_dropout=0.1` Phase A, auto Phase B 400ep. See `docs/STAGE2_GUIDE.md` + `docs/AUDIT_FINDINGS.md` Revision 19.
+
+Train in 3 sequential phases (v7 legacy):
 
 **Phase A — Pure Boundary (ep0-20):**
 - Config: `ratio_r_neq_t=0`, `use_auxiliary_v_head=False`, `contrastive_loss_weight=0`
@@ -165,7 +169,8 @@ Train in 3 sequential phases:
 - **`context_velocity_sep_loss` DISABLED:** 2 extra forward passes through 122M model → OOM risk. Use contrastive instead.
 - **VRAM budget (RTX 4090 24GB):** Phase A 10GB batch=4, Phase B/C 19.5GB batch=2. With ctx_sep: 23+GB risk OOM.
 - **`output_proj` init was 16x too small** (xavier σ≈0.0009). Fixed to `normal_(std=0.014)` per iMF Appendix A.
-- Full details: see `Bao_cao_FaceDiff_ChiTiet.md` Section 11 (Revision 18) + `docs/AUDIT_FINDINGS.md`.
+- **v8 lite:** cross-attn + ctx dropout Phase A (fix CFG null path). Identity test ep 10–15 trước khi đổi kiến trúc.
+- Full details: `docs/AUDIT_FINDINGS.md`, `Bao_cao_FaceDiff_ChiTiet.md` Section 8.
 
 ## Important Implementation Details
 

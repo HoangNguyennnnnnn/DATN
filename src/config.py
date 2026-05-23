@@ -222,14 +222,19 @@ class IMFConfig:
     mamba_num_layers: int = 12           # Số lượng khối BidirectionalMambaBlocks
     mamba_d_state: int = 16              # Số chiều trạng thái SSM
     mamba_d_conv: int = 4                # Kích thước hạt nhân tích chập (kernel size)
-    mamba_expand: int = 2                # Hệ số mở rộng
-    # 2026-05-22 v7: Prefix in-context + per-layer ctx_proj (overfit fail khi tokens=0, AdaLN yếu).
-    mamba_num_context_tokens: int = 8
+    mamba_expand: int = 2                # Hệ số mở rộng SSM
+    mamba_ffn_expand: int = 4            # FFN hidden = dim × expand (lite: 2)
+    # v8: cross-attn ArcFace; không prefix context (time/r/interval/guidance giữ nguyên).
+    context_cond_mode: str = "cross_attn"       # cross_attn | adaln (legacy v7)
+    context_use_arcface_only: bool = True       # Chỉ [:512] ArcFace; FLAME/DINO không vào model
+    mamba_num_context_kv_tokens: int = 8        # K tokens cho cross-attn K/V
+    mamba_context_cross_attn_heads: int = 8
+    mamba_num_context_tokens: int = 0           # prefix context tắt (v8)
     mamba_num_time_tokens: int = 4
     mamba_num_r_tokens: int = 4
     mamba_num_interval_tokens: int = 4
     mamba_num_guidance_tokens: int = 4
-    mamba_use_per_layer_context: bool = True
+    mamba_use_per_layer_context: bool = False
     dual_branch: bool = False          # Chia iMF thành các nhánh hình học và vật liệu
     shape_sc_vae_checkpoint: Optional[str] = None      # Điểm kiểm tra VAE riêng biệt chuyên biệt cho hình học (tùy chọn)
     material_sc_vae_checkpoint: Optional[str] = None   # Điểm kiểm tra VAE riêng biệt chuyên biệt cho vật liệu (tùy chọn)
@@ -257,13 +262,13 @@ class IMFConfig:
     
     # Đặc tả iMF (arXiv:2512.02012v1 — Geng et al., Improved Mean Flows)
     sigma_min: float = 1e-4            # Biên độ nhiễu tối thiểu
-    ratio_r_neq_t: float = 0.0        # 2026-05-22 DIAGNOSTIC: disable JVP entirely. Pure boundary (r=t) flow matching to isolate signal. Previous 0.5 caused plateau.
+    ratio_r_neq_t: float = 0.5        # Paper Table 4: 50% r≠t → JVP compound V = u + (t-r)·sg(dudt)
     t_sampler: str = "logit_normal"    # Paper iMF Table 4: logit-normal(-0.4, 1.0). Focus capacity vào t∈[0.2,0.6] — signal mạnh nhất. Dataset nhỏ càng cần focus.
     t_loc: float = -0.4               # Trung bình logit-normal (Giai đoạn 1: thiên vị ở giữa)
     t_scale: float = 1.0              # Tỉ lệ logit-normal
     curriculum_switch_ratio: float = 0.3   # Compromise 0.6→0.3 (17/05): switch ở 30% (epoch 120) — balance giữa boundary stability và 1-step learning
     curriculum_uniform_prob: float = 0.8   # Xác suất chọn giá trị đồng đều ở Giai đoạn 2 của tiến trình
-    cfg_conditioning_enable: bool = False   # 2026-05-19: DISABLED. Diagnostic ep58 confirm CFG branch tạo degenerate "predict average ignore context" minimum (Test 1 cos_sim=1.0 across diff contexts). Switch to clean v_target = e-x.
+    cfg_conditioning_enable: bool = False   # Phase A: tắt CFG guidance (ω); bật Phase B (train_imf_v8_phaseB_cfg.sh)
     
     # iMF v5.0: v-loss cùng với khối phụ trợ v-head (Chỉ số cải thiện lợi nhuận ROI cao)
     use_v_loss: bool = True              # Dùng v-loss thay vì u-loss (huấn luyện ổn định hơn)
@@ -275,27 +280,26 @@ class IMFConfig:
     # Contrastive auxiliary loss (2026-05-20): force hidden state to encode context.
     # InfoNCE on (pooled_hidden → predicted_ctx) vs (true context).
     contrastive_loss_weight: float = 0.0   # Phase A: off. Enable 0.2 sau khi main loss converge.
-    context_velocity_sep_weight: float = 0.0   # RISK 1: 2 extra forward passes → OOM. Enable riêng sau Phase A.
+    context_velocity_sep_weight: float = 0.1   # v8: nhẹ — ép u phụ thuộc ctx, tránh overfit identity
     context_velocity_sep_margin: float = 0.0   # penalize cos > 0
     contrastive_temperature: float = 0.1 # InfoNCE temperature
     contrastive_mode: str = "arcface"  # "arcface" | "flame" | "full" — audit: Arc margin tốt, DINO/FLAME yếu
-    # Nhân khối trước context_cond_mlp (sau balanced LMDB): ưu tiên identity + expression
-    context_segment_weights: tuple = (1.5, 1.0, 0.5)  # Balanced LMDB đã L2-norm → (1.5,1,0.5) moderate Arc bias. Raw LMDB cần (3,2,0.5).
+    context_segment_weights: Optional[tuple] = None  # v8 arc-only: không dùng segment weights
     cfg_omega_min: float = 1.0              # Cận dưới thang điều hướng (1.0 = không điều hướng)
     cfg_omega_max: float = 8.0              # Cận trên thang điều hướng
     cfg_omega_power_beta: float = 1.0       # Giá trị beta hàm lũy thừa cho p(omega) ~ omega^-beta
-    cfg_context_dropout: float = 0.0        # 2026-05-19: 0.1 → 0. Bỏ random context-drop (gây pressure cho context-invariance). Always train với real context.
+    cfg_context_dropout: float = 0.1        # Phase A+B: zero ArcFace → null_ctx_tokens (độc lập cfg_conditioning_enable)
     cfg_interval_conditioning: bool = True  # Điều kiện hóa trên đoạn [tmin, tmax] giống trong phụ lục iMF
-    adaptive_loss_weighting: bool = False   # 2026-05-22 DIAGNOSTIC: tắt EMA per-bin reweighting để isolate main loss signal. Reweighting có thể amplify variance bins khi bf16+small batch → khó hội tụ.
+    adaptive_loss_weighting: bool = True    # Paper Appendix A: adaptive weighting cho main + v-head loss
     ema_decay: float = 0.9999          # Paper Table 4: ema_decay = 0.9999
     use_ema: bool = True               # EMA cải thiện chất lượng lấy mẫu
     dropout: float = 0.0               # Paper Table 4: dropout = 0
     
     # Điểm kiểm tra
-    checkpoint_dir: str = "checkpoints/imf_unet"
+    checkpoint_dir: str = "checkpoints/imf_v8_arc_xattn"
     sc_vae_checkpoint: str = "checkpoints/sc_vae_shape/latest_step.pt"  # Checkpoint kết thúc Giai đoạn-1 (tự động dùng bản mới nhất)
     save_every_epochs: int = 20
-    save_every_steps: int = 500        # Lưu checkpoint ở bước mới nhất để an toàn khi tiếp tục giữa epoch
+    save_every_steps: int = 1000       # Giảm stall disk (500→1000); vẫn đủ an toàn với save_every_epochs
     resume_from: Optional[str] = None
     resume_model_only: bool = False    # Bỏ qua trạng thái optimizer/scheduler khi khôi phục
     

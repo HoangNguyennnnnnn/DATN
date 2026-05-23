@@ -17,7 +17,7 @@ import torch.nn.functional as F
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
 
-from src.models.voxel_mamba import VoxelMamba
+from src.models.voxel_mamba import VoxelMamba, voxel_mamba_from_stage2_config
 
 
 def _load_voxel_mamba_from_ckpt(
@@ -27,24 +27,8 @@ def _load_voxel_mamba_from_ckpt(
     seg_w = mcfg.get("context_segment_weights")
     if seg_w is not None and len(seg_w) == 3:
         seg_w = tuple(float(x) for x in seg_w)
-    model = VoxelMamba(
-        input_dim=mcfg["input_dim"],
-        hidden_dim=mcfg["hidden_dim"],
-        num_layers=mcfg["num_layers"],
-        slat_length=mcfg["slat_length"],
-        context_dim=mcfg["context_dim"],
-        backend=mcfg.get("backend", "auto"),
-        strict=False,
-        num_context_tokens=mcfg.get("num_context_tokens", 8),
-        num_time_tokens=mcfg.get("num_time_tokens", 4),
-        num_r_tokens=mcfg.get("num_r_tokens", 4),
-        num_interval_tokens=mcfg.get("num_interval_tokens", 4),
-        num_guidance_tokens=mcfg.get("num_guidance_tokens", 4),
-        d_state=mcfg.get("d_state", 16),
-        d_conv=mcfg.get("d_conv", 4),
-        expand=mcfg.get("expand", 2),
-        dropout=0.0,
-        context_segment_weights=seg_w,
+    model = voxel_mamba_from_stage2_config(
+        mcfg, backend=mcfg.get("backend", "auto"), dropout=0.0,
     ).to(device)
     state_key = "ema_state_dict" if (use_ema and "ema_state_dict" in ckpt) else "model_state_dict"
     state = {

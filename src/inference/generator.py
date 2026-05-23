@@ -366,13 +366,20 @@ class FaceDiffGenerator:
             cfg["hidden_dim"] = int(weight.shape[0])
             cfg["input_dim"] = int(weight.shape[1])
 
-        if sd.get("time_guidance_mlp.0.weight") is not None:
-            cfg["conditioning"] = "adaln_additive"
+        if any(k.startswith("layers.0.cross_attn.") for k in sd.keys()):
+            cfg["context_cond_mode"] = "cross_attn"
+            cfg["context_use_arcface_only"] = True
+            cfg["conditioning"] = "cross_attn"
+            arc_w = sd.get("arcface_tokenizer.0.weight", None)
+            if isinstance(arc_w, torch.Tensor) and arc_w.ndim == 2:
+                cfg["context_dim"] = max(int(cfg["context_dim"]), int(arc_w.shape[1]))
+            kv_w = sd.get("arcface_tokenizer.2.weight", None)
+            if isinstance(kv_w, torch.Tensor) and kv_w.ndim == 2 and int(cfg["hidden_dim"]) > 0:
+                cfg["num_context_kv_tokens"] = max(1, int(kv_w.shape[0] // int(cfg["hidden_dim"])))
             cfg["num_context_tokens"] = 0
-            cfg["num_time_tokens"] = 0
-            cfg["num_r_tokens"] = 0
-            cfg["num_interval_tokens"] = 0
-            cfg["num_guidance_tokens"] = 0
+        elif sd.get("time_guidance_mlp.0.weight") is not None:
+            cfg["conditioning"] = "adaln_additive"
+            cfg["context_cond_mode"] = "adaln"
             cc_w = sd.get("context_cond_mlp.0.weight", None)
             if isinstance(cc_w, torch.Tensor) and cc_w.ndim == 2:
                 cfg["context_dim"] = int(cc_w.shape[1])
@@ -387,8 +394,15 @@ class FaceDiffGenerator:
         ctx_out_w = sd.get("context_tokenizer.2.weight", None)
         if not isinstance(ctx_out_w, torch.Tensor):
             ctx_out_w = ctx_w
-        if isinstance(ctx_out_w, torch.Tensor) and ctx_out_w.ndim == 2 and int(cfg["hidden_dim"]) > 0:
+        if (
+            isinstance(ctx_out_w, torch.Tensor)
+            and ctx_out_w.ndim == 2
+            and int(cfg["hidden_dim"]) > 0
+            and cfg.get("context_cond_mode") != "cross_attn"
+        ):
             cfg["num_context_tokens"] = max(1, int(ctx_out_w.shape[0] // int(cfg["hidden_dim"])))
+            cfg["context_cond_mode"] = "adaln"
+            cfg["context_use_arcface_only"] = False
 
         time_w = sd.get("time_tokenizer.0.weight", None)
         if isinstance(time_w, torch.Tensor) and time_w.ndim == 2 and int(cfg["hidden_dim"]) > 0:
@@ -430,23 +444,11 @@ class FaceDiffGenerator:
     def _build_stage2_model(self, stage2_cfg: dict) -> nn.Module:
         from src.models.voxel_mamba import VoxelMamba
 
-        return VoxelMamba(
-            input_dim=int(stage2_cfg["input_dim"]),
-            hidden_dim=int(stage2_cfg["hidden_dim"]),
-            num_layers=int(stage2_cfg["num_layers"]),
-            slat_length=int(stage2_cfg["slat_length"]),
-            context_dim=int(stage2_cfg["context_dim"]),
-            backend=str(stage2_cfg["backend"]),
-            strict=bool(stage2_cfg["strict"]),
-            num_context_tokens=int(stage2_cfg["num_context_tokens"]),
-            num_time_tokens=int(stage2_cfg["num_time_tokens"]),
-            num_r_tokens=int(stage2_cfg["num_r_tokens"]),
-            num_interval_tokens=int(stage2_cfg["num_interval_tokens"]),
-            num_guidance_tokens=int(stage2_cfg["num_guidance_tokens"]),
-            dropout=float(stage2_cfg["dropout"]),
-            d_state=int(stage2_cfg["d_state"]),
-            d_conv=int(stage2_cfg["d_conv"]),
-            expand=int(stage2_cfg["expand"]),
+        from src.models.voxel_mamba import voxel_mamba_from_stage2_config
+
+        return voxel_mamba_from_stage2_config(
+            stage2_cfg,
+            strict=bool(stage2_cfg.get("strict", False)),
         )
 
     def _load_imf_checkpoint(self, model: nn.Module, ckpt_path: str):

@@ -1455,14 +1455,23 @@ Sau 11 epoch contrastive (ep27-38):
 
 ## 8. Trạng thái Hiện tại và Lộ trình
 
-### 8.1. Snapshot Pipeline (23/05/2026)
+### 8.1. Snapshot Pipeline (23/05/2026 — cập nhật v8 lite)
 
 | Stage | Trạng thái | Chi tiết |
 |-------|-----------|----------|
-| **Stage 1 — SC-VAE** | ✅ Done | `checkpoints/sc_vae_shape/epoch_500.pt` (8.3GB). Recon=0.0213, KL=14.58, Rho=0.038, topology recall 86.7% / precision 80.6% |
-| **Stage 2 — Phase A** | ✅ Done ep20 | `checkpoints/imf_v7/epoch_20.pt` (best loss=1.4155). Time conditioning learned (cos@t0vs1 = -0.008). Context dormant (by design — boundary loss không cần ctx) |
-| **Stage 2 — Phase B+C** | 🟢 Running ep38+ | `checkpoints/imf_v7_phaseB/latest_step.pt`. PID 1364952. Loss plateau 2.92 nhưng **context đã activate** (hidden cos 0.999→0.772 random input). VRAM 19.5GB stable |
-| **Stage 3 — Decode** | ⏳ Pending | Cần Stage 2 hội tụ trước. Pipeline: SC-VAE decoder + Dual Contouring sẵn có. |
+| **Stage 1 — SC-VAE** | ✅ Done | `checkpoints/sc_vae_shape/epoch_500.pt` (8.3GB). Recon=0.0213, KL=14.58, Rho=0.038 |
+| **Stage 2 — v7 Phase B+C** | ⏸ Paused | `imf_v7_phaseB/` — ep38 breakthrough (hidden cos 0.772). **Không train tiếp** — chuyển v8 lite |
+| **Stage 2 — v8 lite Phase A** | 🟢 **Running** | `checkpoints/imf_v8_lite/best.pt`. Ep **2/40** (23/05 19:47). Loss ep1=5.95. batch=3, ctx_dropout=0.1, JVP 0.5 |
+| **Stage 2 — v8 lite Phase B** | ⏳ Auto | Pipeline `--wait-phase-a` → CFG 400 ep sau khi Phase A xong |
+| **Stage 3 — Decode** | ⏳ Pending | Sau identity gate ep 10–15 |
+
+**Kiến trúc v8 lite (tóm tắt):** 8L × FFN2 × cross-attn ArcFace-only (~85M). Bỏ prefix ctx 946-d và per-layer AdaLN ctx của v7. Chi tiết: [docs/AUDIT_FINDINGS.md](docs/AUDIT_FINDINGS.md) Revision 19, [docs/STAGE2_GUIDE.md](docs/STAGE2_GUIDE.md).
+
+**Lệnh train:**
+```bash
+bash scripts/train_imf_v8_lite_pipeline.sh
+tail -f logs/train_imf_v8_lite_*.log
+```
 
 ### 8.2. Metrics đạt được
 
@@ -1510,10 +1519,15 @@ Khi đạt ep50 (~10h từ ep38), test `cos_sim` diagnostic và quyết định:
 
 ### 8.5. Lộ trình Tiếp theo
 
-**Ngắn hạn (24h kế tiếp):**
-1. Monitor Phase C đến ep50 (~10h)
-2. Chạy `scripts/test/test_imf_identity_t0.py` ở ep50 để verify cos_sim trên real data (current ep38 test cho 0.997 với real slat — slat dominates output)
-3. Quyết định Phase D theo gate Section 8.4
+**Ngắn hạn (v8 lite — 23/05):**
+1. Phase A chạy ~20h (40 ep × ~29 ph/ep)
+2. **ep 10–15:** `test_imf_identity_t0.py` trên `imf_v8_lite/latest_step.pt`
+3. Pipeline auto Phase B (400 ep CFG) nếu identity pass
+4. Identity test ep 10–15 trước khi đổi hướng kiến trúc
+
+**v7 (tạm dừng):**
+1. ~~Monitor Phase C đến ep50~~ — thay bằng v8 lite baseline
+2. Gate Section 8.4 vẫn tham chiếu cho ablation nếu v8 fail
 
 **Trung hạn (1 tuần):**
 1. Setup Stage 3 decode pipeline (SC-VAE decoder + Dual Contouring đã có sẵn)
@@ -1548,9 +1562,11 @@ Khi đạt ep50 (~10h từ ep38), test `cos_sim` diagnostic và quyết định:
 
 | Script | Vai trò |
 |--------|---------|
-| [scripts/train_imf_v7.sh](scripts/train_imf_v7.sh) | Phase A — boundary-only training |
-| [scripts/train_imf_v7_phaseB.sh](scripts/train_imf_v7_phaseB.sh) | Phase B+C — JVP + v-head + contrastive (resume từ Phase A) |
-| [scripts/train_imf.sh](scripts/train_imf.sh) | Generic recommended (CLAUDE.md mặc định) |
+| [scripts/train_imf_v8_lite.sh](scripts/train_imf_v8_lite.sh) | **v8 lite Phase A** (khuyến nghị) |
+| [scripts/train_imf_v8_phaseB_cfg.sh](scripts/train_imf_v8_phaseB_cfg.sh) | v8 lite Phase B CFG (400 ep) |
+| [scripts/train_imf_v8_lite_pipeline.sh](scripts/train_imf_v8_lite_pipeline.sh) | Pipeline A→B tự động |
+| [scripts/train_imf_v7_phaseB.sh](scripts/train_imf_v7_phaseB.sh) | v7 legacy Phase B+C |
+| [scripts/train_imf.sh](scripts/train_imf.sh) | Generic (CLAUDE.md) |
 | [src/train_imf.py](src/train_imf.py) | Main training loop với CLI args |
 
 **Diagnostic & Data Pipeline:**
@@ -1574,7 +1590,7 @@ Khi đạt ep50 (~10h từ ep38), test `cos_sim` diagnostic và quyết định:
 
 ---
 
-*(Cập nhật: 23/05/2026 — Snapshot v7 architecture sau Phase A/B/C training. Báo cáo này mô tả trạng thái hiện tại của project, đối chiếu chính xác với source code. Lịch sử revision đã được loại bỏ để tập trung vào best practices và phương pháp tốt nhất.)*
+*(Cập nhật: 23/05/2026 — Thêm snapshot **v8 lite** (Section 8.1, 8.5). Phần 4.4 v7 vẫn mô tả kiến trúc cũ; v8 xem [docs/AUDIT_FINDINGS.md](docs/AUDIT_FINDINGS.md) Revision 19.)*
 
 ---
 
