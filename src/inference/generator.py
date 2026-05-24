@@ -58,7 +58,8 @@ class FaceDiffGenerator:
                  cfg_tmin: float = 0.0,
                  cfg_tmax: float = 1.0,
                  feature_mode: str = "shape_mat",
-                 ovoxel_resolution: int = 256):
+                 ovoxel_resolution: int = 256,
+                 slat_stats_path: str = "data/slat_stats.pt"):
         """
         Args:
             device: GPU/CPU device
@@ -175,6 +176,17 @@ class FaceDiffGenerator:
                 self._load_vae_checkpoint(self.vae, self.sc_vae_ckpt)
                 print(f"[Generator] Loaded single SC-VAE checkpoint: {self.sc_vae_ckpt}")
             self.vae.eval()
+        
+        # === Load Slat Stats ===
+        self.slat_mean = None
+        self.slat_std = None
+        if slat_stats_path and os.path.exists(slat_stats_path):
+            print(f"[Generator] Loading slat stats: {slat_stats_path}")
+            stats = torch.load(slat_stats_path, map_location="cpu", weights_only=False)
+            self.slat_mean = stats["mean"].to(self.device).view(1, 1, -1)
+            self.slat_std = stats["std"].to(self.device).view(1, 1, -1)
+        else:
+            print(f"[Generator] Warning: slat stats file {slat_stats_path} not found. Slat denormalization is disabled!")
         
         mem_after = self._get_vram()
         print(f"[Generator] Tổng VRAM cấp phát cho Models: {mem_after - mem_before:.2f} MB")
@@ -607,6 +619,19 @@ class FaceDiffGenerator:
             cfg_tmax=tmax_eff,
         )
         print(f"  -> Slat Tokens Shape: {generated_slats.shape}")
+        
+        # Denormalize generated slats if stats are available.
+        # This resolves Critical Discrepancy #1 where the generator lacks denormalization logic.
+        if self.slat_mean is not None and self.slat_std is not None:
+            print("[Generator] Denormalizing generated slat tokens...")
+            d_dim = generated_slats.shape[-1]
+            s_dim = self.slat_mean.shape[-1]
+            if d_dim == s_dim:
+                generated_slats = generated_slats * self.slat_std + self.slat_mean
+            elif d_dim > s_dim:
+                # Modifying part of tensor in-place after clone to avoid PyTorch errors
+                generated_slats = generated_slats.clone()
+                generated_slats[..., :s_dim] = generated_slats[..., :s_dim] * self.slat_std + self.slat_mean
         
         # ====== BƯỚC 2: SC-VAE Decode ======
         print("[Generator] Bước 2/4: SC-VAE Decode Slat -> Dense Voxel Features...")
@@ -1239,6 +1264,7 @@ def run_inference_test():
         enforce_dual_contouring=bool(inf_cfg.enforce_dual_contouring),
         mesh_smooth_sigma=float(inf_cfg.mesh_smooth_sigma),
         ovoxel_resolution=int(inf_cfg.ovoxel_resolution),
+        slat_stats_path=getattr(cfg.imf, "slat_stats_path", "data/slat_stats.pt"),
     )
     
     # Giả lập Hybrid vector [1, 946]

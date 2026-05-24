@@ -135,77 +135,217 @@ class FeedForward(nn.Module):
         return self.net(x)
 
 
-class ContextCrossAttention(nn.Module):
-    """Cross-attn: slat tokens (Q) attend ArcFace context tokens (K/V). ~1M params/layer."""
+try:
+    from einops import rearrange, repeat
+    from mamba_ssm.ops.selective_scan_interface import selective_scan_fn
 
-    def __init__(self, dim: int, num_heads: int = 8, dropout: float = 0.0):
+    try:
+        from causal_conv1d import causal_conv1d_fn
+    except ImportError:
+        causal_conv1d_fn = None  # type: ignore[assignment,misc]
+except ImportError:
+    rearrange = None  # type: ignore[assignment,misc]
+    repeat = None  # type: ignore[assignment,misc]
+    selective_scan_fn = None  # type: ignore[assignment,misc]
+    causal_conv1d_fn = None  # type: ignore[assignment,misc]
+
+
+class MambaSSMDirection(nn.Module):
+    """Một nhánh Conv1d → selective SSM (dùng chung cổng z với nhánh còn lại)."""
+
+    def __init__(
+        self,
+        d_inner: int,
+        d_state: int = 16,
+        d_conv: int = 4,
+        dt_rank: str | int = "auto",
+        dt_min: float = 0.001,
+        dt_max: float = 0.1,
+        dt_init: str = "random",
+        dt_scale: float = 1.0,
+        dt_init_floor: float = 1e-4,
+        conv_bias: bool = True,
+        device=None,
+        dtype=None,
+    ):
         super().__init__()
-        self.norm_q = RMSNorm(dim)
-        self.norm_kv = RMSNorm(dim)
-        self.attn = nn.MultiheadAttention(
-            dim, num_heads, dropout=dropout, batch_first=True,
-        )
-        self.proj = nn.Linear(dim, dim)
-        nn.init.zeros_(self.proj.weight)
-        nn.init.zeros_(self.proj.bias)
+        factory_kwargs = {"device": device, "dtype": dtype}
+        self.d_inner = int(d_inner)
+        self.d_state = int(d_state)
+        self.d_conv = int(d_conv)
+        self.dt_rank = math.ceil(self.d_inner / 16) if dt_rank == "auto" else int(dt_rank)
+        self.activation = "silu"
+        self.act = nn.SiLU()
 
-    def forward(self, x: torch.Tensor, ctx_tokens: torch.Tensor) -> torch.Tensor:
-        q = self.norm_q(x)
-        kv = self.norm_kv(ctx_tokens)
-        out, _ = self.attn(q, kv, kv, need_weights=False)
-        return x + self.proj(out)
+        self.conv1d = nn.Conv1d(
+            in_channels=self.d_inner,
+            out_channels=self.d_inner,
+            bias=conv_bias,
+            kernel_size=d_conv,
+            groups=self.d_inner,
+            padding=d_conv - 1,
+            **factory_kwargs,
+        )
+        self.x_proj = nn.Linear(
+            self.d_inner,
+            self.dt_rank + self.d_state * 2,
+            bias=False,
+            **factory_kwargs,
+        )
+        self.dt_proj = nn.Linear(self.dt_rank, self.d_inner, bias=True, **factory_kwargs)
+
+        dt_init_std = self.dt_rank**-0.5 * dt_scale
+        if dt_init == "constant":
+            nn.init.constant_(self.dt_proj.weight, dt_init_std)
+        elif dt_init == "random":
+            nn.init.uniform_(self.dt_proj.weight, -dt_init_std, dt_init_std)
+        else:
+            raise NotImplementedError(f"dt_init={dt_init!r}")
+
+        dt = torch.exp(
+            torch.rand(self.d_inner, **factory_kwargs)
+            * (math.log(dt_max) - math.log(dt_min))
+            + math.log(dt_min)
+        ).clamp(min=dt_init_floor)
+        inv_dt = dt + torch.log(-torch.expm1(-dt))
+        with torch.no_grad():
+            self.dt_proj.bias.copy_(inv_dt)
+        self.dt_proj.bias._no_reinit = True  # type: ignore[attr-defined]
+
+        A = torch.arange(1, self.d_state + 1, dtype=torch.float32, device=device).unsqueeze(0)
+        A = A.expand(self.d_inner, -1).contiguous()
+        self.A_log = nn.Parameter(torch.log(A))
+        self.A_log._no_weight_decay = True  # type: ignore[attr-defined]
+        self.D = nn.Parameter(torch.ones(self.d_inner, device=device))
+        self.D._no_weight_decay = True  # type: ignore[attr-defined]
+
+    def forward(self, x: torch.Tensor, z: torch.Tensor, seqlen: int) -> torch.Tensor:
+        """x, z: [B, d_inner, L] → y: [B, L, d_inner] (đã nhân cổng z trong SSM)."""
+        if selective_scan_fn is None or rearrange is None:
+            raise RuntimeError("mamba-ssm selective_scan_fn is required for BidirectionalMambaCore")
+
+        if causal_conv1d_fn is None:
+            x = self.act(self.conv1d(x)[..., :seqlen])
+        else:
+            x = causal_conv1d_fn(
+                x=x,
+                weight=rearrange(self.conv1d.weight, "d 1 w -> d w"),
+                bias=self.conv1d.bias,
+                activation=self.activation,
+            )
+
+        A = -torch.exp(self.A_log.float())
+        x_dbl = self.x_proj(rearrange(x, "b d l -> (b l) d"))
+        dt, B, C = torch.split(x_dbl, [self.dt_rank, self.d_state, self.d_state], dim=-1)
+        dt = self.dt_proj.weight @ dt.t()
+        dt = rearrange(dt, "d (b l) -> b d l", l=seqlen)
+        B = rearrange(B, "(b l) dstate -> b dstate l", l=seqlen).contiguous()
+        C = rearrange(C, "(b l) dstate -> b dstate l", l=seqlen).contiguous()
+        y = selective_scan_fn(
+            x,
+            dt,
+            A,
+            B,
+            C,
+            self.D.float(),
+            z=z,
+            delta_bias=self.dt_proj.bias.float(),
+            delta_softplus=True,
+        )
+        return rearrange(y, "b d l -> b l d")
+
+
+class BidirectionalMambaCore(nn.Module):
+    """
+    BiMamba (Vim / dual-path): in_proj → (x, z) → Fwd/Bwd Conv+SSM ⊗ SiLU(z) → out_proj.
+    Không norm ở đây — DiM block đã RMSNorm + Scale/Shift (γ₁,β₁) trước khi gọi module này.
+    """
+
+    def __init__(
+        self,
+        d_model: int,
+        d_state: int = 16,
+        d_conv: int = 4,
+        expand: int = 2,
+        bias: bool = False,
+        device=None,
+        dtype=None,
+    ):
+        super().__init__()
+        if not MAMBA_AVAILABLE:
+            raise RuntimeError("BidirectionalMambaCore requires mamba-ssm")
+        factory_kwargs = {"device": device, "dtype": dtype}
+        self.d_model = int(d_model)
+        self.d_inner = int(expand * d_model)
+        self.in_proj = nn.Linear(self.d_model, self.d_inner * 2, bias=bias, **factory_kwargs)
+        self.out_proj = nn.Linear(self.d_inner, self.d_model, bias=bias, **factory_kwargs)
+        self.fwd = MambaSSMDirection(
+            d_inner=self.d_inner,
+            d_state=d_state,
+            d_conv=d_conv,
+            device=device,
+            dtype=dtype,
+        )
+        self.bwd = MambaSSMDirection(
+            d_inner=self.d_inner,
+            d_state=d_state,
+            d_conv=d_conv,
+            device=device,
+            dtype=dtype,
+        )
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        if rearrange is None:
+            raise RuntimeError("einops is required for BidirectionalMambaCore")
+        batch, seqlen, _ = hidden_states.shape
+        xz = rearrange(
+            self.in_proj.weight @ rearrange(hidden_states, "b l d -> d (b l)"),
+            "d (b l) -> b d l",
+            l=seqlen,
+        )
+        if self.in_proj.bias is not None:
+            xz = xz + rearrange(self.in_proj.bias.to(dtype=xz.dtype), "d -> d 1")
+        x, z = xz.chunk(2, dim=1)
+
+        y_fwd = self.fwd(x, z, seqlen)
+        x_rev = torch.flip(x, dims=[-1])
+        z_rev = torch.flip(z, dims=[-1])
+        y_bwd = torch.flip(self.bwd(x_rev, z_rev, seqlen), dims=[1])
+        return self.out_proj(y_fwd + y_bwd)
 
 
 class BidirectionalMambaBlock(nn.Module):
     """
-    Khối SSM Hai chiều + FFN + Dual AdaLN Conditioning.
-
-    2026-05-21 v4: FFN + Context AdaLN (replaces cross-attention).
-    - Mamba: inter-token sequential mixing (spatial)
-    - FFN: intra-token nonlinear feature transformation (CRITICAL)
-    - Time AdaLN: modulate both sub-blocks with (t, r) info
-    - Context AdaLN: modulate Mamba output with identity/expression info
-
-    Architecture per block:
-        # Sub-block 1: Mamba + Context modulation
-        x_mod = norm(x) * (1 + scale_t) + shift_t    # Time AdaLN
-        out = bimamba(x_mod)                           # Spatial mixing
-        out = out * (1 + scale_c) + shift_c            # Context AdaLN
-        x = x + gate_t * out                           # Gated residual
-
-        # Sub-block 2: FFN
-        x_ffn = norm_ffn(x) * (1 + scale_f) + shift_f # Time AdaLN
-        x = x + gate_ffn * ffn(x_ffn)                 # Gated residual
+    DiM block (Figure): RMSNorm → Scale/Shift → Mamba → Scale(α₁) + residual;
+                        RMSNorm → Scale/Shift → FFN  → Scale(α₂) + residual.
+    Condition (time+ctx) → adaLN MLP → γ₁,β₁,α₁,γ₂,β₂,α₂.
     """
     def __init__(
         self,
-        dim,
-        time_dim,
-        ctx_dim,
-        d_state=16,
-        d_conv=4,
-        expand=2,
-        ffn_expand=4,
-        dropout=0.0,
-        use_mamba=True,
-        use_ffn=True,
+        dim: int,
+        time_dim: int,
+        ctx_dim: int,
+        d_state: int = 16,
+        d_conv: int = 4,
+        expand: int = 2,
+        ffn_expand: int = 4,
+        dropout: float = 0.0,
+        use_mamba: bool = True,
+        use_ffn: bool = True,
         backend: str = "auto",
-        context_cond_mode: str = "cross_attn",
-        cross_attn_heads: int = 8,
     ):
         super().__init__()
         self.dim = dim
-        self.context_cond_mode = str(context_cond_mode).strip().lower()
         self.backend = _resolve_requested_backend(backend)
         self.use_mamba = use_mamba
         self.use_ffn = use_ffn
 
         if self.use_mamba:
-            self.forward_mamba = Mamba(
-                d_model=dim, d_state=d_state, d_conv=d_conv, expand=expand,
-            )
-            self.backward_mamba = Mamba(
-                d_model=dim, d_state=d_state, d_conv=d_conv, expand=expand,
+            self.bimamba = BidirectionalMambaCore(
+                d_model=dim,
+                d_state=d_state,
+                d_conv=d_conv,
+                expand=expand,
             )
         else:
             self.gru = nn.GRU(
@@ -216,120 +356,89 @@ class BidirectionalMambaBlock(nn.Module):
         self.norm = RMSNorm(dim)
         self.dropout = nn.Dropout(dropout)
 
-        # Time-only AdaLN: time_cond [B, time_dim] → (scale, shift, gate) [B, dim] × 3
-        # Time signal is monotonic and high-variance → suitable for AdaLN modulation
-        self.adaLN_time = nn.Sequential(
+        # 6-Parameter AdaLN DiM Block (fuses time & context, projects to 6*dim parameters)
+        # Layout: [γ₁, β₁, α₁, γ₂, β₂, α₂]
+        #   PRE-Mamba: γ₁(scale), β₁(shift)
+        #   POST-Mamba: α₁(gate)
+        #   PRE-FFN: γ₂(scale), β₂(shift)
+        #   POST-FFN: α₂(gate)
+        self.adaLN = nn.Sequential(
             nn.SiLU(),
-            nn.Linear(time_dim, 3 * dim, bias=True),
+            nn.Linear(time_dim, 6 * dim, bias=True),
         )
-        # Init: scale small non-zero, shift zero, gate bias = 1.0 (NOT zero!)
-        # Gate bias = 1.0 → Mamba receives full gradient from step 1 → breaks gate=0 trap
-        last_linear = self.adaLN_time[-1]
+        # Init: PRE scale small std=0.02, POST gate bias=1.0 (gradient flows at start)
+        last_linear = self.adaLN[-1]
         W = last_linear.weight
-        nn.init.normal_(W[:dim], mean=0.0, std=0.02)      # scale weights
-        nn.init.zeros_(W[dim : 2 * dim])                   # shift weights
-        nn.init.zeros_(W[2 * dim :])                       # gate weights
-        nn.init.zeros_(last_linear.bias[:dim])             # scale bias
-        nn.init.zeros_(last_linear.bias[dim : 2 * dim])   # shift bias
-        nn.init.constant_(last_linear.bias[2 * dim :], 1.0)  # gate bias = 1.0
+        b = last_linear.bias
+        # PRE-Mamba: γ₁ small, β₁ zero
+        nn.init.normal_(W[:dim], mean=0.0, std=0.02)                    # γ₁
+        nn.init.zeros_(W[dim : 2 * dim])                                 # β₁
+        # Gate Mamba: α₁ zero weight, bias=1.0
+        nn.init.zeros_(W[2 * dim : 3 * dim])                             # α₁
+        # PRE-FFN: γ₂ small, β₂ zero
+        nn.init.normal_(W[3 * dim : 4 * dim], mean=0.0, std=0.02)        # γ₂
+        nn.init.zeros_(W[4 * dim : 5 * dim])                             # β₂
+        # Gate FFN: α₂ zero weight, bias=1.0
+        nn.init.zeros_(W[5 * dim :])                                     # α₂
+        
+        nn.init.zeros_(b[:dim])                                          # γ₁ bias
+        nn.init.zeros_(b[dim : 2 * dim])                                 # β₁ bias
+        nn.init.constant_(b[2 * dim : 3 * dim], 1.0)                     # α₁ bias = 1.0
+        nn.init.zeros_(b[3 * dim : 4 * dim])                             # γ₂ bias
+        nn.init.zeros_(b[4 * dim : 5 * dim])                             # β₂ bias
+        nn.init.constant_(b[5 * dim :], 1.0)                             # α₂ bias = 1.0
 
-        if self.context_cond_mode == "cross_attn":
-            self.cross_attn = ContextCrossAttention(
-                dim, num_heads=cross_attn_heads, dropout=dropout,
-            )
-            self.adaLN_ctx = None
-        else:
-            self.cross_attn = None
-            self.adaLN_ctx = nn.Sequential(
-                nn.SiLU(),
-                nn.Linear(ctx_dim, 2 * dim, bias=True),
-            )
-            ctx_linear = self.adaLN_ctx[-1]
-            nn.init.normal_(ctx_linear.weight[:dim], mean=0.0, std=0.1)
-            nn.init.zeros_(ctx_linear.weight[dim:])
-            nn.init.zeros_(ctx_linear.bias)
-
-        # ============================================================
-        # SUB-BLOCK 2: FFN (Per-token nonlinear transform)
-        # 2026-05-21 v3: The CRITICAL missing component.
-        # Without FFN, model cannot learn per-token features independently.
-        # ============================================================
+        # Sub-block 2: FFN (Per-token nonlinear transform)
         self.norm_ffn = RMSNorm(dim)
         self.ffn = FeedForward(dim=dim, expand=ffn_expand, dropout=dropout)
-
-        # FFN also gets Time AdaLN (same as DiT paper — same conditioning for both sub-blocks)
-        self.adaLN_ffn = nn.Sequential(
-            nn.SiLU(),
-            nn.Linear(time_dim, 3 * dim, bias=True),
-        )
-        # Same init pattern: scale small, shift zero, gate bias = 1.0
-        last_ffn = self.adaLN_ffn[-1]
-        W_ffn = last_ffn.weight
-        nn.init.normal_(W_ffn[:dim], mean=0.0, std=0.02)
-        nn.init.zeros_(W_ffn[dim : 2 * dim])
-        nn.init.zeros_(W_ffn[2 * dim :])
-        nn.init.zeros_(last_ffn.bias[:dim])
-        nn.init.zeros_(last_ffn.bias[dim : 2 * dim])
-        nn.init.constant_(last_ffn.bias[2 * dim :], 1.0)
 
     def forward(
         self,
         x: torch.Tensor,
         time_cond: torch.Tensor,
         ctx_cond: Optional[torch.Tensor] = None,
-        ctx_tokens: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
         x: [B, L, dim] hidden states
         time_cond: [B, time_dim] time conditioning (t, r, interval, guidance)
-        ctx_cond: [B, ctx_dim] — AdaLN path only
-        ctx_tokens: [B, K, dim] — cross-attn path only
+        ctx_cond: [B, ctx_dim] — fused context path
         """
-        # ── Sub-block 1: Mamba + Context Cross-Attention ──
-        scale_t, shift_t, gate_t = self.adaLN_time(time_cond).chunk(3, dim=-1)
-        scale_t = scale_t.unsqueeze(1)  # [B, 1, dim]
-        shift_t = shift_t.unsqueeze(1)
-        gate_t = gate_t.unsqueeze(1)
-
-        residual = x
-        x_norm = self.norm(x)
-        x_mod = x_norm * (1 + scale_t) + shift_t
-
+        # 6-Point DiM Block Fused Conditioning: cond = time_cond + ctx_cond
+        cond = time_cond
+        if ctx_cond is not None:
+            cond = cond + ctx_cond
+        
+        # Unpack 6 modulation parameters (as in Figure 1 of DiM-3D paper)
+        (
+            gamma1, beta1,        # PRE-Mamba:  scale, shift
+            alpha1,               # POST-Mamba: gating scale
+            gamma2, beta2,        # PRE-FFN:    scale, shift
+            alpha2,               # POST-FFN:   gating scale
+        ) = self.adaLN(cond).chunk(6, dim=-1)
+        # Broadcast [B, dim] → [B, 1, dim] for element-wise ops on [B, L, dim]
+        gamma1 = gamma1.unsqueeze(1)
+        beta1  = beta1.unsqueeze(1)
+        alpha1 = alpha1.unsqueeze(1)
+        gamma2 = gamma2.unsqueeze(1)
+        beta2  = beta2.unsqueeze(1)
+        alpha2 = alpha2.unsqueeze(1)
+        
+        # --- Nhánh 1: Mamba (residual từ input tokens) ---
+        res_mamba = x
+        x_mod = self.norm(x) * (1 + gamma1) + beta1
         if self.use_mamba:
-            fwd = self.forward_mamba(x_mod)
-            bwd_input = torch.flip(x_mod, dims=[1])
-            bwd = self.backward_mamba(bwd_input)
-            bwd = torch.flip(bwd, dims=[1])
-            out = fwd + bwd
+            out = self.bimamba(x_mod)
         else:
             out, _ = self.gru(x_mod)
-
         out = self.dropout(out)
+        x = res_mamba + alpha1 * out
 
-        if self.cross_attn is not None:
-            if ctx_tokens is None:
-                raise ValueError("cross_attn block requires ctx_tokens [B, K, dim]")
-            out = self.cross_attn(out, ctx_tokens)
-        else:
-            if ctx_cond is None:
-                raise ValueError("adaln block requires ctx_cond [B, ctx_dim]")
-            scale_c, shift_c = self.adaLN_ctx(ctx_cond).chunk(2, dim=-1)
-            scale_c = scale_c.unsqueeze(1)
-            shift_c = shift_c.unsqueeze(1)
-            out = out * (1 + scale_c) + shift_c
-
-        x = residual + gate_t * out
-
-        # ── Sub-block 2: FFN (per-token nonlinear transform) ──
+        # --- Nhánh 2: FFN (residual từ output nhánh 1) ---
         if self.use_ffn:
-            scale_f, shift_f, gate_f = self.adaLN_ffn(time_cond).chunk(3, dim=-1)
-            scale_f = scale_f.unsqueeze(1)
-            shift_f = shift_f.unsqueeze(1)
-            gate_f = gate_f.unsqueeze(1)
-    
-            x_ffn = self.norm_ffn(x) * (1 + scale_f) + shift_f
-            x = x + gate_f * self.ffn(x_ffn)
-            
+            res_ffn = x
+            x_ffn = self.norm_ffn(x) * (1 + gamma2) + beta2
+            ffn_out = self.ffn(x_ffn)
+            x = res_ffn + alpha2 * ffn_out
         return x
 
 
@@ -377,12 +486,12 @@ class VoxelMamba(nn.Module):
     
     Thay thế mạng IMFUNet1D với độ phức tạp O(N).
     
-    Kiến trúc (v8 — ArcFace cross-attn, mặc định):
-    1. Nhúng đầu vào + Hilbert reorder
-    2. Prefix time/r/interval/guidance (không prefix context — tránh trùng cross-attn)
-    3. ArcFace [512] → K context tokens → cross-attn sau Mamba mỗi layer
-    4. Time AdaLN trước Mamba; CFG học nhánh null context
-    5. output_proj → velocity [B, 4096, input_dim]
+    Kiến trúc (Tối ưu hóa v8 — 6-Parameter AdaLN + FFN, Mặc định):
+    1. Nhúng đầu vào + Sắp xếp Hilbert (Hilbert Reordering) bảo toàn cấu trúc không gian 3D.
+    2. Prefix time/r/interval/guidance ở cuối chuỗi (đảm bảo tính hai chiều và không phá vỡ Hilbert).
+    3. Điều hợp động 6-Parameter AdaLN trên mỗi khối DiM-3D để tích hợp mượt mà cả thông tin thời gian và ngữ cảnh.
+    4. Khối FFN chuẩn hóa ở cuối mỗi block để nâng cao tính phi tuyến tính.
+    5. output_proj → velocity [B, 4096, input_dim].
     
     iMF yêu cầu u_θ(z_t, r, t) phải được điều kiện hóa trên CẢ HAI dấu thời gian r (bắt đầu) và t (kết thúc).
     Nếu không có điều kiện r, mô hình sẽ suy thoái thành khớp luồng đơn giản (simple flow matching)
@@ -426,13 +535,17 @@ class VoxelMamba(nn.Module):
         context_segment_weights: Optional[Tuple[float, float, float]] = None,
         context_arc_dim: int = 512,
         context_flame_dim: int = 50,
-        context_cond_mode: str = "cross_attn",
+        context_cond_mode: str = "adaln",
         context_use_arcface_only: bool = True,
         num_context_kv_tokens: int = 8,
         context_cross_attn_heads: int = 8,
     ):
         super().__init__()
         self.context_cond_mode = str(context_cond_mode).strip().lower()
+        if self.context_cond_mode == "cross_attn":
+            print("[VoxelMamba] WARNING: 'cross_attn' mode is deprecated and unsupported. Automatically falling back to 'adaln' mode.")
+            self.context_cond_mode = "adaln"
+            
         self.context_use_arcface_only = bool(context_use_arcface_only)
         self.num_context_kv_tokens = int(num_context_kv_tokens)
         self.context_cross_attn_heads = int(context_cross_attn_heads)
@@ -443,9 +556,6 @@ class VoxelMamba(nn.Module):
             if self.context_use_arcface_only
             else int(context_dim)
         )
-        if self.context_cond_mode == "cross_attn":
-            num_context_tokens = 0
-            use_per_layer_context = False
         if context_segment_weights is not None:
             w = torch.tensor(context_segment_weights, dtype=torch.float32)
             self.register_buffer("_context_segment_weights", w, persistent=True)
@@ -547,25 +657,13 @@ class VoxelMamba(nn.Module):
             if num_guidance_tokens > 0 else None
         )
 
-        if self.context_cond_mode == "cross_attn":
-            self.context_cond_mlp = None
-            self.arcface_tokenizer = nn.Sequential(
-                nn.Linear(self._effective_arc_dim, hidden_dim * 2),
-                nn.SiLU(),
-                nn.Linear(hidden_dim * 2, hidden_dim * self.num_context_kv_tokens),
-            )
-            self.null_ctx_tokens = nn.Parameter(
-                torch.zeros(1, self.num_context_kv_tokens, hidden_dim),
-            )
-            nn.init.normal_(self.null_ctx_tokens, mean=0.0, std=0.02)
-        else:
-            self.arcface_tokenizer = None
-            self.null_ctx_tokens = None
-            self.context_cond_mlp = nn.Sequential(
-                nn.Linear(context_dim, hidden_dim),
-                nn.SiLU(),
-                nn.Linear(hidden_dim, hidden_dim),
-            )
+        self.arcface_tokenizer = None
+        self.null_ctx_tokens = None
+        self.context_cond_mlp = nn.Sequential(
+            nn.Linear(self._effective_arc_dim, hidden_dim),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+        )
         self._time_guidance_in_dim = 3 * self.time_embed_dim + 3
         self.time_guidance_mlp = nn.Sequential(
             nn.Linear(self._time_guidance_in_dim, hidden_dim),
@@ -603,17 +701,10 @@ class VoxelMamba(nn.Module):
                 ffn_expand=ffn_expand,
                 use_mamba=self.use_mamba,
                 use_ffn=use_ffn,
-                context_cond_mode=self.context_cond_mode,
-                cross_attn_heads=self.context_cross_attn_heads,
             )
             for _ in range(num_layers)
         ])
-        mode_label = (
-            f"cross_attn K={self.num_context_kv_tokens} arc_only"
-            if self.context_cond_mode == "cross_attn"
-            else "adaln"
-        )
-        print(f"[VoxelMamba] context_cond_mode={mode_label}")
+        print(f"[VoxelMamba] context_cond_mode=adaln")
         
         # Chuẩn hóa (norm) và phép chiếu (projection) cuối cùng
         self.output_norm = RMSNorm(hidden_dim)
@@ -672,8 +763,8 @@ class VoxelMamba(nn.Module):
         each signal reaches its target mechanism with full magnitude.
         
         Returns:
-            ctx_cond: [B, ctx_dim] — for cross-attention POST-Mamba
-            time_cond: [B, time_dim] — for AdaLN (scale, shift, gate) PRE-Mamba
+            ctx_cond: [B, ctx_dim] — for AdaLN conditioning
+            time_cond: [B, time_dim] — for AdaLN conditioning
         """
         t_emb = self.time_mlp(t)
         r_emb = self.r_mlp(r)
@@ -692,25 +783,8 @@ class VoxelMamba(nn.Module):
             return context[..., : self._effective_arc_dim]
         return self._scale_context_segments(context)
 
-    def _build_ctx_tokens(self, context: torch.Tensor) -> torch.Tensor:
-        arc = self._extract_context_input(context)
-        b = arc.shape[0]
-        flat = self.arcface_tokenizer(arc)
-        tokens = flat.view(b, self.num_context_kv_tokens, self.hidden_dim)
-        if self.null_ctx_tokens is not None:
-            is_null = arc.abs().sum(dim=-1) < 1e-4
-            if is_null.any():
-                null = self.null_ctx_tokens.expand(b, -1, -1).to(
-                    device=tokens.device, dtype=tokens.dtype,
-                )
-                mask = is_null.view(b, 1, 1)
-                tokens = torch.where(mask, null, tokens)
-        return tokens
-
-    def null_context_tokens(self, batch_size: int, device: torch.device) -> torch.Tensor:
-        if self.null_ctx_tokens is None:
-            raise RuntimeError("null_context_tokens only available in cross_attn mode")
-        return self.null_ctx_tokens.expand(batch_size, -1, -1).to(device)
+    # Note: Legacy cross_attn methods (_build_ctx_tokens, null_context_tokens) 
+    # were completely removed as cross-attention has been retired.
 
     def _scale_context_segments(self, context: torch.Tensor) -> torch.Tensor:
         """Nhân Arc/FLAME/DINO trước MLP — legacy adaln path."""
@@ -781,16 +855,10 @@ class VoxelMamba(nn.Module):
             h = torch.cat([h, prefix], dim=1)
 
         ctx_cond, time_cond = self._build_cond_emb(t, r, context, omega, cfg_tmin, cfg_tmax)
-        cross_ctx = None
-        if self.context_cond_mode == "cross_attn":
-            cross_ctx = self._build_ctx_tokens(context)
 
         for i, layer in enumerate(self.layers):
-            if cross_ctx is not None:
-                h = layer(h, time_cond, ctx_tokens=cross_ctx)
-            else:
-                ctx_l = self.ctx_layer_projs[i](ctx_cond) if self.ctx_layer_projs is not None else ctx_cond
-                h = layer(h, time_cond, ctx_cond=ctx_l)
+            ctx_l = self.ctx_layer_projs[i](ctx_cond) if self.ctx_layer_projs is not None else ctx_cond
+            h = layer(h, time_cond, ctx_cond=ctx_l)
 
         if self.total_prefix_tokens > 0:
             # Strip prefix tokens FROM END (not start)

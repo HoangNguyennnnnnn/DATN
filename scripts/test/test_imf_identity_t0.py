@@ -53,7 +53,12 @@ def _load_voxel_mamba_from_ckpt(
 def main():
     import argparse
     ap = argparse.ArgumentParser("iMF identity / conditioning test")
-    ap.add_argument("--ckpt", default="checkpoints/imf_unet_balanced/best.pt")
+    ap.add_argument(
+        "--ckpt",
+        "--checkpoint",
+        default="checkpoints/imf_v8_lite/latest_step.pt",
+        help="Path to iMF checkpoint (.pt)",
+    )
     ap.add_argument("--lmdb", default="data/slat_context_balanced.lmdb")
     ap.add_argument("--num-samples", type=int, default=8)
     ap.add_argument("--no-ema", action="store_true", help="Dùng model_state_dict thay EMA")
@@ -81,10 +86,14 @@ def main():
     if args.context_segment_weights is not None:
         mcfg = dict(mcfg)
         mcfg["context_segment_weights"] = tuple(args.context_segment_weights)
-    elif mcfg.get("context_segment_weights") is None:
+    elif mcfg.get("context_segment_weights") is None and not mcfg.get(
+        "context_use_arcface_only", True
+    ):
         mcfg = dict(mcfg)
         mcfg["context_segment_weights"] = (3.0, 2.0, 0.5)
         print("  [context] fallback segment weights (3, 2, 0.5) — ckpt chưa ghi config")
+    elif mcfg.get("context_use_arcface_only", True):
+        print("  [context] arcface_only=True (v8 lite) — không dùng segment weights")
 
     ckpt_for_load = dict(ckpt)
     ckpt_for_load["stage2_model_config"] = mcfg

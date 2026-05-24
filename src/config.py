@@ -219,17 +219,17 @@ class IMFConfig:
     voxel_mamba_backend: str = "auto"    # auto|mamba|gru
     voxel_mamba_strict: bool = False     # Bằng True -> báo lỗi nếu yêu cầu mamba backend nhưng không khả dụng
     mamba_hidden_dim: int = 512          # Chiều ẩn cho các khối Mamba
-    mamba_num_layers: int = 12           # Số lượng khối BidirectionalMambaBlocks
+    mamba_num_layers: int = 8            # Lite 8L (train_imf_v8.sh); full 12L nếu cần
     mamba_d_state: int = 16              # Số chiều trạng thái SSM
     mamba_d_conv: int = 4                # Kích thước hạt nhân tích chập (kernel size)
     mamba_expand: int = 2                # Hệ số mở rộng SSM
     mamba_ffn_expand: int = 4            # FFN hidden = dim × expand (lite: 2)
-    # v8: cross-attn ArcFace; không prefix context (time/r/interval/guidance giữ nguyên).
-    context_cond_mode: str = "cross_attn"       # cross_attn | adaln (legacy v7)
-    context_use_arcface_only: bool = True       # Chỉ [:512] ArcFace; FLAME/DINO không vào model
-    mamba_num_context_kv_tokens: int = 8        # K tokens cho cross-attn K/V
+    # v8 lite: DiM-3D AdaLN + full 946-d hybrid context
+    context_cond_mode: str = "adaln"            # cross_attn | adaln
+    context_use_arcface_only: bool = False      # True = chỉ ArcFace; False = full 946-d
+    mamba_num_context_kv_tokens: int = 8        # cross-attn only
     mamba_context_cross_attn_heads: int = 8
-    mamba_num_context_tokens: int = 0           # prefix context tắt (v8)
+    mamba_num_context_tokens: int = 0
     mamba_num_time_tokens: int = 4
     mamba_num_r_tokens: int = 4
     mamba_num_interval_tokens: int = 4
@@ -252,8 +252,8 @@ class IMFConfig:
     pin_memory: bool = True              # Tăng tốc GPU transfer
     
     # Huấn luyện (Tối ưu hóa cho kiến trúc được mở rộng quy mô)
-    batch_size: int = 16               # Micro-batch trên GPU (giảm cho 17GB VRAM)
-    gradient_accumulation_steps: int = 4  # Effective batch = batch_size × grad_accum = 64
+    batch_size: int = 2                # 4090 24GB: 2×16 effective 32 with CFG+JVP
+    gradient_accumulation_steps: int = 16
     num_epochs: int = 400              # Khuyên dùng Early stopping (giám sát mất mát trên tập xác thực)
     learning_rate: float = 1e-4        # Paper iMF Table 4: lr=0.0001. train_imf.sh cũng override 1e-4.
     weight_decay: float = 0.0          # Paper Table 4: weight_decay=0
@@ -268,7 +268,7 @@ class IMFConfig:
     t_scale: float = 1.0              # Tỉ lệ logit-normal
     curriculum_switch_ratio: float = 0.3   # Compromise 0.6→0.3 (17/05): switch ở 30% (epoch 120) — balance giữa boundary stability và 1-step learning
     curriculum_uniform_prob: float = 0.8   # Xác suất chọn giá trị đồng đều ở Giai đoạn 2 của tiến trình
-    cfg_conditioning_enable: bool = False   # Phase A: tắt CFG guidance (ω); bật Phase B (train_imf_v8_phaseB_cfg.sh)
+    cfg_conditioning_enable: bool = True    # Paper imeanflow: CFG on from start (train_imf_v8.sh)
     
     # iMF v5.0: v-loss cùng với khối phụ trợ v-head (Chỉ số cải thiện lợi nhuận ROI cao)
     use_v_loss: bool = True              # Dùng v-loss thay vì u-loss (huấn luyện ổn định hơn)
@@ -276,21 +276,25 @@ class IMFConfig:
     v_head_dim: int = 512               # Chiều ẩn cho khối phụ trợ v-head
     v_head_depth: int = 8                # Paper Table 4: aux-head depth = 8 (cũ: 2-layer MLP)
     v_head_mlp_ratio: int = 4            # MLP expansion ratio trong v-head block
-    v_loss_weight: float = 0.5           # 2026-05-21: 1.0 → 0.5 (rollback). 1.0 caused gradient conflict between main velocity loss and v-head, leading to +44% loss jump at resume and persistent plateau.
+    v_loss_weight: float = 1.0           # Paper imeanflow: loss_u + loss_v (equal weight)
     # Contrastive auxiliary loss (2026-05-20): force hidden state to encode context.
     # InfoNCE on (pooled_hidden → predicted_ctx) vs (true context).
-    contrastive_loss_weight: float = 0.0   # Phase A: off. Enable 0.2 sau khi main loss converge.
-    context_velocity_sep_weight: float = 0.1   # v8: nhẹ — ép u phụ thuộc ctx, tránh overfit identity
+    contrastive_loss_weight: float = 0.2   # train_imf_v8.sh
+    context_velocity_sep_weight: float = 0.1   # shuffle-ctx separation (extra forwards)
     context_velocity_sep_margin: float = 0.0   # penalize cos > 0
     contrastive_temperature: float = 0.1 # InfoNCE temperature
     contrastive_mode: str = "arcface"  # "arcface" | "flame" | "full" — audit: Arc margin tốt, DINO/FLAME yếu
     context_segment_weights: Optional[tuple] = None  # v8 arc-only: không dùng segment weights
     cfg_omega_min: float = 1.0              # Cận dưới thang điều hướng (1.0 = không điều hướng)
-    cfg_omega_max: float = 8.0              # Cận trên thang điều hướng
+    cfg_omega_max: float = 7.0              # Paper imeanflow default s_max=7
     cfg_omega_power_beta: float = 1.0       # Giá trị beta hàm lũy thừa cho p(omega) ~ omega^-beta
     cfg_context_dropout: float = 0.1        # Phase A+B: zero ArcFace → null_ctx_tokens (độc lập cfg_conditioning_enable)
     cfg_interval_conditioning: bool = True  # Điều kiện hóa trên đoạn [tmin, tmax] giống trong phụ lục iMF
     adaptive_loss_weighting: bool = True    # Paper Appendix A: adaptive weighting cho main + v-head loss
+    paper_strict_tr: bool = False           # imeanflow sample_tr (env IMEFLOW_PAPER_STRICT=1)
+    adaptive_loss_mode: str = "ema"         # "ema" | "paper" (env IMEFLOW_ADAPTIVE=paper)
+    norm_p: float = 1.0                     # imeanflow default.py
+    norm_eps: float = 0.01
     ema_decay: float = 0.9999          # Paper Table 4: ema_decay = 0.9999
     use_ema: bool = True               # EMA cải thiện chất lượng lấy mẫu
     dropout: float = 0.0               # Paper Table 4: dropout = 0

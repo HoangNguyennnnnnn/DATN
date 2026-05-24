@@ -139,6 +139,10 @@ class ImprovedMeanFlow:
         cfg_omega_power_beta: float = 1.0,
         enable_cfg_interval_conditioning: bool = True,
         adaptive_loss_weighting: bool = True,
+        paper_strict_tr: bool = False,
+        adaptive_loss_mode: str = "ema",
+        norm_p: float = 1.0,
+        norm_eps: float = 0.01,
     ):
         """
         Tham số:
@@ -171,6 +175,10 @@ class ImprovedMeanFlow:
         # Maintains running EMA of per-timestep-bin loss to normalize
         # contributions, preventing high-variance bins from dominating.
         self.adaptive_loss_weighting = adaptive_loss_weighting
+        self.paper_strict_tr = bool(paper_strict_tr)
+        self.adaptive_loss_mode = str(adaptive_loss_mode).strip().lower()
+        self.norm_p = float(norm_p)
+        self.norm_eps = float(norm_eps)
         self._num_bins = 100  # discretize t into 100 bins
         self._loss_ema_decay = 0.99
         # Running EMA of loss per bin, initialized to 1.0 (neutral weight)
@@ -231,10 +239,28 @@ class ImprovedMeanFlow:
             t = torch.sigmoid(u)
         return t
     
+    def _sample_t_r_imeanflow(self, batch_size: int, device: torch.device) -> Tuple[torch.Tensor, torch.Tensor]:
+        """(t,r) như repo imeanflow: logit-normal, r≤t, batch-index 50% r=t."""
+        t = self._sample_t(batch_size, device).clamp(self.sigma_min, 1.0 - self.sigma_min)
+        r = self._sample_t(batch_size, device).clamp(0.0, 1.0 - self.sigma_min)
+        t, r = torch.maximum(t, r), torch.minimum(t, r)
+        n_fm = int(batch_size * (1.0 - self.ratio_r_neq_t))
+        if n_fm > 0:
+            fm_mask = torch.arange(batch_size, device=device) < n_fm
+            r = torch.where(fm_mask, t, r)
+        return t, r
+
     def _sample_t_r(self, batch_size: int, device: torch.device) -> Tuple[torch.Tensor, torch.Tensor]:
         """Sample (t, r) pairs theo paper convention r ≤ t.
 
         Paper Geng et al. 2512.02012v1 — Tab. 4 ratio of r≠t = 50%.
+        If paper_strict_tr: imeanflow sample_tr (no 15%/5% FaceDiff extras).
+        """
+        if self.paper_strict_tr:
+            return self._sample_t_r_imeanflow(batch_size, device)
+
+        """
+        FaceDiff extended sampling (legacy):
 
         2026-05-21 v3 FIX: Two injection strategies for t≈1 coverage:
 
@@ -410,6 +436,37 @@ class ImprovedMeanFlow:
         )
         self._loss_counts = self._loss_counts + bin_cnt.to(self._loss_counts.dtype)
 
+    def _reduce_adaptive_loss(
+        self,
+        per_sample: torch.Tensor,
+        t: torch.Tensor,
+        per_sample_aux: Optional[torch.Tensor] = None,
+        aux_weight: float = 0.0,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Gộp per-sample loss + adaptive (EMA bin hoặc imeanflow loss/(loss+ε)^p)."""
+        if not self.adaptive_loss_weighting:
+            loss = per_sample.mean()
+            if per_sample_aux is not None and aux_weight > 0:
+                loss = loss + float(aux_weight) * per_sample_aux.mean()
+            return loss, per_sample.new_ones(())
+
+        if self.adaptive_loss_mode == "paper":
+            denom = (per_sample.detach() + self.norm_eps).pow(self.norm_p)
+            loss = (per_sample / denom).mean()
+            scale = denom.mean()
+            if per_sample_aux is not None and aux_weight > 0:
+                denom_v = (per_sample_aux.detach() + self.norm_eps).pow(self.norm_p)
+                loss = loss + float(aux_weight) * (per_sample_aux / denom_v).mean()
+            return loss, scale.detach()
+
+        with torch.no_grad():
+            self._update_adaptive_ema(t, per_sample.detach())
+        w = self._get_adaptive_weights(t).detach()
+        loss = (per_sample * w).mean()
+        if per_sample_aux is not None and aux_weight > 0:
+            loss = loss + float(aux_weight) * (per_sample_aux * w).mean()
+        return loss, w.mean()
+
     def _compute_dudt_jvp(
         self,
         model: nn.Module,
@@ -559,6 +616,7 @@ class ImprovedMeanFlow:
 
         context_cond = context
         cfg_context_keep_ratio = torch.ones((), device=device)
+        context_dropped = None  # [B] bool — official iMF cond_drop on v_g
         # Phase A: dropout ngữ cảnh (ArcFace→0 → null_ctx_tokens) KHÔNG phụ thuộc cfg_enabled.
         # Nếu chỉ bật dropout ở Phase B, backbone không học u_uncond → CFG sụp.
         drop_prob = float(max(0.0, min(1.0, cfg_context_dropout)))
@@ -566,60 +624,31 @@ class ImprovedMeanFlow:
             keep_mask = (torch.rand((b, 1), device=device) >= drop_prob).to(dtype=context.dtype)
             context_cond = context * keep_mask
             cfg_context_keep_ratio = keep_mask.mean()
+            context_dropped = keep_mask.squeeze(-1) < 0.5
         
         # Bước 4: Mục tiêu vận tốc có điều kiện
-        # VRAM-optimal CFG: Tách thành 2 forward passes riêng biệt thay vì batch doubling.
-        # Paper iMF (Alg.2) dùng v_c, v_u riêng rồi stopgrad cả hai → không cần lưu activations.
-        # - Conditional pass: CÓ gradient (cho v-head backprop qua _cached_hidden)
-        # - Unconditional pass: KHÔNG gradient (v_uncond luôn bị .detach())
-        # Tiết kiệm ~50% activation memory so với batch doubling.
         _want_hidden = (
             (v_head is not None or (ctx_classifier is not None and float(contrastive_loss_weight) > 0.0))
             and hasattr(model, 'get_hidden_state')
         )
-        if cfg_enabled:
-            _fwd_kwargs_cond = dict(
-                r=t, omega=omega_effective,
-                cfg_tmin=cfg_tmin, cfg_tmax=cfg_tmax,
-            )
-            if _want_hidden:
-                _fwd_kwargs_cond['return_hidden'] = True
-
-            # Forward #1: Conditional (CÓ gradient — cần cho v-head)
-            _fwd_out_cond = model(z_t, t, context_cond, **_fwd_kwargs_cond)
-
-            if _want_hidden and isinstance(_fwd_out_cond, tuple):
-                v_theta, _cached_hidden = _fwd_out_cond
-            else:
-                v_theta = _fwd_out_cond
-                _cached_hidden = None
-
-            # Forward #2: Unconditional (KHÔNG gradient — v_uncond luôn .detach())
-            with torch.no_grad():
-                v_uncond = model(
-                    z_t, t, torch.zeros_like(context_cond),
-                    r=t, omega=omega_effective,
-                    cfg_tmin=cfg_tmin, cfg_tmax=cfg_tmax,
-                )
-
-            coeff = (1.0 - (1.0 / omega_effective.clamp_min(1.0))).view(-1, *([1] * (x_data.ndim - 1)))
-            v_target = (e - x_data) + coeff * (v_theta.detach() - v_uncond.detach())
+        
+        _fwd_kwargs = dict(
+            r=t, omega=omega_effective, cfg_tmin=cfg_tmin, cfg_tmax=cfg_tmax,
+        )
+        if _want_hidden:
+            _fwd_kwargs['return_hidden'] = True
+        
+        _fwd_out = model(z_t, t, context_cond, **_fwd_kwargs)
+        
+        if _want_hidden and isinstance(_fwd_out, tuple):
+            v_theta, _cached_hidden = _fwd_out
         else:
-            _fwd_kwargs = dict(
-                r=t, omega=omega_effective, cfg_tmin=cfg_tmin, cfg_tmax=cfg_tmax,
-            )
-            if _want_hidden:
-                _fwd_kwargs['return_hidden'] = True
-            
-            _fwd_out = model(z_t, t, context_cond, **_fwd_kwargs)
-            
-            if _want_hidden and isinstance(_fwd_out, tuple):
-                v_theta, _cached_hidden = _fwd_out
-            else:
-                v_theta = _fwd_out
-                _cached_hidden = None
-            
-            v_target = e - x_data  # [B, L, D]
+            v_theta = _fwd_out
+            _cached_hidden = None
+        
+        # Sửa lỗi: Hàm mục tiêu là luồng trung bình e - x_data
+        # Không phụ thuộc vào v_theta.detach() để tránh vòng lặp tự dạy luẩn quẩn
+        v_target = e - x_data  # [B, L, D]
         
         # Mục tiêu khớp luồng thô (Raw flow matching target) (e - x), độc lập với tăng cường CFG.
         # Được sử dụng cho việc giám sát v-head phụ trợ theo Phụ lục A của bài báo iMF:
@@ -737,12 +766,12 @@ class ImprovedMeanFlow:
             per_sample_boundary = self._per_sample_weighted_mse(
                 v_theta, v_target_loss, channel_weights, position_weights
             )
-            with torch.no_grad():
-                self._update_adaptive_ema(t, per_sample_boundary.detach())
-            adaptive_w = self._get_adaptive_weights(t).detach()
-            loss = (per_sample_boundary * adaptive_w).mean()
-            if v_head is not None and per_sample_v_head is not None:
-                loss = loss + float(v_loss_weight) * (per_sample_v_head * adaptive_w).mean()
+            loss, adaptive_w = self._reduce_adaptive_loss(
+                per_sample_boundary,
+                t,
+                per_sample_v_head,
+                float(v_loss_weight) if v_head is not None else 0.0,
+            )
             if contrastive_loss_weight > 0.0:
                 loss = loss + float(contrastive_loss_weight) * loss_contrastive
             if float(context_velocity_sep_weight) > 0.0:
@@ -857,15 +886,12 @@ class ImprovedMeanFlow:
         if (~mask_eq).any():
             per_sample_raw[~mask_eq] = per_sample_jvp
 
-        with torch.no_grad():
-            self._update_adaptive_ema(t, per_sample_raw.detach())
-
-        adaptive_w = self._get_adaptive_weights(t).detach()
-        loss = (per_sample_raw * adaptive_w).mean()
-        adaptive_scale = adaptive_w.mean()
-        
-        if v_head is not None and per_sample_v_head is not None:
-            loss = loss + float(v_loss_weight) * (per_sample_v_head * adaptive_w).mean()
+        loss, adaptive_scale = self._reduce_adaptive_loss(
+            per_sample_raw,
+            t,
+            per_sample_v_head,
+            float(v_loss_weight) if v_head is not None else 0.0,
+        )
         if contrastive_loss_weight > 0.0:
             loss = loss + float(contrastive_loss_weight) * loss_contrastive
         if float(context_velocity_sep_weight) > 0.0:

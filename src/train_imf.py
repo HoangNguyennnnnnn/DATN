@@ -38,6 +38,8 @@ from torch.utils.data import DataLoader, Dataset
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
 torch.backends.cudnn.benchmark = True
+if hasattr(torch, "set_float32_matmul_precision"):
+    torch.set_float32_matmul_precision("high")
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -108,9 +110,12 @@ class EMA:
         return {k: v.clone() for k, v in self.shadow.items()}
     
     def load_state_dict(self, state_dict, device=None):
-        self.shadow = {k: v.clone() for k, v in state_dict.items()}
-        if device is not None:
-            self.shadow = {k: v.to(device) for k, v in self.shadow.items()}
+        # Merge (don't replace) so new params e.g. context_gate keep init shadow.
+        for k, v in state_dict.items():
+            t = v.clone()
+            if device is not None:
+                t = t.to(device)
+            self.shadow[k] = t
 
 
 # ============================================================
@@ -129,6 +134,23 @@ class SlatDataset(Dataset):
     """
     CACHE_SCHEMA_VERSION = 3
     _lmdb_env_cache: dict[str, object] = {}  # class-level: share envs across instances
+
+    @classmethod
+    def _open_lmdb_env(cls, lmdb_dir: str):
+        """One LMDB env per path per process (FaceVerse + FaceScape share slat LMDB)."""
+        import lmdb
+
+        abs_dir = os.path.abspath(lmdb_dir)
+        if abs_dir not in cls._lmdb_env_cache:
+            cls._lmdb_env_cache[abs_dir] = lmdb.open(
+                abs_dir,
+                readonly=True,
+                lock=False,
+                readahead=True,
+                meminit=False,
+                max_readers=512,
+            )
+        return cls._lmdb_env_cache[abs_dir]
 
     def __init__(self, data_root: str, sc_vae: SC_VAE,
                  dataset_name: str,
@@ -186,6 +208,7 @@ class SlatDataset(Dataset):
         self.allow_mesh_proxy_fallback = bool(allow_mesh_proxy_fallback)
         self.ovoxel_converter = None
         self.samples = []
+        self.parent_pid = os.getpid()
 
         # LMDB cho Hybrid Context (Offline mode)
         self.context_lmdb_dir = context_lmdb_dir
@@ -193,20 +216,7 @@ class SlatDataset(Dataset):
         self.context_lmdb_txn = None
 
         if self.context_lmdb_dir and os.path.isdir(self.context_lmdb_dir):
-            import lmdb
-            abs_dir = os.path.abspath(self.context_lmdb_dir)
-            if abs_dir in SlatDataset._lmdb_env_cache:
-                self.context_lmdb_env = SlatDataset._lmdb_env_cache[abs_dir]
-            else:
-                self.context_lmdb_env = lmdb.open(
-                    self.context_lmdb_dir,
-                    readonly=True,
-                    lock=False,
-                    readahead=True,
-                    meminit=False,
-                    max_readers=512,
-                )
-                SlatDataset._lmdb_env_cache[abs_dir] = self.context_lmdb_env
+            self.context_lmdb_env = self._open_lmdb_env(self.context_lmdb_dir)
             self.context_lmdb_txn = self.context_lmdb_env.begin(write=False)
             print(f"[SlatDataset] Connected to Hybrid Context LMDB: {self.context_lmdb_dir}")
 
@@ -219,20 +229,7 @@ class SlatDataset(Dataset):
         self.ovoxel_lmdb_max_voxels = int(ovoxel_lmdb_max_voxels)
 
         if self.ovoxel_lmdb_dir and os.path.isdir(self.ovoxel_lmdb_dir):
-            import lmdb
-            abs_dir = os.path.abspath(self.ovoxel_lmdb_dir)
-            if abs_dir in SlatDataset._lmdb_env_cache:
-                self.ovoxel_lmdb_env = SlatDataset._lmdb_env_cache[abs_dir]
-            else:
-                self.ovoxel_lmdb_env = lmdb.open(
-                    self.ovoxel_lmdb_dir,
-                    readonly=True,
-                    lock=False,
-                    readahead=True,
-                    meminit=False,
-                    max_readers=512,
-                )
-                SlatDataset._lmdb_env_cache[abs_dir] = self.ovoxel_lmdb_env
+            self.ovoxel_lmdb_env = self._open_lmdb_env(self.ovoxel_lmdb_dir)
             self.ovoxel_lmdb_txn = self.ovoxel_lmdb_env.begin(write=False)
             print(f"[SlatDataset] Connected to O-Voxel LMDB: {self.ovoxel_lmdb_dir}")
 
@@ -242,20 +239,7 @@ class SlatDataset(Dataset):
         self.slat_lmdb_txn = None
 
         if self.slat_lmdb_dir and os.path.isdir(self.slat_lmdb_dir):
-            import lmdb as _lmdb
-            abs_dir = os.path.abspath(self.slat_lmdb_dir)
-            if abs_dir in SlatDataset._lmdb_env_cache:
-                self.slat_lmdb_env = SlatDataset._lmdb_env_cache[abs_dir]
-            else:
-                self.slat_lmdb_env = _lmdb.open(
-                    self.slat_lmdb_dir,
-                    readonly=True,
-                    lock=False,
-                    readahead=True,
-                    meminit=False,
-                    max_readers=512,
-                )
-                SlatDataset._lmdb_env_cache[abs_dir] = self.slat_lmdb_env
+            self.slat_lmdb_env = self._open_lmdb_env(self.slat_lmdb_dir)
             self.slat_lmdb_txn = self.slat_lmdb_env.begin(write=False)
             print(f"[SlatDataset] Connected to Slat+Context LMDB: {self.slat_lmdb_dir}")
 
@@ -435,8 +419,21 @@ class SlatDataset(Dataset):
         context = torch.randn(self.context_dim)
         return torch.nn.functional.normalize(context, p=2, dim=-1)
 
+    def _check_and_init_lmdb_workers(self):
+        """Đảm bảo các tiến trình con (dataloader workers) tự khởi tạo lại LMDB transactions riêng biệt."""
+        current_pid = os.getpid()
+        if current_pid != getattr(self, "_last_initialized_pid", self.parent_pid):
+            self._last_initialized_pid = current_pid
+            self.slat_lmdb_txn = None
+            self.context_lmdb_txn = None
+            self.ovoxel_lmdb_txn = None
+            self.slat_lmdb_env = None
+            self.context_lmdb_env = None
+            self.ovoxel_lmdb_env = None
+
     @torch.no_grad()
     def __getitem__(self, idx: int):
+        self._check_and_init_lmdb_workers()
         obj_path = self.samples[idx]
 
         # Tạo tên bộ đệm chống trùng lặp (vd: id125_1_neutral.pt)
@@ -449,14 +446,7 @@ class SlatDataset(Dataset):
         # Priority 0: Merged slat+context LMDB (fastest path, cache_tag-independent)
         # Lazy re-open txn in forked DataLoader workers (LMDB txns don't survive fork)
         if self.slat_lmdb_dir and self.slat_lmdb_txn is None:
-            import lmdb as _lmdb
-            abs_dir = os.path.abspath(self.slat_lmdb_dir)
-            if abs_dir not in SlatDataset._lmdb_env_cache:
-                SlatDataset._lmdb_env_cache[abs_dir] = _lmdb.open(
-                    self.slat_lmdb_dir, readonly=True, lock=False,
-                    readahead=True, meminit=False, max_readers=512,
-                )
-            self.slat_lmdb_env = SlatDataset._lmdb_env_cache[abs_dir]
+            self.slat_lmdb_env = self._open_lmdb_env(self.slat_lmdb_dir)
             self.slat_lmdb_txn = self.slat_lmdb_env.begin(write=False)
         if self.slat_lmdb_txn is not None:
             lmdb_key = f"{self.dataset_name}/{rel_path}".encode("utf-8")
@@ -504,15 +494,20 @@ class SlatDataset(Dataset):
         slat, context = self._encode_mesh(obj_path)
 
         # Nếu context trả về None (do offline mode), thử lấy từ LMDB
-        if context is None and self.context_lmdb_txn is not None:
-            rel_path_portable = os.path.relpath(obj_path, self.data_root)
-            key = f"{self.dataset_name}/{rel_path_portable}".encode('utf-8')
-            context_data = self.context_lmdb_txn.get(key)
-            if context_data is not None:
-                import io
-                context = torch.load(io.BytesIO(context_data), map_location="cpu", weights_only=False).float()
-                if context.ndim == 0:
-                    context = context.unsqueeze(0)
+        if context is None and self.context_lmdb_dir:
+            if self.context_lmdb_txn is None:
+                self.context_lmdb_env = self._open_lmdb_env(self.context_lmdb_dir)
+                self.context_lmdb_txn = self.context_lmdb_env.begin(write=False)
+            
+            if self.context_lmdb_txn is not None:
+                rel_path_portable = os.path.relpath(obj_path, self.data_root)
+                key = f"{self.dataset_name}/{rel_path_portable}".encode('utf-8')
+                context_data = self.context_lmdb_txn.get(key)
+                if context_data is not None:
+                    import io
+                    context = torch.load(io.BytesIO(context_data), map_location="cpu", weights_only=False).float()
+                    if context.ndim == 0:
+                        context = context.unsqueeze(0)
 
         if context is None:
             context = self._make_random_context(f"Context not found in LMDB or Extractor for {obj_path}")
@@ -595,6 +590,15 @@ class SlatDataset(Dataset):
 
     def _try_load_ovoxel_from_lmdb(self, obj_path: str):
         """Thử đọc O-Voxel payload từ LMDB. Trả về (features, coords) hoặc None."""
+        self._check_and_init_lmdb_workers()
+        if self.ovoxel_lmdb_dir and self.ovoxel_lmdb_txn is None:
+            import lmdb as _lmdb
+            self.ovoxel_lmdb_env = _lmdb.open(
+                self.ovoxel_lmdb_dir, readonly=True, lock=False,
+                readahead=True, meminit=False, max_readers=512,
+            )
+            self.ovoxel_lmdb_txn = self.ovoxel_lmdb_env.begin(write=False)
+            
         if self.ovoxel_lmdb_txn is None:
             return None
         key = self._ovoxel_lmdb_key(obj_path)
@@ -816,7 +820,7 @@ def _build_stage2_model_config(model: nn.Module, imf_cfg, model_input_dim: int) 
         "d_state": int(getattr(imf_cfg, "mamba_d_state", 16)),
         "d_conv": int(getattr(imf_cfg, "mamba_d_conv", 4)),
         "expand": int(getattr(imf_cfg, "mamba_expand", 2)),
-        "ffn_expand": int(getattr(imf_cfg, "mamba_ffn_expand", 4)),
+        
         "dropout": float(getattr(imf_cfg, "dropout", 0.0)),
         "context_segment_weights": getattr(imf_cfg, "context_segment_weights", None),
     }
@@ -876,7 +880,16 @@ def load_checkpoint(
     ctx_classifier=None,
 ):
     ckpt = torch.load(path, map_location="cpu", weights_only=False)
-    model.load_state_dict(ckpt['model_state_dict'])
+    missing, unexpected = model.load_state_dict(ckpt['model_state_dict'], strict=False)
+    if missing:
+        gate_miss = [k for k in missing if "context_gate" in k]
+        if gate_miss:
+            print(f"  [Resume] New context_gate params ({len(gate_miss)}), default init=1.0")
+        other = [k for k in missing if "context_gate" not in k]
+        if other:
+            print(f"  [Resume] Missing keys ({len(other)}): {other[:5]}{'...' if len(other) > 5 else ''}")
+    if unexpected:
+        print(f"  [Resume] Unexpected keys ({len(unexpected)}): {unexpected[:3]}...")
     downgrade_reasons = []
 
     ckpt_v_head_state = ckpt.get('v_head_state_dict')
@@ -1259,6 +1272,15 @@ def train_imf(
     else:
         print("\n[4.5/5] Skipping torch.compile (mamba-ssm CUDA kernels không tương thích)")
     
+    _paper_strict = os.environ.get("IMEFLOW_PAPER_STRICT", "").strip().lower() in ("1", "true", "yes")
+    if not _paper_strict:
+        _paper_strict = bool(getattr(imf_cfg, "paper_strict_tr", False))
+    _adaptive_mode = os.environ.get("IMEFLOW_ADAPTIVE", "").strip().lower()
+    if _adaptive_mode not in ("paper", "ema"):
+        _adaptive_mode = str(getattr(imf_cfg, "adaptive_loss_mode", "ema")).strip().lower()
+    if _adaptive_mode not in ("paper", "ema"):
+        _adaptive_mode = "ema"
+
     imf = ImprovedMeanFlow(
         sigma_min=imf_cfg.sigma_min,
         ratio_r_neq_t=imf_cfg.ratio_r_neq_t,
@@ -1272,7 +1294,12 @@ def train_imf(
         cfg_omega_power_beta=float(getattr(imf_cfg, "cfg_omega_power_beta", 1.0)),
         enable_cfg_interval_conditioning=bool(getattr(imf_cfg, "cfg_interval_conditioning", True)),
         adaptive_loss_weighting=bool(getattr(imf_cfg, "adaptive_loss_weighting", True)),
+        paper_strict_tr=_paper_strict,
+        adaptive_loss_mode=_adaptive_mode,
+        norm_p=float(getattr(imf_cfg, "norm_p", 1.0)),
+        norm_eps=float(getattr(imf_cfg, "norm_eps", 0.01)),
     )
+    print(f"  [iMF] paper_strict_tr={_paper_strict}  adaptive_loss_mode={_adaptive_mode}")
     
     # ---- Auxiliary v-head (for v-loss) — Paper iMF Table 4: depth=8 ----
     v_head = None
@@ -1349,22 +1376,42 @@ def train_imf(
         "betas": (0.9, 0.95),
     }
     
-    # Thu thập tất cả các tham số (Collect all parameters)
-    all_params = list(model.parameters())
+    # Thu thập params với separate LR cho cross_attn.proj (kick-start zero-init gate).
+    # 2026-05-23: v8 lite ep5 inspection cho thấy cross_attn.proj.weight = 0.114
+    # (vs init 0, expected ~7 nếu fully trained) → cross-attn output bị block ở residual.
+    # Bơm LR 50× để gate mở nhanh hơn, tránh Mean Face Trap (Mamba hội tụ về avg face).
+    proj_boost_mult = float(os.environ.get("CROSS_ATTN_PROJ_LR_MULT", "1.0"))
+    proj_params, base_params = [], []
+    for name, p in model.named_parameters():
+        if "cross_attn.proj" in name:
+            proj_params.append(p)
+        else:
+            base_params.append(p)
     if v_head is not None:
-        all_params.extend(list(v_head.parameters()))
+        base_params.extend(list(v_head.parameters()))
     if ctx_classifier is not None:
-        all_params.extend(list(ctx_classifier.parameters()))
-    
+        base_params.extend(list(ctx_classifier.parameters()))
+
+    if proj_boost_mult != 1.0 and len(proj_params) > 0:
+        param_groups = [
+            {'params': base_params, 'lr': imf_cfg.learning_rate, 'name': 'base'},
+            {'params': proj_params, 'lr': imf_cfg.learning_rate * proj_boost_mult, 'name': 'cross_attn_proj'},
+        ]
+        print(f"  Optimizer: Split param groups — base LR={imf_cfg.learning_rate:.1e}, "
+              f"cross_attn.proj LR={imf_cfg.learning_rate * proj_boost_mult:.1e} ({proj_boost_mult}× boost, {len(proj_params)} tensors)")
+        optimizer_input = param_groups
+    else:
+        optimizer_input = base_params + proj_params
+
     if device.type == "cuda":
         try:
-            optimizer = torch.optim.AdamW(all_params, fused=True, **adamw_kwargs)
+            optimizer = torch.optim.AdamW(optimizer_input, fused=True, **adamw_kwargs)
             print("  Optimizer: AdamW (fused=True)")
         except Exception:
-            optimizer = torch.optim.AdamW(all_params, **adamw_kwargs)
+            optimizer = torch.optim.AdamW(optimizer_input, **adamw_kwargs)
             print("  Optimizer: AdamW (fused unavailable -> fallback)")
     else:
-        optimizer = torch.optim.AdamW(all_params, **adamw_kwargs)
+        optimizer = torch.optim.AdamW(optimizer_input, **adamw_kwargs)
     scheduler = get_lr_scheduler(optimizer, imf_cfg, len(dataloader))
     scaler = torch.amp.GradScaler('cuda', enabled=imf_cfg.use_amp)
     grad_accum_steps = max(1, int(getattr(imf_cfg, "gradient_accumulation_steps", 1)))
@@ -1394,6 +1441,24 @@ def train_imf(
             global_step = int(ckpt_info["global_step"])
         else:
             global_step = start_epoch * len(dataloader)
+
+        # Stabilize cross_attn.proj after LR-boost blow-up; gate controls residual strength.
+        from src.cross_attn_utils import cross_attn_proj_stats, renormalize_cross_attn_proj_weights
+
+        proj_max_norm = float(os.environ.get("CROSS_ATTN_PROJ_MAX_NORM", "1.0"))
+        before = cross_attn_proj_stats(model)
+        if before["count"] > 0:
+            print(
+                f"  [cross_attn] proj L2 before renorm: mean={before['mean']:.2f} "
+                f"max={before['max']:.2f}"
+            )
+        n_clip = renormalize_cross_attn_proj_weights(model, max_norm=proj_max_norm)
+        if n_clip > 0:
+            after = cross_attn_proj_stats(model)
+            print(
+                f"  [cross_attn] Renormalized {n_clip} proj tensors to max_norm={proj_max_norm:.2f} "
+                f"(now mean={after['mean']:.2f} max={after['max']:.2f})"
+            )
     else:
         global_step = start_epoch * len(dataloader)
     
@@ -1494,7 +1559,7 @@ def train_imf(
             if not is_accum_step or (batch_idx + 1) == len(dataloader):
                 if imf_cfg.grad_clip > 0:
                     scaler.unscale_(optimizer)
-                    torch.nn.utils.clip_grad_norm_(all_params, imf_cfg.grad_clip)
+                    torch.nn.utils.clip_grad_norm_(base_params + proj_params, imf_cfg.grad_clip)
 
                 scaler.step(optimizer)
                 scaler.update()
@@ -1674,6 +1739,8 @@ def main():
     parser.add_argument("--cfg-omega-beta", type=float, default=None, help="Power-law beta for sampling omega with p(omega)~omega^-beta.")
     parser.add_argument("--cfg-context-dropout", type=float, default=None, help="Context dropout ratio for conditional branch during CFG-conditioning training.")
     parser.add_argument("--disable-cfg-interval-conditioning", action="store_true", help="Disable interval conditioning on [tmin, tmax].")
+    parser.add_argument("--context-cond-mode", type=str, default=None, choices=["cross_attn", "adaln"], help="Conditioning mode: cross_attn or adaln")
+    parser.add_argument("--context-use-all", action="store_true", help="Use full 946-d hybrid context (ArcFace + FLAME + DINOv2)")
     parser.add_argument("--epochs", type=int, default=None, help="Override num_epochs")
     parser.add_argument("--batch-size", type=int, default=None, help="Override batch_size (micro-batch per GPU)")
     parser.add_argument("--gradient-accumulation-steps", type=int, default=None, help="Gradient accumulation steps (effective_batch = batch_size × this)")
@@ -1687,9 +1754,11 @@ def main():
     parser.add_argument("--context-velocity-sep-margin", type=float, default=None,
                         help="Margin for context sep loss (penalize cos above this).")
     parser.add_argument("--ratio-r-neq-t", type=float, default=None, help="Fraction of batches with r≠t (JVP). 0.5 = paper default.")
+    parser.add_argument("--v-loss-weight", type=float, default=None, help="Auxiliary v-head loss weight (paper uses 1.0; default config 0.5).")
     parser.add_argument("--mamba-num-layers", type=int, default=None, help="BidirectionalMambaBlock count (lite: 8)")
     parser.add_argument("--mamba-ffn-expand", type=int, default=None, help="FFN expansion per block (lite: 2, default: 4)")
-    parser.add_argument("--num-workers", type=int, default=0, help="Dataloader workers (0 to avoid EGL crash over caches)")
+    parser.add_argument("--num-workers", type=int, default=None, help="Dataloader workers (default: config data.num_workers)")
+    parser.add_argument("--prefetch-factor", type=int, default=None, help="Batches prefetched per worker (default: config data.prefetch_factor)")
     parser.add_argument("--no-wandb", action="store_true", help="Disable WandB")
     parser.add_argument("--no-ema", action="store_true", help="Disable EMA")
     parser.add_argument("--offline-data", action="store_true", help="Kích hoạt chế độ tải Slat từ ổ cứng, bỏ qua Instantiate model Extractor để tiết kiệm VRAM.")
@@ -1763,6 +1832,10 @@ def main():
         cfg.imf.cfg_interval_conditioning = False
     if args.epochs:
         cfg.imf.num_epochs = args.epochs
+    if args.context_cond_mode:
+        cfg.imf.context_cond_mode = args.context_cond_mode
+    if args.context_use_all:
+        cfg.imf.context_use_arcface_only = False
     if args.batch_size:
         cfg.imf.batch_size = args.batch_size
     if args.gradient_accumulation_steps:
@@ -1781,13 +1854,19 @@ def main():
         cfg.imf.context_velocity_sep_margin = float(args.context_velocity_sep_margin)
     if args.ratio_r_neq_t is not None:
         cfg.imf.ratio_r_neq_t = float(max(0.0, min(1.0, args.ratio_r_neq_t)))
+    if args.v_loss_weight is not None:
+        cfg.imf.v_loss_weight = float(max(0.0, args.v_loss_weight))
     if getattr(args, "mamba_num_layers", None) is not None:
         cfg.imf.mamba_num_layers = int(max(1, args.mamba_num_layers))
     if getattr(args, "mamba_ffn_expand", None) is not None:
         cfg.imf.mamba_ffn_expand = int(max(1, args.mamba_ffn_expand))
     if args.num_workers is not None:
-        cfg.data.num_workers = args.num_workers   # Cấu hình đè cực quan trọng chống EGL multiprocessing crash!
-        
+        cfg.data.num_workers = args.num_workers
+        cfg.imf.num_workers = args.num_workers
+    if args.prefetch_factor is not None:
+        cfg.data.prefetch_factor = max(1, int(args.prefetch_factor))
+        cfg.imf.prefetch_factor = cfg.data.prefetch_factor
+
     if args.no_wandb:
         cfg.wandb.enabled = False
     if args.no_ema:
