@@ -284,7 +284,7 @@ class IMFConfig:
     context_velocity_sep_margin: float = 0.0   # penalize cos > 0
     contrastive_temperature: float = 0.1 # InfoNCE temperature
     contrastive_mode: str = "arcface"  # "arcface" | "flame" | "full" — audit: Arc margin tốt, DINO/FLAME yếu
-    context_segment_weights: Optional[tuple] = None  # v8 arc-only: không dùng segment weights
+    context_segment_weights: Optional[tuple] = (1.5, 1.0, 0.5)  # ArcFace * 1.5, FLAME * 1.0, DINOv2 * 0.5
     cfg_omega_min: float = 1.0              # Cận dưới thang điều hướng (1.0 = không điều hướng)
     cfg_omega_max: float = 7.0              # Paper imeanflow default s_max=7
     cfg_omega_power_beta: float = 1.0       # Giá trị beta hàm lũy thừa cho p(omega) ~ omega^-beta

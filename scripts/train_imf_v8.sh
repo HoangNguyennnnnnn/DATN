@@ -81,6 +81,7 @@ nohup python -u src/train_imf.py \
     --cfg-context-dropout 0.1 \
     --context-cond-mode adaln \
     --context-use-all \
+    --context-segment-weights 1.5 1.0 0.5 \
     --v-loss-weight 1.0 \
     --contrastive-loss-weight 0.2 \
     --contrastive-mode arcface \

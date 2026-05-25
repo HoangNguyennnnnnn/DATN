@@ -1741,6 +1741,7 @@ def main():
     parser.add_argument("--disable-cfg-interval-conditioning", action="store_true", help="Disable interval conditioning on [tmin, tmax].")
     parser.add_argument("--context-cond-mode", type=str, default=None, choices=["cross_attn", "adaln"], help="Conditioning mode: cross_attn or adaln")
     parser.add_argument("--context-use-all", action="store_true", help="Use full 946-d hybrid context (ArcFace + FLAME + DINOv2)")
+    parser.add_argument("--context-segment-weights", type=float, nargs=3, default=None, help="Weights for ArcFace, FLAME, DINOv2 segments (e.g. 1.5 1.0 0.5)")
     parser.add_argument("--epochs", type=int, default=None, help="Override num_epochs")
     parser.add_argument("--batch-size", type=int, default=None, help="Override batch_size (micro-batch per GPU)")
     parser.add_argument("--gradient-accumulation-steps", type=int, default=None, help="Gradient accumulation steps (effective_batch = batch_size × this)")
@@ -1836,6 +1837,8 @@ def main():
         cfg.imf.context_cond_mode = args.context_cond_mode
     if args.context_use_all:
         cfg.imf.context_use_arcface_only = False
+    if args.context_segment_weights is not None:
+        cfg.imf.context_segment_weights = tuple(args.context_segment_weights)
     if args.batch_size:
         cfg.imf.batch_size = args.batch_size
     if args.gradient_accumulation_steps:

@@ -412,20 +412,8 @@ def extract_ovoxel_mesh(coords: torch.Tensor, feats: torch.Tensor, aabb, res: in
         # Fast path for giant meshes (untrained model output)
         if verts.shape[0] > GIANT_MESH_THRESHOLD:
             print(f"    [GIANT MESH] verts={verts.shape[0]} > {GIANT_MESH_THRESHOLD}: "
-                  f"skip trimesh.repair + CC + smoothing (return raw DC output)")
-            # Compute simple per-vertex color from nearest voxel (GPU, fast)
-            try:
-                from src.mesh_gpu import gpu_knn_idw_colors
-                voxel_size_g = (aabb[1] - aabb[0]) / float(res)
-                world_dv_g = (coords.float() + dv) * voxel_size_g + aabb[0]
-                # k=1 cho giant mesh — chỉ lấy màu voxel gần nhất, không IDW
-                colors_t = gpu_knn_idw_colors(
-                    verts.float(), world_dv_g, rgb_linear_vox, k=1, chunk=4096,
-                )
-                colors_srgb = colors_t.clamp(0.0, 1.0).cpu().numpy().astype(np.float32)
-            except Exception as e:
-                print(f"    [WARN] giant mesh color failed: {e}; using grey")
-                colors_srgb = np.full((verts_np.shape[0], 3), 0.5, dtype=np.float32)
+                  f"skip trimesh.repair + CC + smoothing + KNN color (return raw grey DC output)")
+            colors_srgb = np.full((verts_np.shape[0], 3), 0.5, dtype=np.float32)
             return verts_np, faces_np, colors_srgb
 
         # 2. Geometry Post-processing (trimesh repair + Open3D smoothing)
