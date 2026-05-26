@@ -14,7 +14,7 @@ TS="$(date +%Y%m%d_%H%M%S)"
 LOG_FILE="logs/train_imf_v8_${TS}.log"
 CKPT_DIR="${CKPT_DIR:-checkpoints/imf_v8_lite}"
 mkdir -p "${CKPT_DIR}" logs
-RESUME="${RESUME:-${CKPT_DIR}/latest_step.pt}"
+RESUME="${RESUME:-${CKPT_DIR}/epoch_100.pt}"
 
 CONDA_BASE="/mnt/18TData/facediff/miniconda3"
 source "${CONDA_BASE}/etc/profile.d/conda.sh"
@@ -29,7 +29,7 @@ GRAD_ACCUM="${GRAD_ACCUM:-8}"
 MAMBA_FFN_EXPAND="${MAMBA_FFN_EXPAND:-4}"
 NUM_WORKERS="${NUM_WORKERS:-8}"
 PREFETCH_FACTOR="${PREFETCH_FACTOR:-4}"
-NUM_EPOCHS="${NUM_EPOCHS:-400}"
+NUM_EPOCHS="${NUM_EPOCHS:-1000}"
 
 RESUME_ARGS=()
 if [ "${FRESH_START:-1}" = "1" ]; then
@@ -73,9 +73,9 @@ nohup python -u src/train_imf.py \
     --prefetch-factor "${PREFETCH_FACTOR}" \
     --mamba-num-layers 8 \
     --mamba-ffn-expand "${MAMBA_FFN_EXPAND}" \
-    --lr 1e-4 \
+    --lr 5e-5 \
     --epochs "${NUM_EPOCHS}" \
-    --disable-id-filters \
+    --facescape-unique-identities \
     --enable-cfg-conditioning \
     --cfg-omega-max 7 \
     --cfg-context-dropout 0.1 \
@@ -88,6 +88,7 @@ nohup python -u src/train_imf.py \
     --context-velocity-sep-weight 0.1 \
     --context-velocity-sep-margin 0.2 \
     --ratio-r-neq-t 0.5 \
+    --dataset faceverse \
     > "${LOG_FILE}" 2>&1 &
 
 TRAIN_PID=$!

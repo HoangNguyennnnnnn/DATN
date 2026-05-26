@@ -4,8 +4,11 @@ import torch.nn.functional as F
 from typing import Tuple, Optional
 
 import spconv.pytorch as spconv
+from spconv.pytorch import ConvAlgo
 # Hard requirement: spconv is mandatory for SC-VAE
 # No fallback to mock layers - this ensures quality is never silently degraded
+# Use Native algo to avoid ConvTunerSimple autotuning failures on certain voxel shapes
+_ALGO = ConvAlgo.Native
 
 # Export for backward compatibility (always True now)
 SPCONV_AVAILABLE = True
@@ -372,6 +375,7 @@ class SparseResMLPBlock(nn.Module):
             kernel_size=3,
             padding=1,
             indice_key=f"subm_res_{key_id}",
+            algo=_ALGO,
         )
         # TRELLIS.2 uses LayerNorm32 (FP32 cast) for AMP stability. Falls back to
         # plain nn.LayerNorm if the project-wide module is unavailable.
@@ -411,13 +415,13 @@ class SparseEncoderBlock(nn.Module):
     def __init__(self, in_c: int, out_c: int, key_id: str = "0", num_res_blocks: int = 2):
         super().__init__()
         self.out_c = out_c
-        self.proj = spconv.SubMConv3d(in_c, out_c, kernel_size=1, indice_key=f"proj_{key_id}")
+        self.proj = spconv.SubMConv3d(in_c, out_c, kernel_size=1, indice_key=f"proj_{key_id}", algo=_ALGO)
         # Multiple residual blocks as per paper: "multiple residual blocks"
         self.res_blocks = nn.ModuleList([
             SparseResMLPBlock(out_c, mlp_ratio=4, key_id=f"enc_{key_id}_{i}")
             for i in range(num_res_blocks)
         ])
-        self.down = spconv.SparseConv3d(out_c, out_c, kernel_size=2, stride=2, indice_key=f"down_{key_id}")
+        self.down = spconv.SparseConv3d(out_c, out_c, kernel_size=2, stride=2, indice_key=f"down_{key_id}", algo=_ALGO)
             
     def forward(self, x):
         x = self.proj(x)
@@ -449,7 +453,7 @@ class SparseDecoderBlock(nn.Module):
         # Predict 8-way child occupancy (rho mask)
         self.rho_head = nn.Linear(in_c, 8)
         # Use SparseConvTranspose3d for Generative Upsampling (kernel=2, stride=2 expands 1 voxel -> 8 voxels)
-        self.up = spconv.SparseConvTranspose3d(in_c, out_c, kernel_size=2, stride=2, indice_key=f"up_{key_id}")
+        self.up = spconv.SparseConvTranspose3d(in_c, out_c, kernel_size=2, stride=2, indice_key=f"up_{key_id}", algo=_ALGO)
         # Multiple residual blocks as per paper
         self.res_blocks = nn.ModuleList([
             SparseResMLPBlock(out_c, mlp_ratio=4, key_id=f"dec_{key_id}_{i}")

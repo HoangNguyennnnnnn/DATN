@@ -762,13 +762,16 @@ class FaceDiffGenerator:
                 voxel_features, sparse_indices, batch_size
             )
 
+        if self.feature_mode == "poisson" and sparse_indices is not None:
+            return self._voxel_to_mesh_poisson(voxel_features, batch_size, sparse_indices)
+
         if self.enforce_dual_contouring and self.feature_mode in {"shape_native", "shape_mat"}:
             raise RuntimeError(
                 "Dual Contouring is enforced but sparse indices were not available for DC mesh extraction."
             )
 
         # === Legacy path: Marching Cubes ===
-        return self._voxel_to_mesh_marching_cubes(voxel_features, batch_size)
+        return self._voxel_to_mesh_marching_cubes(voxel_features, batch_size, sparse_indices)
 
     def _voxel_to_mesh_dual_contouring(
         self, voxel_features: torch.Tensor,
@@ -797,7 +800,7 @@ class FaceDiffGenerator:
                 if self.enforce_dual_contouring:
                     raise RuntimeError("Dual Contouring strict mode received empty sparse payload")
                 print("  [DualContouring] Empty sparse payload, falling back to Marching Cubes")
-                return self._voxel_to_mesh_marching_cubes(voxel_features, batch_size)
+                return self._voxel_to_mesh_marching_cubes(voxel_features, batch_size, sparse_indices)
             print(
                 f"  [DualContouring] Aligning sparse payload size idx={sparse_indices.shape[0]} "
                 f"feat={feats.shape[0]} -> {n}"
@@ -882,32 +885,61 @@ class FaceDiffGenerator:
                 if self.enforce_dual_contouring:
                     raise RuntimeError("Dual Contouring returned 0 faces while strict DC mode is enabled")
                 print("  [DualContouring] 0 faces, falling back to Marching Cubes")
-                return self._voxel_to_mesh_marching_cubes(voxel_features, batch_size)
+                return self._voxel_to_mesh_marching_cubes(voxel_features, batch_size, sparse_indices)
         except Exception as e:
             if self.enforce_dual_contouring:
                 raise RuntimeError(f"Dual Contouring failed in strict mode: {e}")
             print(f"  [DualContouring] Failed: {e}, falling back to Marching Cubes")
-            return self._voxel_to_mesh_marching_cubes(voxel_features, batch_size)
+            return self._voxel_to_mesh_marching_cubes(voxel_features, batch_size, sparse_indices)
 
-    def _voxel_to_mesh_marching_cubes(self, voxel_features: torch.Tensor, batch_size: int):
-        """Legacy Marching Cubes path for geom6/mat6 modes."""
+    def _voxel_to_mesh_poisson(self, voxel_features: torch.Tensor, batch_size: int, sparse_indices: torch.Tensor):
+        import sys
+        import os
+        sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "../../..")))
+        from scripts.test.test_sc_vae_recon_v2 import extract_poisson_mesh
+        
         features_np = voxel_features.detach().cpu().float().numpy()
-        points = features_np[:, :3]
+        out_indices_np = sparse_indices.detach().cpu().numpy()
+        
+        coords = out_indices_np[:, 1:4].astype(np.float32)
+        v = np.clip(features_np[:, :3], 0.0, 1.0)
+        
+        grid_size_ov = float(self.ovoxel_resolution)
+        voxel_size = 2.0 / grid_size_ov
+        points = (coords + v) * voxel_size - 1.0
+        
+        colors = np.ones((len(points), 3), dtype=np.float32) * 0.8
+        if features_np.shape[1] >= 10:
+            colors = np.clip(features_np[:, 7:10], 0.0, 1.0)
+            
+        print(f"  [Poisson] Running Open3D Poisson Reconstruction on {len(points)} points...")
+        verts, faces, out_colors = extract_poisson_mesh(points, colors, poisson_depth=9, density_quantile=0.01, smooth_iters=2)
+        if verts is None:
+            print("  [Poisson] Failed. Falling back to Marching Cubes.")
+            return self._voxel_to_mesh_marching_cubes(voxel_features, batch_size, sparse_indices)
+        return verts, faces, out_colors
+
+    def _voxel_to_mesh_marching_cubes(self, voxel_features: torch.Tensor, batch_size: int, sparse_indices: torch.Tensor | None = None):
+        """Legacy Marching Cubes path for geom6/mat6 modes, with basic OVoxel support."""
+        features_np = voxel_features.detach().cpu().float().numpy()
+        
+        if self.feature_mode in {"shape_native", "shape_mat"} and sparse_indices is not None:
+            # OVoxel format: feats[:, :3] is intra-voxel offset v
+            out_indices_np = sparse_indices.detach().cpu().numpy()
+            coords = out_indices_np[:, 1:4].astype(np.float32)
+            v = np.clip(features_np[:, :3], 0.0, 1.0)
+            
+            grid_size_ov = float(self.ovoxel_resolution)
+            voxel_size = 2.0 / grid_size_ov
+            points = (coords + v) * voxel_size - 1.0
+        else:
+            # Legacy format: feats[:, :3] is global XYZ
+            points = features_np[:, :3]
+            
         points = np.nan_to_num(points, nan=0.0, posinf=1.0, neginf=-1.0)
         points = np.clip(points, -1.0, 1.0)
-
-        point_colors = None
-        if features_np.shape[1] >= 10:
-            # shape_mat 10-channel layout: [v(3), delta(3), gamma(1), rgb(3)]
-            # RGB bắt đầu từ index 7, KHÔNG phải 6
-            point_colors = np.nan_to_num(features_np[:, 7:10], nan=0.5, posinf=1.0, neginf=0.0)
-            point_colors = np.clip(point_colors, 0.0, 1.0)
-        elif features_np.shape[1] >= 9:
-            # Legacy 6/12-channel modes: geom6 [xyz, normals] + mat [kd_rgb, ...]
-            point_colors = np.nan_to_num(features_np[:, 6:9], nan=0.5, posinf=1.0, neginf=0.0)
-            point_colors = np.clip(point_colors, 0.0, 1.0)
-
-        grid_size = self.voxel_grid_size
+        
+        # ... legacy marching cubes body ...
         volume = np.zeros((grid_size, grid_size, grid_size), dtype=np.float32)
         idx = ((points + 1.0) * 0.5 * (grid_size - 1)).astype(np.int32)
         idx = np.clip(idx, 0, grid_size - 1)
@@ -928,7 +960,7 @@ class FaceDiffGenerator:
         if float(volume.max()) <= 0.0:
             print("  [Cảnh báo] Occupancy volume rỗng. Dùng placeholder mesh.")
             verts, faces = self._create_icosphere()
-            return verts, faces, None
+            return verts, faces, color_grid
 
         volume /= float(volume.max())
         

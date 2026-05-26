@@ -30,6 +30,8 @@ import time
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
 import torch
+# Disable gradient tracking for inference‑only precompute
+torch.set_grad_enabled(False)
 
 
 def _build_one_slat_dataset(
@@ -112,6 +114,8 @@ def main() -> None:
         help="Torch device (default: TrainConfig.device)",
     )
     parser.add_argument("--num-workers", type=int, default=0)
+    parser.add_argument("--shard-id", type=int, default=0, help="Shard ID for parallel processing")
+    parser.add_argument("--num-shards", type=int, default=1, help="Total number of shards")
     parser.add_argument(
         "--skip-existing",
         action="store_true",
@@ -185,6 +189,12 @@ def main() -> None:
     device = torch.device(cfg.device if torch.cuda.is_available() else "cpu")
     imf_cfg = cfg.imf
 
+    # Use all available CPU threads for torch operations
+    torch.set_num_threads(os.cpu_count())
+    # Enable TF32 (fast float32 matmul on RTX 4090) and high‑precision mode
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.set_float32_matmul_precision('high')
+
     if imf_cfg.dual_branch:
         raise RuntimeError(
             "precompute_slat_cache.py hiện chỉ hỗ trợ single-branch. "
@@ -208,6 +218,10 @@ def main() -> None:
     state = ckpt.get("model_state_dict", ckpt)
     sc_vae.load_state_dict(state, strict=True)
     sc_vae = sc_vae.to(device).eval()
+    # Convert model to half‑precision (AMP will manage it)
+    # Keep model in full precision (spconv autotuning fails with half) 
+    torch.backends.cudnn.benchmark = True
+    print("[Precompute] cuDNN benchmark enabled for faster GPU ops")
 
     if args.use_random_context or args.context_lmdb:
         renderer = arcface = flame = dinov2 = None
@@ -292,12 +306,26 @@ def main() -> None:
     print(f"[Precompute] cache_tag (first ds) = {datasets[0][1].cache_tag}")
     print(f"[Precompute] total samples: {total}")
 
+    # ── Fast sequential precompute ──────────────────────────────────────
+    # Threading/multiprocessing with CUDA causes GIL contention or OOM.
+    # Sequential is fastest for single-GPU: CPU voxelization releases GIL
+    # during C++ calls, and spconv CUDA kernels run asynchronously.
+    # The algo=ConvAlgo.Native fix eliminates autotuning failures.
+
     t0 = time.time()
-    processed = skipped = errors = 0
+    processed = 0
+    skipped = 0
+    errors = 0
 
     for name, ds in datasets:
-        print(f"\n[Precompute] === {name} ({len(ds)} meshes) → {ds.cache_dir} ===")
-        for i in range(len(ds)):
+        n = len(ds)
+        start_idx = (n * args.shard_id) // args.num_shards
+        end_idx = (n * (args.shard_id + 1)) // args.num_shards
+        total_shard = end_idx - start_idx
+        
+        print(f"\n[Precompute] === {name} ({n} meshes) [Shard {args.shard_id}/{args.num_shards}: {start_idx} to {end_idx-1}] → {ds.cache_dir} ===", flush=True)
+        
+        for i in range(start_idx, end_idx):
             try:
                 if args.skip_existing and ds.has_valid_cache(i):
                     skipped += 1
@@ -308,21 +336,25 @@ def main() -> None:
             except Exception as exc:
                 errors += 1
                 processed += 1
-                if errors <= 15:
-                    print(f"  [ERROR] {name}[{i}]: {exc}")
+                if errors <= 50:
+                    print(f"  [ERROR] {name}[{i}]: {exc}", flush=True)
 
-            if processed % 200 == 0 or processed == total:
+            if processed % 10 == 0 or processed == total_shard:
                 elapsed = time.time() - t0
                 rate = processed / max(elapsed, 1e-8)
-                eta_min = (total - processed) / max(rate, 1e-8) / 60.0
+                eta_min = (total_shard - processed) / max(rate, 1e-8) / 60.0
+                vram_mb = torch.cuda.memory_allocated() / 1024**2 if torch.cuda.is_available() else 0
                 print(
-                    f"  [{processed}/{total}] ok_errors={errors} skipped_valid={skipped} "
-                    f"rate={rate:.2f}/s ETA~{eta_min:.0f}min"
+                    f"  [Shard {args.shard_id}] [{processed}/{total_shard}] errors={errors} skipped={skipped} "
+                    f"rate={rate:.2f}/s ETA~{eta_min:.0f}min VRAM={vram_mb:.0f}MB",
+                    flush=True,
                 )
 
     elapsed = time.time() - t0
     print(f"\n[Precompute] Done in {elapsed:.0f}s ({elapsed/60:.1f} min)")
     print(f"  touched={processed} skipped_existing={skipped} errors={errors}")
+    if torch.cuda.is_available():
+        print(f"  VRAM peak: {torch.cuda.max_memory_allocated()/1024**2:.0f}MB")
     print("\nNext: python src/train_imf.py --offline-data --batch-size <lớn hơn> ...")
 
 

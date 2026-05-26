@@ -1,4 +1,0 @@
-Traceback (most recent call last):
-  File "/mnt/18TData/facediff/measure_cos_sim.py", line 4, in <module>
-    from src.dataset.slat_dataset import SlatDataset
-ModuleNotFoundError: No module named 'src.dataset'

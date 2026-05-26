@@ -453,7 +453,7 @@ def extract_ovoxel_mesh(coords: torch.Tensor, feats: torch.Tensor, aabb, res: in
                 components = mesh.split(only_watertight=False)
                 if len(components) > 1:
                     total_faces = sum(len(c.faces) for c in components)
-                    min_faces = max(100, int(total_faces * 0.01))  # 1% threshold
+                    min_faces = 100  # 100 threshold, avoid dropping large chunks of fragmented mesh
                     kept = [c for c in components if len(c.faces) >= min_faces]
                     if kept:
                         mesh = _tm.util.concatenate(kept)

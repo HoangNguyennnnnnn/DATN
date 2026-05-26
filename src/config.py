@@ -22,6 +22,7 @@ class DataConfig:
     
     # Chế độ Dataset (Sprint 17)
     active_dataset: str = "both"  # "facescape", "faceverse", hay "both"
+    facescape_unique_identities: bool = True  # Chỉ lấy danh tính độc bản cho FaceScape (1 neutral mesh per subject)
     
     # Kết xuất (Rendering)
     image_size: int = 512

@@ -178,7 +178,8 @@ class SlatDataset(Dataset):
                  ovoxel_lmdb_in_channels: int = 10,
                  ovoxel_lmdb_feature_mode: str = "shape_mat",
                  ovoxel_lmdb_max_voxels: int = 350000,
-                 slat_lmdb_dir: str | None = None):
+                 slat_lmdb_dir: str | None = None,
+                 unique_identities: bool = False):
         self.data_root = data_root
         self.sc_vae = sc_vae
         self.dataset_name = str(dataset_name)
@@ -207,6 +208,7 @@ class SlatDataset(Dataset):
         self.allow_random_context_fallback = bool(allow_random_context_fallback)
         self.allow_mesh_proxy_fallback = bool(allow_mesh_proxy_fallback)
         self.ovoxel_converter = None
+        self.unique_identities = bool(unique_identities)
         self.samples = []
         self.parent_pid = os.getpid()
 
@@ -301,6 +303,36 @@ class SlatDataset(Dataset):
                             skipped_by_exclude += 1
                             continue
                         self.samples.append(obj_path)
+        
+        # FaceScape Unique Identities Filter: 1 neutral mesh per subject to avoid duplicate expressions
+        if self.unique_identities and self.dataset_name == "facescape":
+            by_id = {}
+            for path in self.samples:
+                identity = extract_identity_from_obj_path(path, self.data_root, self.dataset_name)
+                if identity not in by_id:
+                    by_id[identity] = []
+                by_id[identity].append(path)
+            
+            filtered_samples = []
+            for identity, paths in by_id.items():
+                # Prefer "1_neutral.obj" if available
+                neutral_path = None
+                for p in paths:
+                    if "1_neutral.obj" in p:
+                        neutral_path = p
+                        break
+                if neutral_path is None:
+                    for p in paths:
+                        if "neutral" in p.lower():
+                            neutral_path = p
+                            break
+                if neutral_path is None:
+                    neutral_path = paths[0]
+                filtered_samples.append(neutral_path)
+            
+            before_len = len(self.samples)
+            self.samples = sorted(filtered_samples)
+            print(f"[SlatDataset] Filtered FaceScape to unique identities only: {before_len} -> {len(self.samples)} samples")
         
         print(f"[SlatDataset] Found {len(self.samples)} meshes from {data_root}")
         if self.include_ids is not None or self.exclude_ids is not None:
@@ -1191,6 +1223,7 @@ def train_imf(
             ovoxel_lmdb_dir=ovoxel_lmdb_dir,
             slat_lmdb_dir=slat_lmdb_dir,
             manifest_list=manifest_data.get("facescape") if manifest_data else None,
+            unique_identities=cfg.data.facescape_unique_identities,
         )
         if len(fs_dataset) > 0:
             datasets_to_concat.append(fs_dataset)
@@ -1742,6 +1775,7 @@ def main():
     parser.add_argument("--context-cond-mode", type=str, default=None, choices=["cross_attn", "adaln"], help="Conditioning mode: cross_attn or adaln")
     parser.add_argument("--context-use-all", action="store_true", help="Use full 946-d hybrid context (ArcFace + FLAME + DINOv2)")
     parser.add_argument("--context-segment-weights", type=float, nargs=3, default=None, help="Weights for ArcFace, FLAME, DINOv2 segments (e.g. 1.5 1.0 0.5)")
+    parser.add_argument("--facescape-unique-identities", action="store_true", default=False, help="Filter FaceScape to only load unique identities (1 neutral expression per subject)")
     parser.add_argument("--epochs", type=int, default=None, help="Override num_epochs")
     parser.add_argument("--batch-size", type=int, default=None, help="Override batch_size (micro-batch per GPU)")
     parser.add_argument("--gradient-accumulation-steps", type=int, default=None, help="Gradient accumulation steps (effective_batch = batch_size × this)")
@@ -1784,6 +1818,8 @@ def main():
         cfg.data.facescape_root = args.facescape_root
     if args.faceverse_root:
         cfg.data.faceverse_root = args.faceverse_root
+    if args.facescape_unique_identities:
+        cfg.data.facescape_unique_identities = True
     if args.num_workers is not None:
         cfg.data.num_workers = args.num_workers
     if args.resume:
