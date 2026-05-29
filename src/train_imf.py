@@ -25,6 +25,7 @@ import time
 import json
 import hashlib
 import argparse
+import math
 import random
 import warnings
 import numpy as np
@@ -828,6 +829,18 @@ def _resolve_material_config(imf_cfg) -> None:
 
 
 def _build_stage2_model_config(model: nn.Module, imf_cfg, model_input_dim: int) -> dict:
+    if str(getattr(imf_cfg, "backbone", "voxel_mamba")) == "unet3d":
+        return {
+            "arch": "unet3d",
+            "input_dim": int(model_input_dim),
+            "context_dim": int(getattr(imf_cfg, "context_dim", 946)),
+            "slat_length": int(getattr(imf_cfg, "slat_length", 4096)),
+            "slat_stats_path": getattr(imf_cfg, "slat_stats_path", None),
+            "base": int(getattr(imf_cfg, "unet_base", 128)),
+            "cond_dim": int(getattr(imf_cfg, "unet_cond_dim", 512)),
+            "grid_size": int(round(int(getattr(imf_cfg, "slat_length", 4096)) ** (1.0 / 3.0))),
+            "context_use_arcface_only": bool(getattr(imf_cfg, "context_use_arcface_only", False)),
+        }
     return {
         "arch": "voxel_mamba",
         "input_dim": int(model_input_dim),
@@ -878,15 +891,19 @@ def save_checkpoint(
     best_loss: float | None = None,
 ):
     os.makedirs(os.path.dirname(path), exist_ok=True)
+    loss_value = float(loss)
+    if not np.isfinite(loss_value):
+        raise FloatingPointError(f"Refusing to save checkpoint with non-finite loss={loss_value}: {path}")
+    best_loss_value = float(best_loss if best_loss is not None else loss_value)
     state = {
         'epoch': epoch,
         'model_state_dict': model.state_dict(),
         'optimizer_state_dict': optimizer.state_dict(),
         'scheduler_state_dict': scheduler.state_dict(),
         'scaler_state_dict': scaler.state_dict() if scaler else None,
-        'loss': loss,
+        'loss': loss_value,
         'global_step': int(global_step if global_step is not None else 0),
-        'best_loss': float(best_loss if best_loss is not None else loss),
+        'best_loss': best_loss_value,
     }
     if ema is not None:
         state['ema_state_dict'] = ema.state_dict()
@@ -1001,6 +1018,25 @@ def get_lr_scheduler(optimizer, cfg, steps_per_epoch: int = 100):
         t_max = max(1, total_steps - cfg.lr_warmup_steps)
         main = CosineAnnealingLR(optimizer, T_max=t_max, eta_min=1e-7)
     return SequentialLR(optimizer, [warmup, main], milestones=[cfg.lr_warmup_steps])
+
+
+def _set_optimizer_lrs(optimizer, base_lr: float):
+    """Set LR without letting a partially reset scheduler re-ramp from the wrong value."""
+    lrs = []
+    for pg in optimizer.param_groups:
+        pg["lr"] = base_lr
+        pg["initial_lr"] = base_lr
+        lrs.append(base_lr)
+    return lrs
+
+
+def _reset_scheduler_lrs(scheduler, lrs):
+    if hasattr(scheduler, "base_lrs"):
+        scheduler.base_lrs = list(lrs)
+    if hasattr(scheduler, "_last_lr"):
+        scheduler._last_lr = list(lrs)
+    for child in getattr(scheduler, "_schedulers", []):
+        _reset_scheduler_lrs(child, lrs)
 
 
 # ============================================================
@@ -1254,52 +1290,67 @@ def train_imf(
     dataloader = DataLoader(**dataloader_kwargs)
     print(f"  Dataset: {len(dataset)} samples, {len(dataloader)} batches/epoch")
     
-    # ---- Model: Voxel Mamba v5.0 (O(N) complexity, default backbone) ----
+    # ---- Model: backbone selection (voxel_mamba | unet3d) ----
     model_input_dim = imf_cfg.input_dim * 2 if imf_cfg.dual_branch else imf_cfg.input_dim
-    print("\n[4/5] Building Voxel Mamba v5.0...")
-    from src.models.voxel_mamba import VoxelMamba
-    seg_w = getattr(imf_cfg, "context_segment_weights", None)
-    if seg_w is not None and len(seg_w) == 3:
-        seg_w = tuple(float(x) for x in seg_w)
-        print(f"  [context] segment weights Arc/FLAME/DINO = {seg_w}")
-    ctx_mode = str(getattr(imf_cfg, "context_cond_mode", "cross_attn"))
-    arc_only = bool(getattr(imf_cfg, "context_use_arcface_only", True))
-    print(f"  [context] mode={ctx_mode}, arcface_only={arc_only}")
-    model = VoxelMamba(
-        input_dim=model_input_dim,
-        hidden_dim=imf_cfg.mamba_hidden_dim,
-        num_layers=imf_cfg.mamba_num_layers,
-        slat_length=imf_cfg.slat_length,
-        context_dim=imf_cfg.context_dim,
-        backend=str(getattr(imf_cfg, "voxel_mamba_backend", "auto")),
-        strict=bool(getattr(imf_cfg, "voxel_mamba_strict", False)),
-        num_context_tokens=int(getattr(imf_cfg, "mamba_num_context_tokens", 0)),
-        num_time_tokens=int(getattr(imf_cfg, "mamba_num_time_tokens", 4)),
-        num_r_tokens=int(getattr(imf_cfg, "mamba_num_r_tokens", 4)),
-        num_interval_tokens=int(getattr(imf_cfg, "mamba_num_interval_tokens", 4)),
-        num_guidance_tokens=int(getattr(imf_cfg, "mamba_num_guidance_tokens", 4)),
-        use_per_layer_context=bool(getattr(imf_cfg, "mamba_use_per_layer_context", False)),
-        d_state=imf_cfg.mamba_d_state,
-        d_conv=imf_cfg.mamba_d_conv,
-        expand=imf_cfg.mamba_expand,
-        ffn_expand=int(getattr(imf_cfg, "mamba_ffn_expand", 4)),
-        dropout=imf_cfg.dropout,
-        context_segment_weights=seg_w if not arc_only else None,
-        context_cond_mode=ctx_mode,
-        context_use_arcface_only=arc_only,
-        num_context_kv_tokens=int(getattr(imf_cfg, "mamba_num_context_kv_tokens", 8)),
-        context_cross_attn_heads=int(getattr(imf_cfg, "mamba_context_cross_attn_heads", 8)),
-    ).to(device)
-    print(f"  Architecture: Voxel Mamba [D={imf_cfg.mamba_hidden_dim}, L={imf_cfg.mamba_num_layers}]")
-    print(f"  Backend: {getattr(model, 'backend', 'unknown')}")
-    print(f"  Complexity: O(N) linear scan (vs O(N²) attention)")
-
-    stage2_model_config = _build_stage2_model_config(model, imf_cfg, model_input_dim)
+    _backbone = str(getattr(imf_cfg, "backbone", "voxel_mamba"))
+    if _backbone == "unet3d":
+        print("\n[4/5] Building 3D UNet backbone...")
+        from src.models.unet3d import VoxelUNet3D
+        model = VoxelUNet3D(
+            input_dim=model_input_dim,
+            context_dim=int(getattr(imf_cfg, "context_dim", 946)),
+            base=int(getattr(imf_cfg, "unet_base", 128)),
+            cond_dim=int(getattr(imf_cfg, "unet_cond_dim", 512)),
+            grid_size=int(round(int(getattr(imf_cfg, "slat_length", 4096)) ** (1.0 / 3.0))),
+            context_use_arcface_only=bool(getattr(imf_cfg, "context_use_arcface_only", False)),
+        ).to(device)
+        nparam = sum(p.numel() for p in model.parameters()) / 1e6
+        print(f"  Architecture: 3D UNet [base={getattr(imf_cfg, 'unet_base', 128)}, {nparam:.1f}M params]")
+        stage2_model_config = _build_stage2_model_config(model, imf_cfg, model_input_dim)
+    else:
+        print("\n[4/5] Building Voxel Mamba v5.0...")
+        from src.models.voxel_mamba import VoxelMamba
+        seg_w = getattr(imf_cfg, "context_segment_weights", None)
+        if seg_w is not None and len(seg_w) == 3:
+            seg_w = tuple(float(x) for x in seg_w)
+            print(f"  [context] segment weights Arc/FLAME/DINO = {seg_w}")
+        ctx_mode = str(getattr(imf_cfg, "context_cond_mode", "cross_attn"))
+        arc_only = bool(getattr(imf_cfg, "context_use_arcface_only", True))
+        print(f"  [context] mode={ctx_mode}, arcface_only={arc_only}")
+        model = VoxelMamba(
+            input_dim=model_input_dim,
+            hidden_dim=imf_cfg.mamba_hidden_dim,
+            num_layers=imf_cfg.mamba_num_layers,
+            slat_length=imf_cfg.slat_length,
+            context_dim=imf_cfg.context_dim,
+            backend=str(getattr(imf_cfg, "voxel_mamba_backend", "auto")),
+            strict=bool(getattr(imf_cfg, "voxel_mamba_strict", False)),
+            num_context_tokens=int(getattr(imf_cfg, "mamba_num_context_tokens", 0)),
+            num_time_tokens=int(getattr(imf_cfg, "mamba_num_time_tokens", 4)),
+            num_r_tokens=int(getattr(imf_cfg, "mamba_num_r_tokens", 4)),
+            num_interval_tokens=int(getattr(imf_cfg, "mamba_num_interval_tokens", 4)),
+            num_guidance_tokens=int(getattr(imf_cfg, "mamba_num_guidance_tokens", 4)),
+            use_per_layer_context=bool(getattr(imf_cfg, "mamba_use_per_layer_context", False)),
+            d_state=imf_cfg.mamba_d_state,
+            d_conv=imf_cfg.mamba_d_conv,
+            expand=imf_cfg.mamba_expand,
+            ffn_expand=int(getattr(imf_cfg, "mamba_ffn_expand", 4)),
+            dropout=imf_cfg.dropout,
+            context_segment_weights=seg_w if not arc_only else None,
+            context_cond_mode=ctx_mode,
+            context_use_arcface_only=arc_only,
+            num_context_kv_tokens=int(getattr(imf_cfg, "mamba_num_context_kv_tokens", 8)),
+            context_cross_attn_heads=int(getattr(imf_cfg, "mamba_context_cross_attn_heads", 8)),
+        ).to(device)
+        print(f"  Architecture: Voxel Mamba [D={imf_cfg.mamba_hidden_dim}, L={imf_cfg.mamba_num_layers}]")
+        print(f"  Backend: {getattr(model, 'backend', 'unknown')}")
+        print(f"  Complexity: O(N) linear scan (vs O(N²) attention)")
+        stage2_model_config = _build_stage2_model_config(model, imf_cfg, model_input_dim)
 
     # ---- Compilation (RTX 4090 Optimization) ----
     # Bỏ qua torch.compile khi dùng mamba-ssm CUDA kernels (không tương thích).
     _can_compile = device.type == "cuda" and hasattr(torch, "compile")
-    if _can_compile and not getattr(model, "use_mamba", False):
+    if _can_compile and not getattr(model, "use_mamba", False) and _backbone != "unet3d":
         print("\n[4.5/5] Compiling model with torch.compile (reduce-overhead)...")
         model = torch.compile(model, mode="reduce-overhead")
     else:
@@ -1409,32 +1460,11 @@ def train_imf(
         "betas": (0.9, 0.95),
     }
     
-    # Thu thập params với separate LR cho cross_attn.proj (kick-start zero-init gate).
-    # 2026-05-23: v8 lite ep5 inspection cho thấy cross_attn.proj.weight = 0.114
-    # (vs init 0, expected ~7 nếu fully trained) → cross-attn output bị block ở residual.
-    # Bơm LR 50× để gate mở nhanh hơn, tránh Mean Face Trap (Mamba hội tụ về avg face).
-    proj_boost_mult = float(os.environ.get("CROSS_ATTN_PROJ_LR_MULT", "1.0"))
-    proj_params, base_params = [], []
-    for name, p in model.named_parameters():
-        if "cross_attn.proj" in name:
-            proj_params.append(p)
-        else:
-            base_params.append(p)
+    optimizer_input = list(model.parameters())
     if v_head is not None:
-        base_params.extend(list(v_head.parameters()))
+        optimizer_input += list(v_head.parameters())
     if ctx_classifier is not None:
-        base_params.extend(list(ctx_classifier.parameters()))
-
-    if proj_boost_mult != 1.0 and len(proj_params) > 0:
-        param_groups = [
-            {'params': base_params, 'lr': imf_cfg.learning_rate, 'name': 'base'},
-            {'params': proj_params, 'lr': imf_cfg.learning_rate * proj_boost_mult, 'name': 'cross_attn_proj'},
-        ]
-        print(f"  Optimizer: Split param groups — base LR={imf_cfg.learning_rate:.1e}, "
-              f"cross_attn.proj LR={imf_cfg.learning_rate * proj_boost_mult:.1e} ({proj_boost_mult}× boost, {len(proj_params)} tensors)")
-        optimizer_input = param_groups
-    else:
-        optimizer_input = base_params + proj_params
+        optimizer_input += list(ctx_classifier.parameters())
 
     if device.type == "cuda":
         try:
@@ -1448,6 +1478,7 @@ def train_imf(
     scheduler = get_lr_scheduler(optimizer, imf_cfg, len(dataloader))
     scaler = torch.amp.GradScaler('cuda', enabled=imf_cfg.use_amp)
     grad_accum_steps = max(1, int(getattr(imf_cfg, "gradient_accumulation_steps", 1)))
+    optimizer_steps_per_epoch = max(1, math.ceil(len(dataloader) / grad_accum_steps))
     effective_batch = imf_cfg.batch_size * grad_accum_steps
     print(f"  Gradient accumulation: {grad_accum_steps} steps (effective batch = {effective_batch})")
 
@@ -1468,32 +1499,38 @@ def train_imf(
             v_head=v_head,
             ctx_classifier=ctx_classifier,
         )
+        # BUG FIX: EMA.shadow được snapshot lúc tạo (TRƯỚC resume) = weights fresh-init.
+        # model-only resume KHÔNG load ema state → shadow vẫn là fresh-init → với decay 0.9999
+        # cần ~10000 step mới hồi phục, nên ema checkpoint = rác (context chết, sampling hỏng).
+        # Re-snapshot shadow từ model đã load để EMA khởi đầu từ weights tốt.
+        if imf_cfg.resume_model_only and ema is not None:
+            ema.shadow = {
+                name: param.clone().detach()
+                for name, param in model.named_parameters() if param.requires_grad
+            }
+            print("  [Resume] EMA shadow re-initialized from loaded model weights (fix fresh-init garbage)")
         start_epoch = int(ckpt_info["epoch"])
         best_loss = float(ckpt_info["best_loss"])
-        if not imf_cfg.resume_model_only and ckpt_info.get("global_step", 0) > 0:
+        resume_full_state = (not imf_cfg.resume_model_only) and bool(ckpt_info.get("resumed_full", False))
+        if ckpt_info.get("global_step", 0) > 0:
             global_step = int(ckpt_info["global_step"])
         else:
-            global_step = start_epoch * len(dataloader)
+            global_step = start_epoch * optimizer_steps_per_epoch
 
-        # Stabilize cross_attn.proj after LR-boost blow-up; gate controls residual strength.
-        from src.cross_attn_utils import cross_attn_proj_stats, renormalize_cross_attn_proj_weights
-
-        proj_max_norm = float(os.environ.get("CROSS_ATTN_PROJ_MAX_NORM", "1.0"))
-        before = cross_attn_proj_stats(model)
-        if before["count"] > 0:
-            print(
-                f"  [cross_attn] proj L2 before renorm: mean={before['mean']:.2f} "
-                f"max={before['max']:.2f}"
-            )
-        n_clip = renormalize_cross_attn_proj_weights(model, max_norm=proj_max_norm)
-        if n_clip > 0:
-            after = cross_attn_proj_stats(model)
-            print(
-                f"  [cross_attn] Renormalized {n_clip} proj tensors to max_norm={proj_max_norm:.2f} "
-                f"(now mean={after['mean']:.2f} max={after['max']:.2f})"
-            )
+        # Full resume can keep scheduler progress, but --lr still needs to override
+        # restored base_lrs. Model-only/auto-downgrade has no valid scheduler state;
+        # use constant LR immediately so warmup cannot restart at epoch 500+.
+        new_lr = float(imf_cfg.learning_rate)
+        group_lrs = _set_optimizer_lrs(optimizer, new_lr)
+        if resume_full_state:
+            _reset_scheduler_lrs(scheduler, group_lrs)
+            print(f"  [Resume] Full-state LR forced to {new_lr:.2e} (scheduler state preserved)")
+        else:
+            from torch.optim.lr_scheduler import ConstantLR
+            scheduler = ConstantLR(optimizer, factor=1.0, total_iters=10**9)
+            print(f"  [Resume] Model-only scheduler reset to constant LR={new_lr:.2e}")
     else:
-        global_step = start_epoch * len(dataloader)
+        global_step = start_epoch * optimizer_steps_per_epoch
     
     # ---- Slat normalization stats (per-channel mean/std, TRELLIS.2-style) ----
     slat_norm_mean = None
@@ -1572,10 +1609,40 @@ def train_imf(
                     context_velocity_sep_weight=float(getattr(imf_cfg, "context_velocity_sep_weight", 0.0)),
                     context_velocity_sep_margin=float(getattr(imf_cfg, "context_velocity_sep_margin", 0.0)),
                     occupancy_mask=occupancy_mask,
+                    empty_weight_floor=float(os.environ.get("EMPTY_WEIGHT_FLOOR", "0.0")),
                     return_components=True,
                 )
 
-                loss = loss_out["loss"] / grad_accum_steps
+                raw_loss = loss_out["loss"]
+                if not torch.isfinite(raw_loss).all().item():
+                    debug_parts = {}
+                    for key in (
+                        "loss",
+                        "loss_boundary",
+                        "loss_jvp",
+                        "loss_v_head",
+                        "loss_contrastive",
+                        "loss_context_sep",
+                        "ctx_sep_cos",
+                    ):
+                        if key not in loss_out:
+                            continue
+                        value = loss_out[key]
+                        if torch.is_tensor(value):
+                            if value.numel() == 1:
+                                debug_parts[key] = float(value.detach().float().cpu())
+                            else:
+                                finite = torch.isfinite(value).all().item()
+                                debug_parts[key] = f"tensor{tuple(value.shape)} finite={finite}"
+                        else:
+                            debug_parts[key] = value
+                    optimizer.zero_grad(set_to_none=True)
+                    raise FloatingPointError(
+                        f"Non-finite iMF loss at epoch={epoch + 1}, "
+                        f"batch={batch_idx + 1}, global_step={global_step}: {debug_parts}"
+                    )
+
+                loss = raw_loss / grad_accum_steps
                 loss_shape_val = float(loss_out.get("loss_shape", 0.0))
                 loss_material_val = float(loss_out.get("loss_material", 0.0))
                 loss_boundary_val = float(loss_out.get("loss_boundary", 0.0))
@@ -1592,7 +1659,7 @@ def train_imf(
             if not is_accum_step or (batch_idx + 1) == len(dataloader):
                 if imf_cfg.grad_clip > 0:
                     scaler.unscale_(optimizer)
-                    torch.nn.utils.clip_grad_norm_(base_params + proj_params, imf_cfg.grad_clip)
+                    torch.nn.utils.clip_grad_norm_(optimizer_input, imf_cfg.grad_clip)
 
                 scaler.step(optimizer)
                 scaler.update()
@@ -1671,6 +1738,8 @@ def train_imf(
         # Thống kê Epoch (Epoch stats)
         n_batches = max(len(dataloader), 1)
         avg_loss = epoch_loss / n_batches
+        if not np.isfinite(avg_loss):
+            raise FloatingPointError(f"Non-finite epoch loss at epoch={epoch + 1}: {avg_loss}")
         elapsed = time.time() - t_start
         vram = torch.cuda.max_memory_allocated(device) / (1024**2) if device.type == 'cuda' else 0
         
@@ -1776,6 +1845,7 @@ def main():
     parser.add_argument("--context-use-all", action="store_true", help="Use full 946-d hybrid context (ArcFace + FLAME + DINOv2)")
     parser.add_argument("--context-segment-weights", type=float, nargs=3, default=None, help="Weights for ArcFace, FLAME, DINOv2 segments (e.g. 1.5 1.0 0.5)")
     parser.add_argument("--facescape-unique-identities", action="store_true", default=False, help="Filter FaceScape to only load unique identities (1 neutral expression per subject)")
+    parser.add_argument("--facescape-all-expressions", action="store_true", default=False, help="Tắt filter unique-ID: nạp TOÀN BỘ FaceScape (mọi biểu cảm) cho pretrain đa dạng.")
     parser.add_argument("--epochs", type=int, default=None, help="Override num_epochs")
     parser.add_argument("--batch-size", type=int, default=None, help="Override batch_size (micro-batch per GPU)")
     parser.add_argument("--gradient-accumulation-steps", type=int, default=None, help="Gradient accumulation steps (effective_batch = batch_size × this)")
@@ -1789,6 +1859,9 @@ def main():
     parser.add_argument("--context-velocity-sep-margin", type=float, default=None,
                         help="Margin for context sep loss (penalize cos above this).")
     parser.add_argument("--ratio-r-neq-t", type=float, default=None, help="Fraction of batches with r≠t (JVP). 0.5 = paper default.")
+    parser.add_argument("--backbone", type=str, default=None, choices=["voxel_mamba", "unet3d"], help="Stage 2 backbone.")
+    parser.add_argument("--unet-base", type=int, default=None, help="Base channels for unet3d backbone.")
+    parser.add_argument("--t-sampler", type=str, default=None, choices=["uniform", "logit_normal", "curriculum"], help="Timestep sampler.")
     parser.add_argument("--v-loss-weight", type=float, default=None, help="Auxiliary v-head loss weight (paper uses 1.0; default config 0.5).")
     parser.add_argument("--mamba-num-layers", type=int, default=None, help="BidirectionalMambaBlock count (lite: 8)")
     parser.add_argument("--mamba-ffn-expand", type=int, default=None, help="FFN expansion per block (lite: 2, default: 4)")
@@ -1807,6 +1880,7 @@ def main():
     parser.add_argument("--context-lmdb", type=str, default=None, help="Path to hybrid_context.lmdb for offline context loading")
     parser.add_argument("--ovoxel-lmdb", type=str, default=None, help="Path to ovoxel_cache_lmdb for reading O-Voxel data without mesh files")
     parser.add_argument("--slat-lmdb", type=str, default=None, help="Path to slat_context.lmdb (merged slat+context, fastest loading)")
+    parser.add_argument("--slat-stats", type=str, default=None, help="Path to slat stats .pt for normalization (combined vs faceverse per phase)")
     parser.add_argument("--manifest", type=str, default=None, help="Path to mesh_manifest.json to avoid scanning .obj files")
     args = parser.parse_args()
     
@@ -1820,6 +1894,8 @@ def main():
         cfg.data.faceverse_root = args.faceverse_root
     if args.facescape_unique_identities:
         cfg.data.facescape_unique_identities = True
+    if args.facescape_all_expressions:
+        cfg.data.facescape_unique_identities = False
     if args.num_workers is not None:
         cfg.data.num_workers = args.num_workers
     if args.resume:
@@ -1893,6 +1969,14 @@ def main():
         cfg.imf.context_velocity_sep_margin = float(args.context_velocity_sep_margin)
     if args.ratio_r_neq_t is not None:
         cfg.imf.ratio_r_neq_t = float(max(0.0, min(1.0, args.ratio_r_neq_t)))
+    if args.slat_stats is not None:
+        cfg.imf.slat_stats_path = str(args.slat_stats)
+    if args.backbone is not None:
+        cfg.imf.backbone = str(args.backbone)
+    if args.unet_base is not None:
+        cfg.imf.unet_base = int(args.unet_base)
+    if args.t_sampler is not None:
+        cfg.imf.t_sampler = str(args.t_sampler)
     if args.v_loss_weight is not None:
         cfg.imf.v_loss_weight = float(max(0.0, args.v_loss_weight))
     if getattr(args, "mamba_num_layers", None) is not None:

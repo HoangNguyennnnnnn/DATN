@@ -127,3 +127,6 @@ docs/
 !.gitignore
 !requirements.txt
 !requirements-mamba.txt
+
+#iFaceFlow 
+iFaceFlow/

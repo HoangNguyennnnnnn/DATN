@@ -526,6 +526,7 @@ class ImprovedMeanFlow:
         context_velocity_sep_weight: float = 0.0,
         context_velocity_sep_margin: float = 0.0,
         occupancy_mask: Optional[torch.Tensor] = None,
+        empty_weight_floor: float = 0.0,
         return_components: bool = False,
     ):
         """
@@ -578,6 +579,13 @@ class ImprovedMeanFlow:
                 raise ValueError(
                     f"occupancy_mask shape {tuple(position_weights.shape)} must match x_data[:2] {tuple(x_data.shape[:2])}"
                 )
+            # FIX 2026-05-27: empty voxels (occ=0) từng có weight=0 → model KHÔNG học
+            # "empty phải ≈ 0" → lúc sampling (không có mask) phun rác vào 79% vùng trống
+            # → mesh noise. empty_weight_floor > 0 ép model học cả empty region.
+            # blended = occ * 1.0 + (1-occ) * floor; chuẩn hóa mean=1.
+            if empty_weight_floor > 0.0:
+                occ = (position_weights > 0).to(dtype=x_data.dtype)
+                position_weights = occ + (1.0 - occ) * float(empty_weight_floor)
             position_weights = position_weights / position_weights.mean(dim=-1, keepdim=True).clamp(min=1e-6)
         else:
             position_weights = self._slat_position_weights(x_data)

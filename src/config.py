@@ -216,6 +216,13 @@ class IMFConfig:
     context_dim: int = 946             # Ngữ cảnh Lai v4.1 (ArcFace 512 + FLAME 50 + DINOv2_Back 384)
     slat_length: int = 4096            # Số Slat tokens trên mỗi lưới
 
+    # Backbone selection: "voxel_mamba" | "unet3d"
+    # unet3d (29/05): 3D conv UNet trên grid 16³ — data-efficient, sinh được (validate overfit).
+    # VoxelMamba không generate được (cos 0.03 vs UNet 0.97). Xem docs/AUDIT_FINDINGS.md.
+    backbone: str = "voxel_mamba"
+    unet_base: int = 128                 # số kênh gốc UNet (16³ nhỏ nên rẻ); mults [1,2,4]
+    unet_cond_dim: int = 512             # chiều embedding time+context (FiLM)
+
     # Kiến trúc Voxel Mamba (v5.0 backbone)
     voxel_mamba_backend: str = "auto"    # auto|mamba|gru
     voxel_mamba_strict: bool = False     # Bằng True -> báo lỗi nếu yêu cầu mamba backend nhưng không khả dụng
@@ -263,25 +270,25 @@ class IMFConfig:
     
     # Đặc tả iMF (arXiv:2512.02012v1 — Geng et al., Improved Mean Flows)
     sigma_min: float = 1e-4            # Biên độ nhiễu tối thiểu
-    ratio_r_neq_t: float = 0.5        # Paper Table 4: 50% r≠t → JVP compound V = u + (t-r)·sg(dudt)
+    ratio_r_neq_t: float = 0.0        # Phase A clean config: boundary-only
     t_sampler: str = "logit_normal"    # Paper iMF Table 4: logit-normal(-0.4, 1.0). Focus capacity vào t∈[0.2,0.6] — signal mạnh nhất. Dataset nhỏ càng cần focus.
     t_loc: float = -0.4               # Trung bình logit-normal (Giai đoạn 1: thiên vị ở giữa)
     t_scale: float = 1.0              # Tỉ lệ logit-normal
     curriculum_switch_ratio: float = 0.3   # Compromise 0.6→0.3 (17/05): switch ở 30% (epoch 120) — balance giữa boundary stability và 1-step learning
     curriculum_uniform_prob: float = 0.8   # Xác suất chọn giá trị đồng đều ở Giai đoạn 2 của tiến trình
-    cfg_conditioning_enable: bool = True    # Paper imeanflow: CFG on from start (train_imf_v8.sh)
+    cfg_conditioning_enable: bool = False   # Phase A clean config
     
     # iMF v5.0: v-loss cùng với khối phụ trợ v-head (Chỉ số cải thiện lợi nhuận ROI cao)
     use_v_loss: bool = True              # Dùng v-loss thay vì u-loss (huấn luyện ổn định hơn)
-    use_auxiliary_v_head: bool = True    # 2026-05-22 Phase B: enable v-head for JVP tangent estimation (Paper Table 4: depth=8)
+    use_auxiliary_v_head: bool = False   # Phase A clean config
     v_head_dim: int = 512               # Chiều ẩn cho khối phụ trợ v-head
     v_head_depth: int = 8                # Paper Table 4: aux-head depth = 8 (cũ: 2-layer MLP)
     v_head_mlp_ratio: int = 4            # MLP expansion ratio trong v-head block
     v_loss_weight: float = 1.0           # Paper imeanflow: loss_u + loss_v (equal weight)
     # Contrastive auxiliary loss (2026-05-20): force hidden state to encode context.
     # InfoNCE on (pooled_hidden → predicted_ctx) vs (true context).
-    contrastive_loss_weight: float = 0.2   # train_imf_v8.sh
-    context_velocity_sep_weight: float = 0.1   # shuffle-ctx separation (extra forwards)
+    contrastive_loss_weight: float = 0.0   # Phase A clean config
+    context_velocity_sep_weight: float = 0.0   # Phase A clean config
     context_velocity_sep_margin: float = 0.0   # penalize cos > 0
     contrastive_temperature: float = 0.1 # InfoNCE temperature
     contrastive_mode: str = "arcface"  # "arcface" | "flame" | "full" — audit: Arc margin tốt, DINO/FLAME yếu
@@ -291,7 +298,7 @@ class IMFConfig:
     cfg_omega_power_beta: float = 1.0       # Giá trị beta hàm lũy thừa cho p(omega) ~ omega^-beta
     cfg_context_dropout: float = 0.1        # Phase A+B: zero ArcFace → null_ctx_tokens (độc lập cfg_conditioning_enable)
     cfg_interval_conditioning: bool = True  # Điều kiện hóa trên đoạn [tmin, tmax] giống trong phụ lục iMF
-    adaptive_loss_weighting: bool = True    # Paper Appendix A: adaptive weighting cho main + v-head loss
+    adaptive_loss_weighting: bool = False   # Phase A clean config: disable adaptive weighting
     paper_strict_tr: bool = False           # imeanflow sample_tr (env IMEFLOW_PAPER_STRICT=1)
     adaptive_loss_mode: str = "ema"         # "ema" | "paper" (env IMEFLOW_ADAPTIVE=paper)
     norm_p: float = 1.0                     # imeanflow default.py

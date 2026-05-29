@@ -92,9 +92,13 @@ def load_models(device):
 
 def get_aligned_sample(sc_vae, device):
     # Try different slat dbs
-    slat_db_path = "data/slat_context_balanced.lmdb"
+    slat_db_path = "data/slat_context_faceverse_balanced.lmdb"
     if not os.path.exists(slat_db_path):
-        slat_db_path = "data/slat_context.lmdb"
+        slat_db_path = "data/slat_context_faceverse.lmdb"
+        if not os.path.exists(slat_db_path):
+            slat_db_path = "data/slat_context_balanced.lmdb"
+            if not os.path.exists(slat_db_path):
+                slat_db_path = "data/slat_context.lmdb"
         
     print(f"[LMDB] Connecting to Slat DB: {slat_db_path}")
     env_slat = lmdb.open(slat_db_path, readonly=True, lock=False)

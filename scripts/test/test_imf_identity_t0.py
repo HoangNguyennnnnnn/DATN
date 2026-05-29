@@ -60,6 +60,8 @@ def main():
         help="Path to iMF checkpoint (.pt)",
     )
     ap.add_argument("--lmdb", default="data/slat_context_balanced.lmdb")
+    ap.add_argument("--stats", default=None, help="override slat stats .pt (vd faceverse)")
+    ap.add_argument("--omega", type=float, default=1.0, help="CFG guidance omega cho test (training dùng [1,7])")
     ap.add_argument("--num-samples", type=int, default=8)
     ap.add_argument("--no-ema", action="store_true", help="Dùng model_state_dict thay EMA")
     ap.add_argument(
@@ -101,7 +103,7 @@ def main():
     print(f"  Backend={getattr(model, 'backend', '?')}")
 
     slat_norm_mean = slat_norm_std = None
-    stats_path = mcfg.get("slat_stats_path") or "data/slat_stats.pt"
+    stats_path = args.stats or mcfg.get("slat_stats_path") or "data/slat_stats.pt"
     if stats_path and os.path.exists(stats_path):
         _stats = torch.load(stats_path, map_location="cpu", weights_only=False)
         slat_norm_mean = _stats["mean"].to(device).view(1, 1, -1)
@@ -139,7 +141,8 @@ def main():
     else:
         slats_norm = slats_raw
 
-    omega = torch.ones(B, device=device)
+    omega = torch.full((B,), float(getattr(args, "omega", 1.0)), device=device)
+    print(f"  [omega] = {float(getattr(args, 'omega', 1.0))}")
     zcfg = torch.zeros(B, device=device)
     ocfg = torch.ones(B, device=device)
 
