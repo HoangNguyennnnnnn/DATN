@@ -80,8 +80,9 @@ nohup python -u src/train_imf.py \
     --backbone unet3d \
     --unet-base "${UNET_BASE}" \
     --facescape-all-expressions \
-    --t-sampler uniform \
-    --ratio-r-neq-t 0.0 \
+    --t-sampler "${T_SAMPLER:-uniform}" \
+    --ratio-r-neq-t "${RATIO_RNEQT:-0.0}" \
+    ${IMF_CFG_ARGS:-} \
     --context-use-all \
     --cfg-context-dropout "${CFG_DROPOUT}" \
     --contrastive-loss-weight 0.0 \

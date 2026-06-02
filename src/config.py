@@ -223,7 +223,7 @@ class IMFConfig:
     unet_base: int = 128                 # số kênh gốc UNet (16³ nhỏ nên rẻ); mults [1,2,4]
     unet_cond_dim: int = 512             # chiều embedding time+context (FiLM)
     context_whiten_path: Optional[str] = None  # PCA-whiten context (Bước 2): off-diag cos 0.72→0.13
-    prediction_type: str = "velocity"   # "velocity" (e-x) | "x0" (slat sạch — fix noise lấn át identity)
+    prediction_type: str = "x0"   # "velocity" (e-x) | "x0" (slat sạch — fix noise lấn át identity)
 
     # Kiến trúc Voxel Mamba (v5.0 backbone)
     voxel_mamba_backend: str = "auto"    # auto|mamba|gru

@@ -1376,6 +1376,15 @@ def train_imf(
         _adaptive_mode = str(getattr(imf_cfg, "adaptive_loss_mode", "ema")).strip().lower()
     if _adaptive_mode not in ("paper", "ema"):
         _adaptive_mode = "ema"
+    # Env override cho adaptive_loss_weighting (paper iMF BẮT BUỘC để JVP không nổ:
+    # loss/(loss+eps)^p tự chuẩn hóa → chặn blowup khi (t-r)*du/dt khổng lồ).
+    _adaptive_on_env = os.environ.get("IMEFLOW_ADAPTIVE_ON", "").strip().lower()
+    if _adaptive_on_env in ("1", "true", "yes"):
+        _adaptive_weighting = True
+    elif _adaptive_on_env in ("0", "false", "no"):
+        _adaptive_weighting = False
+    else:
+        _adaptive_weighting = bool(getattr(imf_cfg, "adaptive_loss_weighting", True))
 
     imf = ImprovedMeanFlow(
         sigma_min=imf_cfg.sigma_min,
@@ -1389,7 +1398,7 @@ def train_imf(
         cfg_omega_max=float(getattr(imf_cfg, "cfg_omega_max", 8.0)),
         cfg_omega_power_beta=float(getattr(imf_cfg, "cfg_omega_power_beta", 1.0)),
         enable_cfg_interval_conditioning=bool(getattr(imf_cfg, "cfg_interval_conditioning", True)),
-        adaptive_loss_weighting=bool(getattr(imf_cfg, "adaptive_loss_weighting", True)),
+        adaptive_loss_weighting=_adaptive_weighting,
         paper_strict_tr=_paper_strict,
         adaptive_loss_mode=_adaptive_mode,
         norm_p=float(getattr(imf_cfg, "norm_p", 1.0)),
