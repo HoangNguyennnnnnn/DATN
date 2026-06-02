@@ -133,7 +133,7 @@ class SlatDataset(Dataset):
     
     Bộ đệm (Caching): Slat tokens được lưu đệm vào các tệp .pt để tăng tốc độ.
     """
-    CACHE_SCHEMA_VERSION = 3
+    CACHE_SCHEMA_VERSION = 4
     _lmdb_env_cache: dict[str, object] = {}  # class-level: share envs across instances
 
     @classmethod
@@ -777,8 +777,15 @@ class SlatDataset(Dataset):
                 spatial_shape=[self.ovoxel_resolution] * 3,
                 batch_size=1,
             )
-            mu, _ = model.encode(sparse_input)
-            return mu.detach().cpu()
+            mu, _, x_idx, x_shape = model.encode(sparse_input, return_indices=True)
+            
+            # Khôi phục tensor thưa thớt cho mu để gọi .dense()
+            mu_sparse = spconv.SparseConvTensor(mu, x_idx, x_shape, 1)
+            mu_dense = mu_sparse.dense() # [1, latent_dim, D, H, W]
+            
+            # Flatten thành [D*H*W, latent_dim] (ví dụ: [4096, 32])
+            mu_flat = mu_dense.view(1, mu.shape[-1], -1).transpose(1, 2).squeeze(0)
+            return mu_flat.detach().cpu()
 
         mu, _ = model.encode(feats.to(self.device))
         return mu.detach().cpu()
@@ -840,6 +847,8 @@ def _build_stage2_model_config(model: nn.Module, imf_cfg, model_input_dim: int) 
             "cond_dim": int(getattr(imf_cfg, "unet_cond_dim", 512)),
             "grid_size": int(round(int(getattr(imf_cfg, "slat_length", 4096)) ** (1.0 / 3.0))),
             "context_use_arcface_only": bool(getattr(imf_cfg, "context_use_arcface_only", False)),
+            "num_ctx_tokens": int(getattr(model, "num_ctx_tokens", 16)),
+            "context_whiten_path": getattr(imf_cfg, "context_whiten_path", None) or None,
         }
     return {
         "arch": "voxel_mamba",
@@ -1303,7 +1312,10 @@ def train_imf(
             cond_dim=int(getattr(imf_cfg, "unet_cond_dim", 512)),
             grid_size=int(round(int(getattr(imf_cfg, "slat_length", 4096)) ** (1.0 / 3.0))),
             context_use_arcface_only=bool(getattr(imf_cfg, "context_use_arcface_only", False)),
+            context_whiten_path=getattr(imf_cfg, "context_whiten_path", None) or None,
         ).to(device)
+        if getattr(imf_cfg, "context_whiten_path", None):
+            print(f"  [context] whitening ENABLED: {imf_cfg.context_whiten_path} → ctx_in={model._ctx_in}")
         nparam = sum(p.numel() for p in model.parameters()) / 1e6
         print(f"  Architecture: 3D UNet [base={getattr(imf_cfg, 'unet_base', 128)}, {nparam:.1f}M params]")
         stage2_model_config = _build_stage2_model_config(model, imf_cfg, model_input_dim)
@@ -1547,6 +1559,18 @@ def train_imf(
         print(f"[Slat Norm] DISABLED: slat_stats_path={slat_stats_path} not found. "
               f"Training without slat normalization (risk of identity collapse).")
 
+    # ---- Variance-weighted loss (Hướng B): ánh mạnh voxel mang identity ----
+    voxel_variance_weights = None
+    _vv_path = os.environ.get("VOXEL_VARIANCE_PATH", "")
+    _vv_mult = float(os.environ.get("VOXEL_VARIANCE_MULT", "4.0"))
+    if _vv_path and os.path.exists(_vv_path):
+        _vv = torch.load(_vv_path, map_location="cpu", weights_only=False)["voxel_variance"]
+        _q75 = _vv.quantile(0.75)
+        voxel_variance_weights = torch.where(_vv > _q75,
+                                             torch.tensor(_vv_mult), torch.tensor(1.0)).to(device)
+        print(f"[VarWeight] {_vv_path}: top25% voxel ×{_vv_mult} (q75={_q75:.4f}, "
+              f"{int((_vv > _q75).sum())} voxels ánh mạnh)")
+
     # ---- Training ----
     print(f"\n[4/5] Training for {imf_cfg.num_epochs} epochs...")
     os.makedirs(imf_cfg.checkpoint_dir, exist_ok=True)
@@ -1581,6 +1605,8 @@ def train_imf(
             # identity collapse khi raw slat std=0.36 << noise std=1.0.
             if slat_norm_mean is not None and slat_norm_std is not None:
                 slat_targets = (slat_targets - slat_norm_mean) / slat_norm_std
+                # KEEP empty space EXACTLY 0.0 so the target diffusion velocity is exactly the noise
+                slat_targets = slat_targets * occupancy_mask.unsqueeze(-1)
 
             is_accum_step = (batch_idx + 1) % grad_accum_steps != 0
 
@@ -1610,6 +1636,8 @@ def train_imf(
                     context_velocity_sep_margin=float(getattr(imf_cfg, "context_velocity_sep_margin", 0.0)),
                     occupancy_mask=occupancy_mask,
                     empty_weight_floor=float(os.environ.get("EMPTY_WEIGHT_FLOOR", "0.0")),
+                    voxel_variance_weights=voxel_variance_weights,
+                    prediction_type=os.environ.get("PREDICTION_TYPE", "velocity"),
                     return_components=True,
                 )
 
@@ -1862,6 +1890,7 @@ def main():
     parser.add_argument("--backbone", type=str, default=None, choices=["voxel_mamba", "unet3d"], help="Stage 2 backbone.")
     parser.add_argument("--unet-base", type=int, default=None, help="Base channels for unet3d backbone.")
     parser.add_argument("--t-sampler", type=str, default=None, choices=["uniform", "logit_normal", "curriculum"], help="Timestep sampler.")
+    parser.add_argument("--context-whiten", type=str, default=None, help="Path to context whitening .pt (PCA-whiten context).")
     parser.add_argument("--v-loss-weight", type=float, default=None, help="Auxiliary v-head loss weight (paper uses 1.0; default config 0.5).")
     parser.add_argument("--mamba-num-layers", type=int, default=None, help="BidirectionalMambaBlock count (lite: 8)")
     parser.add_argument("--mamba-ffn-expand", type=int, default=None, help="FFN expansion per block (lite: 2, default: 4)")
@@ -1977,6 +2006,8 @@ def main():
         cfg.imf.unet_base = int(args.unet_base)
     if args.t_sampler is not None:
         cfg.imf.t_sampler = str(args.t_sampler)
+    if args.context_whiten is not None:
+        cfg.imf.context_whiten_path = str(args.context_whiten)
     if args.v_loss_weight is not None:
         cfg.imf.v_loss_weight = float(max(0.0, args.v_loss_weight))
     if getattr(args, "mamba_num_layers", None) is not None:

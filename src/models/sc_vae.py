@@ -569,14 +569,16 @@ class SC_VAE(nn.Module):
         # Final output projection depending on target (Shape logits or Texture regression)
         self.out_proj = nn.Linear(encoder_dims[0], in_channels)
 
-    def encode(self, x) -> Tuple[torch.Tensor, torch.Tensor]:
+    def encode(self, x, return_indices: bool = False):
         """Encode sparse voxels to latent distribution.
         
         Args:
             x: spconv.SparseConvTensor with shape [N, C] features
+            return_indices: If True, also return the indices and spatial_shape of the bottleneck
             
         Returns:
             mu, logvar: Tensors of shape [N, latent_dim]
+            (optional) indices, spatial_shape: if return_indices=True
         """
         if not hasattr(x, 'features'):
             raise TypeError(f"SC-VAE encode expects SparseConvTensor, got {type(x)}")
@@ -598,6 +600,8 @@ class SC_VAE(nn.Module):
 
         mu = self.to_mu(feats)
         logvar = self.to_logvar(feats)
+        if return_indices:
+            return mu, logvar, x.indices, x.spatial_shape
         return mu, logvar
 
     def reparameterize(self, mu: torch.Tensor, logvar: torch.Tensor) -> torch.Tensor:

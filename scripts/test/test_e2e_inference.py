@@ -76,6 +76,7 @@ def slat_to_mesh(
     decode_device: torch.device,
     slat_grid_size: int = 16,
     ovoxel_resolution: int = 256,
+    mask: torch.Tensor | None = None,
 ):
     """Decode slat → SC-VAE → DC mesh (verts, faces, rgb)."""
     b, L, D = slat_raw.shape
@@ -91,9 +92,27 @@ def slat_to_mesh(
     ).int()  # [L, 4] với cột 0 = batch_id
 
     z_flat = slat_raw[0].contiguous()  # [L, D]
+    
+    # [BUG FIX]: Lọc bỏ các token rỗng (do UNet3D dense padding) trước khi đưa vào decode
+    # Nếu đưa toàn bộ grid_indices vào, SC_VAE sẽ bị OOM vì cố gắng decode vùng không gian rỗng (sponge).
+    if mask is None:
+        mask = (z_flat.norm(dim=-1) > 0.1)
+    else:
+        mask = mask.to(decode_device)
+        
+    valid_z = z_flat[mask]
+    valid_indices = grid_indices[mask]
+    
+    print(f"      -> Valid tokens (num_voxels): {mask.sum().item()} / 4096")
+    
+    if valid_z.shape[0] == 0:
+        print("[WARN] UNet3D sinh ra rỗng hoàn toàn! Bỏ qua mask.")
+        valid_z = z_flat
+        valid_indices = grid_indices
+
     voxel_feats, _, _, out_indices = sc_vae.decode(
-        z_flat,
-        original_indices=grid_indices,
+        valid_z,
+        original_indices=valid_indices,
         batch_size=1,
         return_indices=True,
     )

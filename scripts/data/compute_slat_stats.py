@@ -58,15 +58,20 @@ def main():
             if sum_per_ch is None:
                 sample_shape = tuple(slat.shape)
                 sum_per_ch = torch.zeros(slat.shape[-1], dtype=torch.float64)
-            sum_per_ch += slat.sum(dim=tuple(range(slat.ndim - 1)))
-            n_total_tokens += slat.numel() // slat.shape[-1]
+                
+            # Filter valid tokens (non-zero padding)
+            valid_mask = slat.norm(dim=-1) > 0
+            valid_slat = slat[valid_mask]
+            
+            sum_per_ch += valid_slat.sum(dim=0)
+            n_total_tokens += valid_slat.shape[0]
             n_samples += 1
             if args.max_samples and n_samples >= args.max_samples:
                 break
             if n_samples % 1000 == 0:
                 elapsed = time.time() - t0
                 eta = elapsed / n_samples * (20369 - n_samples) if n_samples > 0 else 0
-                print(f"  [{n_samples}] sample shape={sample_shape}, elapsed={elapsed:.1f}s, ETA={eta:.0f}s")
+                print(f"  [{n_samples}] sample shape={sample_shape}, elapsed={elapsed:.1f}s, ETA={eta:.0f}s", flush=True)
 
     mean_per_ch = sum_per_ch / n_total_tokens
     print(f"[Pass 1] done in {time.time()-t0:.1f}s: n_samples={n_samples}, n_tokens={n_total_tokens}")
@@ -88,9 +93,13 @@ def main():
             if not torch.is_tensor(slat):
                 slat = torch.as_tensor(slat)
             slat = slat.to(torch.float64)
-            # Broadcast subtract: slat [L, 32], mean_ref [32]
-            diff = slat - mean_ref
-            sumsq += (diff * diff).sum(dim=tuple(range(slat.ndim - 1)))
+            # Filter valid tokens (non-zero padding)
+            valid_mask = slat.norm(dim=-1) > 0
+            valid_slat = slat[valid_mask]
+            
+            # Broadcast subtract: slat [N, 32], mean_ref [32]
+            diff = valid_slat - mean_ref
+            sumsq += (diff * diff).sum(dim=0)
             n_seen += 1
             if args.max_samples and n_seen >= args.max_samples:
                 break

@@ -527,6 +527,8 @@ class ImprovedMeanFlow:
         context_velocity_sep_margin: float = 0.0,
         occupancy_mask: Optional[torch.Tensor] = None,
         empty_weight_floor: float = 0.0,
+        voxel_variance_weights: Optional[torch.Tensor] = None,
+        prediction_type: str = "velocity",
         return_components: bool = False,
     ):
         """
@@ -589,7 +591,15 @@ class ImprovedMeanFlow:
             position_weights = position_weights / position_weights.mean(dim=-1, keepdim=True).clamp(min=1e-6)
         else:
             position_weights = self._slat_position_weights(x_data)
-        
+
+        # Variance-weighted loss (Bước 3 / Hướng B): ánh mạnh voxel mang identity (top variance
+        # qua dataset). Ép gradient vào ~25% voxel phân biệt thay vì pha loãng đều.
+        # voxel_variance_weights: [L] đã chuẩn hóa (vd top25=4.0, còn lại 1.0). Nhân vào position_weights.
+        if voxel_variance_weights is not None:
+            vw = voxel_variance_weights.to(device=device, dtype=position_weights.dtype).view(1, -1)
+            position_weights = position_weights * vw
+            position_weights = position_weights / position_weights.mean(dim=-1, keepdim=True).clamp(min=1e-6)
+
         # Bước 1: Lấy mẫu nhiễu
         e = torch.randn_like(x_data)
         
@@ -654,9 +664,14 @@ class ImprovedMeanFlow:
             v_theta = _fwd_out
             _cached_hidden = None
         
-        # Sửa lỗi: Hàm mục tiêu là luồng trung bình e - x_data
-        # Không phụ thuộc vào v_theta.detach() để tránh vòng lặp tự dạy luẩn quẩn
-        v_target = e - x_data  # [B, L, D]
+        # Mục tiêu: velocity (e-x) hoặc x0 (x_data sạch).
+        # x0-prediction: loại noise e khỏi target → identity signal không bị lấn át ở high-t
+        # (context-gain<0 với velocity vì noise variance=1.0 áp đảo -x). Chỉ dùng cho FM (r=t).
+        _x0_mode = (str(prediction_type).lower() == "x0")
+        if _x0_mode:
+            v_target = x_data  # model dự đoán x0 trực tiếp
+        else:
+            v_target = e - x_data  # [B, L, D]
         
         # Mục tiêu khớp luồng thô (Raw flow matching target) (e - x), độc lập với tăng cường CFG.
         # Được sử dụng cho việc giám sát v-head phụ trợ theo Phụ lục A của bài báo iMF:
@@ -667,6 +682,9 @@ class ImprovedMeanFlow:
         mask_eq = (r == t)  # [B], True khi r=t
         mask_eq_any = bool(mask_eq.any().item())
         mask_eq_all = bool(mask_eq.all().item())
+        if _x0_mode and not mask_eq_all:
+            raise ValueError("prediction_type='x0' chỉ hỗ trợ FM thuần (ratio_r_neq_t=0). "
+                             "JVP/mean-flow cần velocity parameterization.")
         
         # Khi r=t: u(z,t,t) ≡ v(z,t) → hàm mất mát v đơn giản (simple v-loss)
         # Khi r≠t: hàm hợp V = u + (t-r)*sg(du/dt)
