@@ -136,6 +136,9 @@ class VoxelUNet3D(nn.Module):
         self.out_conv = nn.Conv3d(c1, C, 3, padding=1)
         nn.init.zeros_(self.out_conv.weight)
         nn.init.zeros_(self.out_conv.bias)
+        # Occupancy head: dự đoán voxel nào thuộc mặt (1 logit/voxel) từ cùng decoder feature.
+        # Fix floaters: gen chỉ giữ voxel occ_logit>0 thay vì threshold norm (IoU 0.43 → cao hơn).
+        self.occ_conv = nn.Conv3d(c1, 1, 3, padding=1)
 
     def _to_grid(self, s: torch.Tensor) -> torch.Tensor:
         B = s.shape[0]
@@ -173,6 +176,7 @@ class VoxelUNet3D(nn.Module):
         cfg_tmin: Optional[torch.Tensor] = None,
         cfg_tmax: Optional[torch.Tensor] = None,
         return_hidden: bool = False,
+        return_occupancy: bool = False,
     ) -> torch.Tensor:
         ctx = self._prep_context(context)
         time_cond = self.t_mlp(_sinusoidal(t, 256))
@@ -189,8 +193,11 @@ class VoxelUNet3D(nn.Module):
         u2 = self.attn_up2(u2, ctx_tokens)
         u1 = F.interpolate(u2, scale_factor=2, mode="trilinear", align_corners=False)
         u1 = self.up1(torch.cat([u1, h0], dim=1), time_cond)
-        out = self.out_conv(F.silu(self.out_norm(u1)))
-        out = self._to_seq(out)
+        feat = F.silu(self.out_norm(u1))
+        out = self._to_seq(self.out_conv(feat))
+        if return_occupancy:
+            occ_logit = self.occ_conv(feat).reshape(x.shape[0], -1)  # [B, L] occupancy logit
+            return out, occ_logit
         if return_hidden:
             return out, None
         return out

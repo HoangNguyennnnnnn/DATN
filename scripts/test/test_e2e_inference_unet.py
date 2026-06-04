@@ -28,14 +28,15 @@ from scripts.test.test_e2e_inference import slat_to_mesh, save_ply
 @torch.no_grad()
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--imf-ckpt", default="checkpoints/imf_unet/latest_step.pt")
+    ap.add_argument("--imf-ckpt", default="checkpoints/imf_v4/latest_step.pt")
     ap.add_argument("--sc-vae-ckpt", default="checkpoints/sc_vae_shape/epoch_600.pt")
-    ap.add_argument("--context-lmdb", default="data/slat_context_faceverse_balanced.lmdb")
-    ap.add_argument("--slat-lmdb", default="data/slat_context.lmdb")
-    ap.add_argument("--slat-stats", default="data/slat_stats_faceverse.pt")
+    ap.add_argument("--context-lmdb", default="data/slat_context_v4.lmdb")
+    ap.add_argument("--slat-lmdb", default="data/slat_context_v4.lmdb")
+    ap.add_argument("--slat-stats", default="data/slat_stats_v4.pt")
     ap.add_argument("--n-samples", type=int, default=2, help="Số test samples")
-    ap.add_argument("--steps", type=int, nargs="+", default=[50], help="Sampling steps")
-    ap.add_argument("--omega", type=float, default=1.5)
+    ap.add_argument("--steps", type=int, nargs="+", default=[1], help="Sampling steps (1=iMF 1-step)")
+    ap.add_argument("--omega", type=float, default=2.0)
+    ap.add_argument("--mask-threshold", type=float, default=2.8, help="Raw slat norm threshold để lọc occupied voxel (GT occupied min~2.8)")
     ap.add_argument("--out-dir", default="outputs_e2e")
     ap.add_argument("--device", default="cuda", help="Device for UNet3D sampling (cuda/cpu)")
     ap.add_argument("--decode-device", default="cuda", help="Device cho SC-VAE decode + DC.")
@@ -134,46 +135,35 @@ def main():
             oc = torch.ones(B, device=device)
             null = torch.zeros_like(ctx)
             
+            # iMF VELOCITY sampling: model dự đoán u (average velocity), step z -= dt*v.
+            # CFG guided: v_g = v_u + omega*(v_c - v_u). 1-step iMF: n_steps=1, z0 = z1 - u.
             for k in range(n_steps):
                 tv = 1.0 - k / n_steps
                 tt = torch.full((B,), tv, device=device)
-                
                 with torch.autocast(device_type=device.type, dtype=torch.bfloat16 if device.type == "cuda" else torch.float32):
-                    out_c = model(z, tt, ctx, r=tt, omega=om, cfg_tmin=zc, cfg_tmax=oc).float()
+                    v_c = model(z, tt, ctx, r=tt, omega=om, cfg_tmin=zc, cfg_tmax=oc).float()
                     if args.omega != 1.0:
-                        out_u = model(z, tt, null, r=tt, omega=om, cfg_tmin=zc, cfg_tmax=oc).float()
-                        x0h = out_u + args.omega * (out_c - out_u)
+                        v_u = model(z, tt, null, r=tt, omega=om, cfg_tmin=zc, cfg_tmax=oc).float()
+                        v = v_u + args.omega * (v_c - v_u)
                     else:
-                        x0h = out_c
-                
-                v = (z - x0h) / max(tv, 1e-3)
+                        v = v_c
                 z = z - (1.0 / n_steps) * v
-            
+
             slat_norm = z.float()
-            
-            # --- BẢN VÁ: Gọt bọt biển (Clamp) ---
-            slat_norm = torch.clamp(slat_norm, min=-3.0, max=3.0)
-            
-            slat_raw = slat_norm * slat_std + slat_mean
-            
+
             print(f"    Decoding via SC-VAE + DC...")
             try:
                 if torch.cuda.is_available():
                     torch.cuda.empty_cache()
-                slat_norm = slat_norm.to(decode_device)
-                
-                # Check valid tokens based on normalized predictions
-                # Since we trained the model to predict exactly 0.0 for empty space in the normalized domain,
-                # slat_norm will be close to 0.0 for empty space.
-                # Real surface tokens will have variance 1.0 per channel, so norm over 32 channels is ~sqrt(32)=5.65
-                mask = (slat_norm.norm(dim=-1) > 1.0).squeeze(0) # Threshold safely above noise but below 5.65
-                
-                # Un-normalize for VAE decoding
-                slat_raw = slat_norm * slat_std.to(slat_norm) + slat_mean.to(slat_norm)
-                
-                # Apply mask explicitly to empty space before passing to VAE
-                slat_raw = slat_raw * mask.unsqueeze(-1).to(slat_raw.dtype)
-                
+                # Un-normalize TRƯỚC, mask trên RAW slat. GT occupied norm min~2.8; gen sinh 4096
+                # voxel đặc (chưa học occupancy) → threshold cao (--mask-threshold, mặc định 2.8)
+                # để lọc voxel yếu, tránh sponge. KHÔNG mask trên normalized (empty≠0).
+                slat_raw = (slat_norm.to(decode_device) * slat_std.to(decode_device)
+                            + slat_mean.to(decode_device))
+                rn = slat_raw[0].norm(dim=-1)
+                mask = (rn > args.mask_threshold)
+                print(f"    mask raw norm>{args.mask_threshold}: {int(mask.sum())}/4096 occupied "
+                      f"(norm med={rn.median():.2f})")
                 verts, faces, colors, n_voxels = slat_to_mesh(slat_raw, sc_vae, decode_device, mask=mask)
                 out_path = os.path.join(args.out_dir, f"{name}_unet_{n_steps}step.ply")
                 ok = save_ply(verts, faces, colors, out_path)

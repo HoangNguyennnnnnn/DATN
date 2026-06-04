@@ -130,3 +130,9 @@ docs/
 
 #iFaceFlow 
 iFaceFlow/
+
+20252_SOICT_DATN_Research_VIE_Nguyễn_Trịnh_Hoàng_Nguyên_20225656/
+
+# ── LaTeX (TinyTeX install for thesis — tool install, not project code) ──
+.TinyTeX/
+/bin/

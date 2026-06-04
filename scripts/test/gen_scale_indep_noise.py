@@ -23,14 +23,16 @@ def load_model(ckpt, dev, no_ema=True):
     return m
 
 
-def load_samples(p, n, skip=0):
+def load_samples(p, n, skip=0, stride=1):
     env = lmdb.open(p, readonly=True, lock=False, readahead=False)
     sl, cx = [], []
     with env.begin() as t:
-        cur = t.cursor(); cur.first(); c = 0; seen = 0
+        cur = t.cursor(); cur.first(); c = 0; seen = 0; idx = 0
         for k, v in cur:
             if k == b"__meta__": continue
             if seen < skip: seen += 1; continue
+            if idx % stride != 0: idx += 1; continue
+            idx += 1
             b = torch.load(io.BytesIO(v), map_location="cpu", weights_only=False)
             sl.append(b["slat"].float()); cx.append(b["context"].float().flatten()); c += 1
             if c >= n: break
@@ -46,6 +48,7 @@ def main():
     ap.add_argument("--stats", default="data/slat_stats_both.pt")
     ap.add_argument("--n", type=int, default=8)
     ap.add_argument("--skip", type=int, default=2000)
+    ap.add_argument("--stride", type=int, default=1, help="Lấy mỗi stride-th mẫu (>21 để né cùng-ID FaceVerse)")
     ap.add_argument("--steps", type=int, default=50)
     ap.add_argument("--omega", type=float, default=1.0)
     ap.add_argument("--prediction-type", default="velocity", choices=["velocity", "x0"])
@@ -53,7 +56,7 @@ def main():
     dev = torch.device("cuda")
 
     m = load_model(args.ckpt, dev)
-    sl, ctx = load_samples(args.lmdb, args.n, args.skip)
+    sl, ctx = load_samples(args.lmdb, args.n, args.skip, args.stride)
     st = torch.load(args.stats, map_location="cpu", weights_only=False)
     mean = st["mean"].view(1, 1, -1).to(dev); std = st["std"].view(1, 1, -1).to(dev)
     x = (sl.to(dev) - mean) / std; ctx = ctx.to(dev); B = x.shape[0]

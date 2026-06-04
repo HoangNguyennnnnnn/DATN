@@ -429,10 +429,15 @@ def extract_ovoxel_mesh(coords: torch.Tensor, feats: torch.Tensor, aabb, res: in
             _tm.repair.fix_winding(mesh)
             print(f"    [TIMING] trimesh.fix_normals/winding: {_time.time()-_t0:.2f}s")
 
-            # Step 2: Fill small holes
+            # Step 2: Fill small holes. Lỗ chấm = single dropped quads (voxel thiếu neighbor).
+            # merge_vertices TRƯỚC để biên lỗ liền nhau (DC tạo vertex trùng tọa độ nhưng index khác
+            # → fill_holes không thấy biên khép kín). Lặp 2 lần để vá lỗ lộ ra sau lần đầu.
             _t0 = _time.time()
+            mesh.merge_vertices()
             _tm.repair.fill_holes(mesh)
-            print(f"    [TIMING] trimesh.fill_holes: {_time.time()-_t0:.2f}s")
+            mesh.merge_vertices()
+            _tm.repair.fill_holes(mesh)
+            print(f"    [TIMING] trimesh.fill_holes (merge+2x): {_time.time()-_t0:.2f}s")
 
             # Step 3: Remove degenerate/duplicate faces
             _t0 = _time.time()

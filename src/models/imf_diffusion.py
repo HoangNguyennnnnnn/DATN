@@ -529,6 +529,7 @@ class ImprovedMeanFlow:
         empty_weight_floor: float = 0.0,
         voxel_variance_weights: Optional[torch.Tensor] = None,
         prediction_type: str = "velocity",
+        occupancy_loss_weight: float = 0.0,
         return_components: bool = False,
     ):
         """
@@ -655,14 +656,28 @@ class ImprovedMeanFlow:
         )
         if _want_hidden:
             _fwd_kwargs['return_hidden'] = True
-        
+        # Occupancy head: dự đoán voxel nào thuộc mặt (fix floaters). Chỉ khi bật + có mask.
+        _want_occ = (occupancy_loss_weight > 0.0 and occupancy_mask is not None
+                     and not _want_hidden)
+        if _want_occ:
+            _fwd_kwargs['return_occupancy'] = True
+
         _fwd_out = model(z_t, t, context_cond, **_fwd_kwargs)
-        
-        if _want_hidden and isinstance(_fwd_out, tuple):
+
+        loss_occupancy = torch.zeros((), device=device)
+        occ_logit = None
+        if _want_occ and isinstance(_fwd_out, tuple):
+            v_theta, occ_logit = _fwd_out
+            _cached_hidden = None
+        elif _want_hidden and isinstance(_fwd_out, tuple):
             v_theta, _cached_hidden = _fwd_out
         else:
             v_theta = _fwd_out
             _cached_hidden = None
+        if occ_logit is not None:
+            # BCE: occ_logit [B,L] vs occupancy_mask [B,L] (1=occupied voxel mặt)
+            occ_target = (occupancy_mask > 0.5).to(dtype=occ_logit.dtype)
+            loss_occupancy = F.binary_cross_entropy_with_logits(occ_logit, occ_target)
         
         # Mục tiêu: velocity (e-x) hoặc x0 (x_data sạch).
         # x0-prediction: loại noise e khỏi target → identity signal không bị lấn át ở high-t
@@ -802,6 +817,8 @@ class ImprovedMeanFlow:
                 loss = loss + float(contrastive_loss_weight) * loss_contrastive
             if float(context_velocity_sep_weight) > 0.0:
                 loss = loss + float(context_velocity_sep_weight) * loss_context_sep
+            if occupancy_loss_weight > 0.0:
+                loss = loss + float(occupancy_loss_weight) * loss_occupancy
             loss_boundary = per_sample_boundary.mean()
             if return_components:
                 return {
@@ -813,6 +830,7 @@ class ImprovedMeanFlow:
                     "loss_v_head": loss_v_head.detach(),
                     "loss_contrastive": loss_contrastive.detach(),
                     "loss_context_sep": loss_context_sep.detach(),
+                    "loss_occupancy": loss_occupancy.detach(),
                     "ctx_sep_cos": ctx_sep_cos_monitor.detach(),
                     "material_supervision_keep_ratio": material_keep_ratio.detach(),
                     "cfg_context_keep_ratio": cfg_context_keep_ratio.detach(),
@@ -922,6 +940,8 @@ class ImprovedMeanFlow:
             loss = loss + float(contrastive_loss_weight) * loss_contrastive
         if float(context_velocity_sep_weight) > 0.0:
             loss = loss + float(context_velocity_sep_weight) * loss_context_sep
+        if occupancy_loss_weight > 0.0:
+            loss = loss + float(occupancy_loss_weight) * loss_occupancy
 
         if return_components:
             return {
@@ -933,6 +953,7 @@ class ImprovedMeanFlow:
                 "loss_v_head": loss_v_head.detach(),
                 "loss_contrastive": loss_contrastive.detach(),
                 "loss_context_sep": loss_context_sep.detach(),
+                "loss_occupancy": loss_occupancy.detach(),
                 "ctx_sep_cos": ctx_sep_cos_monitor.detach(),
                 "material_supervision_keep_ratio": material_keep_ratio.detach(),
                 "cfg_context_keep_ratio": cfg_context_keep_ratio.detach(),

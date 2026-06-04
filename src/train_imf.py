@@ -991,7 +991,10 @@ def load_checkpoint(
             if ema and 'ema_state_dict' in ckpt:
                 ema_device = next(model.parameters()).device
                 ema.load_state_dict(ckpt['ema_state_dict'], device=ema_device)
-        except (ValueError, RuntimeError) as exc:
+        except (ValueError, RuntimeError, KeyError) as exc:
+            # KeyError '_schedulers': SequentialLR mới vs scheduler_state_dict cũ thiếu key.
+            # → auto-downgrade: model+epoch giữ nguyên, scheduler thay ConstantLR (LR=1e-4
+            # constant, không warmup lại), EMA re-init từ model weights. An toàn để resume tiếp.
             resumed_full = False
             downgrade_reasons.append(f"optimizer/scheduler state mismatch: {exc}")
 
@@ -1647,6 +1650,7 @@ def train_imf(
                     empty_weight_floor=float(os.environ.get("EMPTY_WEIGHT_FLOOR", "0.0")),
                     voxel_variance_weights=voxel_variance_weights,
                     prediction_type=os.environ.get("PREDICTION_TYPE", "velocity"),
+                    occupancy_loss_weight=float(os.environ.get("OCCUPANCY_LOSS_WEIGHT", "0.0")),
                     return_components=True,
                 )
 
