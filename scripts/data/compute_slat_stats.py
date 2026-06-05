@@ -33,6 +33,8 @@ def main():
     ap.add_argument("--sc-vae-ckpt", default="checkpoints/sc_vae_shape/epoch_500.pt")
     ap.add_argument("--max-samples", type=int, default=None,
                     help="Giới hạn số samples (debug); default = toàn bộ")
+    ap.add_argument("--key-prefix", default="",
+                    help="Chỉ tính trên key bắt đầu prefix (vd 'faceverse' để stats faceverse-only từ both lmdb)")
     args = ap.parse_args()
 
     env = lmdb.open(args.lmdb, readonly=True, lock=False, readahead=False, max_readers=64)
@@ -49,6 +51,8 @@ def main():
         cur = txn.cursor()
         for k, v in cur:
             if k == b"__meta__":
+                continue
+            if args.key_prefix and not k.decode().startswith(args.key_prefix):
                 continue
             blob = torch.load(io.BytesIO(v), map_location="cpu", weights_only=False)
             slat = blob["slat"]
@@ -87,6 +91,8 @@ def main():
         cur = txn.cursor()
         for k, v in cur:
             if k == b"__meta__":
+                continue
+            if args.key_prefix and not k.decode().startswith(args.key_prefix):
                 continue
             blob = torch.load(io.BytesIO(v), map_location="cpu", weights_only=False)
             slat = blob["slat"]
