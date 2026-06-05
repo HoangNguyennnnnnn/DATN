@@ -6,7 +6,7 @@ Organized into subdirectories by purpose. Core training scripts remain at root.
 
 | Script | Purpose |
 |--------|---------|
-| `train_imf.sh` | Generic iMF VoxelMamba training (recommended in CLAUDE.md) |
+| `train_imf_both20k.sh` / `auto_regen_and_train_both20k.sh` | iMF UNet3D training (xem CLAUDE.md — bảng này có thể cũ; CLAUDE.md là nguồn chuẩn) |
 | `train_imf_v7.sh` | **Stage 2 v7 Phase A** (boundary-only, batch=4) |
 | `train_imf_v7_phaseB.sh` | **Stage 2 v7 Phase B+C** (+ JVP + v-head + contrastive, batch=2) |
 | `train_imf_balanced.sh` | Training with balanced context LMDB (baseline reference) |
@@ -54,8 +54,7 @@ Used during training to verify model behavior. Re-usable.
 
 | Script | Purpose |
 |--------|---------|
-| `inference_from_image.py` | Photo → mesh end-to-end inference |
-| `preprocess_image.py` | Image → hybrid context vector |
+| `preprocess_image.py` | Image → hybrid context vector (real-image→mesh unet3d sẽ build khi finetune; bản mamba `inference_from_image.py`/`generator.py` đã xoá) |
 
 ## `viz/` — Visualization
 

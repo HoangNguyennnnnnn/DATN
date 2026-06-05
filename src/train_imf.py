@@ -836,47 +836,19 @@ def _resolve_material_config(imf_cfg) -> None:
 
 
 def _build_stage2_model_config(model: nn.Module, imf_cfg, model_input_dim: int) -> dict:
-    if str(getattr(imf_cfg, "backbone", "voxel_mamba")) == "unet3d":
-        return {
-            "arch": "unet3d",
-            "input_dim": int(model_input_dim),
-            "context_dim": int(getattr(imf_cfg, "context_dim", 946)),
-            "slat_length": int(getattr(imf_cfg, "slat_length", 4096)),
-            "slat_stats_path": getattr(imf_cfg, "slat_stats_path", None),
-            "base": int(getattr(imf_cfg, "unet_base", 128)),
-            "cond_dim": int(getattr(imf_cfg, "unet_cond_dim", 512)),
-            "grid_size": int(round(int(getattr(imf_cfg, "slat_length", 4096)) ** (1.0 / 3.0))),
-            "context_use_arcface_only": bool(getattr(imf_cfg, "context_use_arcface_only", False)),
-            "num_ctx_tokens": int(getattr(model, "num_ctx_tokens", 16)),
-            "context_whiten_path": getattr(imf_cfg, "context_whiten_path", None) or None,
-        }
+    # Backbone duy nhất hiện tại: VoxelUNet3D (VoxelMamba đã deprecate/xoá).
     return {
-        "arch": "voxel_mamba",
+        "arch": "unet3d",
         "input_dim": int(model_input_dim),
         "context_dim": int(getattr(imf_cfg, "context_dim", 946)),
         "slat_length": int(getattr(imf_cfg, "slat_length", 4096)),
         "slat_stats_path": getattr(imf_cfg, "slat_stats_path", None),
-        "hidden_dim": int(getattr(model, "hidden_dim", getattr(imf_cfg, "mamba_hidden_dim", 512))),
-        "num_layers": int(getattr(imf_cfg, "mamba_num_layers", 12)),
-        "backend": str(getattr(model, "backend", getattr(imf_cfg, "voxel_mamba_backend", "auto"))),
-        "strict": bool(getattr(imf_cfg, "voxel_mamba_strict", False)),
-        "num_context_tokens": int(getattr(model, "num_context_tokens", getattr(imf_cfg, "mamba_num_context_tokens", 8))),
-        "num_time_tokens": int(getattr(model, "num_time_tokens", getattr(imf_cfg, "mamba_num_time_tokens", 4))),
-        "num_r_tokens": int(getattr(model, "num_r_tokens", getattr(imf_cfg, "mamba_num_r_tokens", 4))),
-        "num_interval_tokens": int(getattr(model, "num_interval_tokens", getattr(imf_cfg, "mamba_num_interval_tokens", 4))),
-        "num_guidance_tokens": int(getattr(model, "num_guidance_tokens", getattr(imf_cfg, "mamba_num_guidance_tokens", 4))),
-        "use_per_layer_context": bool(getattr(model, "use_per_layer_context", getattr(imf_cfg, "mamba_use_per_layer_context", False))),
-        "context_cond_mode": str(getattr(model, "context_cond_mode", getattr(imf_cfg, "context_cond_mode", "cross_attn"))),
-        "context_use_arcface_only": bool(getattr(model, "context_use_arcface_only", getattr(imf_cfg, "context_use_arcface_only", True))),
-        "num_context_kv_tokens": int(getattr(model, "num_context_kv_tokens", getattr(imf_cfg, "mamba_num_context_kv_tokens", 8))),
-        "context_cross_attn_heads": int(getattr(model, "context_cross_attn_heads", getattr(imf_cfg, "mamba_context_cross_attn_heads", 8))),
-        "conditioning": str(getattr(model, "context_cond_mode", "cross_attn")),
-        "d_state": int(getattr(imf_cfg, "mamba_d_state", 16)),
-        "d_conv": int(getattr(imf_cfg, "mamba_d_conv", 4)),
-        "expand": int(getattr(imf_cfg, "mamba_expand", 2)),
-        
-        "dropout": float(getattr(imf_cfg, "dropout", 0.0)),
-        "context_segment_weights": getattr(imf_cfg, "context_segment_weights", None),
+        "base": int(getattr(imf_cfg, "unet_base", 128)),
+        "cond_dim": int(getattr(imf_cfg, "unet_cond_dim", 512)),
+        "grid_size": int(round(int(getattr(imf_cfg, "slat_length", 4096)) ** (1.0 / 3.0))),
+        "context_use_arcface_only": bool(getattr(imf_cfg, "context_use_arcface_only", False)),
+        "num_ctx_tokens": int(getattr(model, "num_ctx_tokens", 16)),
+        "context_whiten_path": getattr(imf_cfg, "context_whiten_path", None) or None,
     }
 
 
@@ -1302,74 +1274,33 @@ def train_imf(
     dataloader = DataLoader(**dataloader_kwargs)
     print(f"  Dataset: {len(dataset)} samples, {len(dataloader)} batches/epoch")
     
-    # ---- Model: backbone selection (voxel_mamba | unet3d) ----
+    # ---- Model: VoxelUNet3D backbone (VoxelMamba đã deprecate/xoá) ----
     model_input_dim = imf_cfg.input_dim * 2 if imf_cfg.dual_branch else imf_cfg.input_dim
-    _backbone = str(getattr(imf_cfg, "backbone", "voxel_mamba"))
-    if _backbone == "unet3d":
-        print("\n[4/5] Building 3D UNet backbone...")
-        from src.models.unet3d import VoxelUNet3D
-        model = VoxelUNet3D(
-            input_dim=model_input_dim,
-            context_dim=int(getattr(imf_cfg, "context_dim", 946)),
-            base=int(getattr(imf_cfg, "unet_base", 128)),
-            cond_dim=int(getattr(imf_cfg, "unet_cond_dim", 512)),
-            grid_size=int(round(int(getattr(imf_cfg, "slat_length", 4096)) ** (1.0 / 3.0))),
-            context_use_arcface_only=bool(getattr(imf_cfg, "context_use_arcface_only", False)),
-            context_whiten_path=getattr(imf_cfg, "context_whiten_path", None) or None,
-        ).to(device)
-        if getattr(imf_cfg, "context_whiten_path", None):
-            print(f"  [context] whitening ENABLED: {imf_cfg.context_whiten_path} → ctx_in={model._ctx_in}")
-        nparam = sum(p.numel() for p in model.parameters()) / 1e6
-        print(f"  Architecture: 3D UNet [base={getattr(imf_cfg, 'unet_base', 128)}, {nparam:.1f}M params]")
-        stage2_model_config = _build_stage2_model_config(model, imf_cfg, model_input_dim)
-    else:
-        print("\n[4/5] Building Voxel Mamba v5.0...")
-        from src.models.voxel_mamba import VoxelMamba
-        seg_w = getattr(imf_cfg, "context_segment_weights", None)
-        if seg_w is not None and len(seg_w) == 3:
-            seg_w = tuple(float(x) for x in seg_w)
-            print(f"  [context] segment weights Arc/FLAME/DINO = {seg_w}")
-        ctx_mode = str(getattr(imf_cfg, "context_cond_mode", "cross_attn"))
-        arc_only = bool(getattr(imf_cfg, "context_use_arcface_only", True))
-        print(f"  [context] mode={ctx_mode}, arcface_only={arc_only}")
-        model = VoxelMamba(
-            input_dim=model_input_dim,
-            hidden_dim=imf_cfg.mamba_hidden_dim,
-            num_layers=imf_cfg.mamba_num_layers,
-            slat_length=imf_cfg.slat_length,
-            context_dim=imf_cfg.context_dim,
-            backend=str(getattr(imf_cfg, "voxel_mamba_backend", "auto")),
-            strict=bool(getattr(imf_cfg, "voxel_mamba_strict", False)),
-            num_context_tokens=int(getattr(imf_cfg, "mamba_num_context_tokens", 0)),
-            num_time_tokens=int(getattr(imf_cfg, "mamba_num_time_tokens", 4)),
-            num_r_tokens=int(getattr(imf_cfg, "mamba_num_r_tokens", 4)),
-            num_interval_tokens=int(getattr(imf_cfg, "mamba_num_interval_tokens", 4)),
-            num_guidance_tokens=int(getattr(imf_cfg, "mamba_num_guidance_tokens", 4)),
-            use_per_layer_context=bool(getattr(imf_cfg, "mamba_use_per_layer_context", False)),
-            d_state=imf_cfg.mamba_d_state,
-            d_conv=imf_cfg.mamba_d_conv,
-            expand=imf_cfg.mamba_expand,
-            ffn_expand=int(getattr(imf_cfg, "mamba_ffn_expand", 4)),
-            dropout=imf_cfg.dropout,
-            context_segment_weights=seg_w if not arc_only else None,
-            context_cond_mode=ctx_mode,
-            context_use_arcface_only=arc_only,
-            num_context_kv_tokens=int(getattr(imf_cfg, "mamba_num_context_kv_tokens", 8)),
-            context_cross_attn_heads=int(getattr(imf_cfg, "mamba_context_cross_attn_heads", 8)),
-        ).to(device)
-        print(f"  Architecture: Voxel Mamba [D={imf_cfg.mamba_hidden_dim}, L={imf_cfg.mamba_num_layers}]")
-        print(f"  Backend: {getattr(model, 'backend', 'unknown')}")
-        print(f"  Complexity: O(N) linear scan (vs O(N²) attention)")
-        stage2_model_config = _build_stage2_model_config(model, imf_cfg, model_input_dim)
+    _backbone = str(getattr(imf_cfg, "backbone", "unet3d"))
+    if _backbone != "unet3d":
+        raise ValueError(
+            f"Backbone '{_backbone}' không còn hỗ trợ — chỉ còn 'unet3d' (VoxelMamba đã xoá). "
+            f"Dùng --backbone unet3d."
+        )
+    print("\n[4/5] Building 3D UNet backbone...")
+    from src.models.unet3d import VoxelUNet3D
+    model = VoxelUNet3D(
+        input_dim=model_input_dim,
+        context_dim=int(getattr(imf_cfg, "context_dim", 946)),
+        base=int(getattr(imf_cfg, "unet_base", 128)),
+        cond_dim=int(getattr(imf_cfg, "unet_cond_dim", 512)),
+        grid_size=int(round(int(getattr(imf_cfg, "slat_length", 4096)) ** (1.0 / 3.0))),
+        context_use_arcface_only=bool(getattr(imf_cfg, "context_use_arcface_only", False)),
+        context_whiten_path=getattr(imf_cfg, "context_whiten_path", None) or None,
+    ).to(device)
+    if getattr(imf_cfg, "context_whiten_path", None):
+        print(f"  [context] whitening ENABLED: {imf_cfg.context_whiten_path} → ctx_in={model._ctx_in}")
+    nparam = sum(p.numel() for p in model.parameters()) / 1e6
+    print(f"  Architecture: 3D UNet [base={getattr(imf_cfg, 'unet_base', 128)}, {nparam:.1f}M params]")
+    stage2_model_config = _build_stage2_model_config(model, imf_cfg, model_input_dim)
 
-    # ---- Compilation (RTX 4090 Optimization) ----
-    # Bỏ qua torch.compile khi dùng mamba-ssm CUDA kernels (không tương thích).
-    _can_compile = device.type == "cuda" and hasattr(torch, "compile")
-    if _can_compile and not getattr(model, "use_mamba", False) and _backbone != "unet3d":
-        print("\n[4.5/5] Compiling model with torch.compile (reduce-overhead)...")
-        model = torch.compile(model, mode="reduce-overhead")
-    else:
-        print("\n[4.5/5] Skipping torch.compile (mamba-ssm CUDA kernels không tương thích)")
+    # ---- torch.compile: KHÔNG dùng với iMF (JVP = double-backward, compile không hỗ trợ) ----
+    print("\n[4.5/5] Skipping torch.compile (JVP double-backward không tương thích compile)")
     
     _paper_strict = os.environ.get("IMEFLOW_PAPER_STRICT", "").strip().lower() in ("1", "true", "yes")
     if not _paper_strict:
@@ -1413,10 +1344,7 @@ def train_imf(
     v_head = None
     if getattr(imf_cfg, "use_v_loss", True) and getattr(imf_cfg, "use_auxiliary_v_head", True):
         print("  [v-loss] Adding auxiliary v-head...")
-        if stage2_model_config["arch"] == "voxel_mamba":
-            model_hidden_dim = int(stage2_model_config["hidden_dim"])
-        else:
-            model_hidden_dim = int(stage2_model_config["hidden_dims"][0])
+        model_hidden_dim = int(stage2_model_config.get("cond_dim", 512))
         v_head_depth = int(getattr(imf_cfg, "v_head_depth", 8))
         v_head_mlp_ratio = int(getattr(imf_cfg, "v_head_mlp_ratio", 4))
         from src.models.v_head import VHead
@@ -1440,10 +1368,7 @@ def train_imf(
         from src.models.imf_diffusion import contrastive_target_dim
         contrastive_mode = str(getattr(imf_cfg, "contrastive_mode", "arcface"))
         ctx_out_dim = contrastive_target_dim(int(imf_cfg.context_dim), contrastive_mode)
-        if stage2_model_config["arch"] == "voxel_mamba":
-            model_hidden_dim = int(stage2_model_config["hidden_dim"])
-        else:
-            model_hidden_dim = int(stage2_model_config["hidden_dims"][0])
+        model_hidden_dim = int(stage2_model_config.get("cond_dim", 512))
         ctx_classifier = nn.Sequential(
             nn.Linear(model_hidden_dim, model_hidden_dim),
             nn.SiLU(),
@@ -1900,13 +1825,11 @@ def main():
     parser.add_argument("--context-velocity-sep-margin", type=float, default=None,
                         help="Margin for context sep loss (penalize cos above this).")
     parser.add_argument("--ratio-r-neq-t", type=float, default=None, help="Fraction of batches with r≠t (JVP). 0.5 = paper default.")
-    parser.add_argument("--backbone", type=str, default=None, choices=["voxel_mamba", "unet3d"], help="Stage 2 backbone.")
+    parser.add_argument("--backbone", type=str, default=None, choices=["unet3d"], help="Stage 2 backbone (chỉ còn unet3d; VoxelMamba đã xoá).")
     parser.add_argument("--unet-base", type=int, default=None, help="Base channels for unet3d backbone.")
     parser.add_argument("--t-sampler", type=str, default=None, choices=["uniform", "logit_normal", "curriculum"], help="Timestep sampler.")
     parser.add_argument("--context-whiten", type=str, default=None, help="Path to context whitening .pt (PCA-whiten context).")
     parser.add_argument("--v-loss-weight", type=float, default=None, help="Auxiliary v-head loss weight (paper uses 1.0; default config 0.5).")
-    parser.add_argument("--mamba-num-layers", type=int, default=None, help="BidirectionalMambaBlock count (lite: 8)")
-    parser.add_argument("--mamba-ffn-expand", type=int, default=None, help="FFN expansion per block (lite: 2, default: 4)")
     parser.add_argument("--num-workers", type=int, default=None, help="Dataloader workers (default: config data.num_workers)")
     parser.add_argument("--prefetch-factor", type=int, default=None, help="Batches prefetched per worker (default: config data.prefetch_factor)")
     parser.add_argument("--no-wandb", action="store_true", help="Disable WandB")
@@ -2023,10 +1946,6 @@ def main():
         cfg.imf.context_whiten_path = str(args.context_whiten)
     if args.v_loss_weight is not None:
         cfg.imf.v_loss_weight = float(max(0.0, args.v_loss_weight))
-    if getattr(args, "mamba_num_layers", None) is not None:
-        cfg.imf.mamba_num_layers = int(max(1, args.mamba_num_layers))
-    if getattr(args, "mamba_ffn_expand", None) is not None:
-        cfg.imf.mamba_ffn_expand = int(max(1, args.mamba_ffn_expand))
     if args.num_workers is not None:
         cfg.data.num_workers = args.num_workers
         cfg.imf.num_workers = args.num_workers

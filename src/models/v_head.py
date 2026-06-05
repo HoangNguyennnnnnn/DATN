@@ -43,7 +43,7 @@ class VHead(nn.Module):
     """8-layer auxiliary v-head theo iMF paper Table 4.
 
     Args:
-        hidden_dim: chiều ẩn của backbone (e.g., 512 cho VoxelMamba)
+        hidden_dim: chiều ẩn của backbone (e.g., cond_dim 512 cho UNet3D)
         out_dim:    chiều output (e.g., 32 = slat latent dim)
         depth:      số block, paper dùng 8
         mlp_ratio:  expansion ratio trong MLP block

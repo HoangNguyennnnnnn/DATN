@@ -38,6 +38,7 @@ def main():
     ap.add_argument("--omega", type=float, default=2.0)
     ap.add_argument("--mask-threshold", type=float, default=2.8, help="Raw slat norm threshold để lọc occupied voxel (GT occupied min~2.8)")
     ap.add_argument("--out-dir", default="outputs_e2e")
+    ap.add_argument("--key-prefix", default="", help="Chỉ lấy context có key bắt đầu prefix (vd 'faceverse' / 'facescape')")
     ap.add_argument("--device", default="cuda", help="Device for UNet3D sampling (cuda/cpu)")
     ap.add_argument("--decode-device", default="cuda", help="Device cho SC-VAE decode + DC.")
     ap.add_argument("--seed", type=int, default=42)
@@ -91,10 +92,15 @@ def main():
     test_keys = []
     with ctx_env.begin() as txn:
         cur = txn.cursor()
-        cur.first()
+        if args.key_prefix:
+            cur.set_range(args.key_prefix.encode())  # nhảy tới key >= prefix
+        else:
+            cur.first()
         for k, _ in cur:
             if k == b"__meta__":
                 continue
+            if args.key_prefix and not k.decode().startswith(args.key_prefix):
+                break  # đã qua hết key của prefix
             test_keys.append(k)
             if len(test_keys) >= args.n_samples + 20:
                 break

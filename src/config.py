@@ -5,7 +5,7 @@ Các giá trị mặc định cho pipeline 2 giai đoạn hiện tại trên RTX
 
 Đường dẫn chuẩn hiện tại:
 - Giai đoạn 1: SC-VAE thống nhất trên `shape_mat` (10 kênh)
-- Giai đoạn 2: iMF trên Slat latents, backbone mặc định `VoxelMamba`
+- Giai đoạn 2: iMF trên Slat latents, backbone `VoxelUNet3D` (VoxelMamba đã deprecate/xoá)
 - Các chế độ thử nghiệm/nhánh rẽ cũ vẫn được giữ lại cho các bài kiểm thử tùy chọn
 """
 
@@ -205,46 +205,23 @@ class IMFConfig:
     - U-Net ~70M tham số + đạo hàm (gradients) → tổng ~20GB VRAM
     - An toàn khi chạy trên RTX 4090 24GB
     """
-    # Kiến trúc (Tối ưu cho 20K mẫu khuôn mặt, RTX 4090)
-    # VoxelMamba backbone: ~49M tham số (12 layers × 512 hidden × d_state=16 × expand=2).
+    # Kiến trúc Stage 2 (Tối ưu cho 20K mẫu khuôn mặt, RTX 4090)
     input_dim: int = 32                # Số chiều Slat token - BẮT BUỘC KHỚP với SC-VAE latent_dim
     # Per-channel slat normalization (TRELLIS.2 style — CRITICAL):
     # SC-VAE latent std~0.36 vs noise std=1.0 → SNR thấp → identity collapse.
-    # Apply (slat - mean) / std trước khi train, reverse khi decode.
-    # Stats được tính 1 lần bằng scripts/compute_slat_stats.py, lưu shape [32] mean+std.
+    # Apply (slat - mean) / std trước khi train, reverse khi decode (tính bằng compute_slat_stats.py).
     slat_stats_path: Optional[str] = "data/slat_stats.pt"
     context_dim: int = 946             # Ngữ cảnh Lai v4.1 (ArcFace 512 + FLAME 50 + DINOv2_Back 384)
-    slat_length: int = 4096            # Số Slat tokens trên mỗi lưới
+    slat_length: int = 4096            # Số Slat tokens trên mỗi lưới (= 16³ grid)
 
-    # Backbone selection: "voxel_mamba" | "unet3d"
-    # unet3d (29/05): 3D conv UNet trên grid 16³ — data-efficient, sinh được (validate overfit).
-    # VoxelMamba không generate được (cos 0.03 vs UNet 0.97). Xem docs/AUDIT_FINDINGS.md.
-    backbone: str = "voxel_mamba"
+    # Backbone: CHỈ còn "unet3d" — VoxelMamba đã deprecate/xoá (không generate được ở scale).
+    backbone: str = "unet3d"
     unet_base: int = 128                 # số kênh gốc UNet (16³ nhỏ nên rẻ); mults [1,2,4]
     unet_cond_dim: int = 512             # chiều embedding time+context (FiLM)
-    context_whiten_path: Optional[str] = None  # PCA-whiten context (Bước 2): off-diag cos 0.72→0.13
-    prediction_type: str = "x0"   # "velocity" (e-x) | "x0" (slat sạch — fix noise lấn át identity)
-
-    # Kiến trúc Voxel Mamba (v5.0 backbone)
-    voxel_mamba_backend: str = "auto"    # auto|mamba|gru
-    voxel_mamba_strict: bool = False     # Bằng True -> báo lỗi nếu yêu cầu mamba backend nhưng không khả dụng
-    mamba_hidden_dim: int = 512          # Chiều ẩn cho các khối Mamba
-    mamba_num_layers: int = 8            # Lite 8L (train_imf_v8.sh); full 12L nếu cần
-    mamba_d_state: int = 16              # Số chiều trạng thái SSM
-    mamba_d_conv: int = 4                # Kích thước hạt nhân tích chập (kernel size)
-    mamba_expand: int = 2                # Hệ số mở rộng SSM
-    mamba_ffn_expand: int = 4            # FFN hidden = dim × expand (lite: 2)
-    # v8 lite: DiM-3D AdaLN + full 946-d hybrid context
-    context_cond_mode: str = "adaln"            # cross_attn | adaln
-    context_use_arcface_only: bool = False      # True = chỉ ArcFace; False = full 946-d
-    mamba_num_context_kv_tokens: int = 8        # cross-attn only
-    mamba_context_cross_attn_heads: int = 8
-    mamba_num_context_tokens: int = 0
-    mamba_num_time_tokens: int = 4
-    mamba_num_r_tokens: int = 4
-    mamba_num_interval_tokens: int = 4
-    mamba_num_guidance_tokens: int = 4
-    mamba_use_per_layer_context: bool = False
+    context_whiten_path: Optional[str] = None  # PCA-whiten context 946→632 (lưu thành buffer trong model)
+    prediction_type: str = "velocity"   # "velocity" (FM v-pred, dùng cho iMF JVP) | "x0"
+    context_cond_mode: str = "cross_attn"       # unet3d: context qua cross-attn (8³/4³)
+    context_use_arcface_only: bool = False      # True = chỉ ArcFace; False = full 946-d (whiten)
     dual_branch: bool = False          # Chia iMF thành các nhánh hình học và vật liệu
     shape_sc_vae_checkpoint: Optional[str] = None      # Điểm kiểm tra VAE riêng biệt chuyên biệt cho hình học (tùy chọn)
     material_sc_vae_checkpoint: Optional[str] = None   # Điểm kiểm tra VAE riêng biệt chuyên biệt cho vật liệu (tùy chọn)
@@ -386,7 +363,7 @@ class TrainConfig:
         print(f"  [Struct] batch={self.structure.batch_size}, epochs={self.structure.num_epochs}, "
               f"lr={self.structure.learning_rate}, hidden={self.structure.hidden_dim}")
         print(f"  [iMF]    batch={self.imf.batch_size}, epochs={self.imf.num_epochs}, "
-              f"lr={self.imf.learning_rate}, hidden={self.imf.mamba_hidden_dim}×{self.imf.mamba_num_layers}L")
+              f"lr={self.imf.learning_rate}, backbone={self.imf.backbone} base={self.imf.unet_base}")
         print(f"  [WandB]  enabled={self.wandb.enabled}, project={self.wandb.project}")
         print("=" * 60)
 

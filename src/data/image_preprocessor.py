@@ -3,7 +3,7 @@ Image → 946-dim Context Preprocessor.
 
 Pipeline cho ứng dụng thực tế: nhận ảnh raw (background bất kỳ), tự cắt nền
 giữ face + vai, extract 3 thành phần context, trả tensor [946] sẵn sàng
-feed VoxelMamba+iMF.
+feed iMF (VoxelUNet3D).
 
 Context layout:
     [   0 :  512] ArcFace identity (L2-normalized)

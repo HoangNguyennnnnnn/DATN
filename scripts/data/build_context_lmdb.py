@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Tạo hybrid_context.lmdb chứa các vector đặc trưng cho VoxelMamba.
+Tạo hybrid_context.lmdb chứa các vector đặc trưng (hybrid context 946-d) cho iMF.
 Script này chạy qua tất cả các file .obj, render 2 mặt, và trích xuất:
 - ArcFace (Identity): [1, 512]
 - FLAME (Expression): [1, 50]
